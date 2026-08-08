@@ -56,6 +56,12 @@ pub struct IrohTransport {
     inbound_rx: InboundRx,
     /// Per-peer open send stream, so `send` reuses one dial.
     conns: Arc<AsyncMutex<HashMap<u64, PeerStream>>>,
+    /// Per-peer dial lock, so concurrent dials to the same peer open exactly one
+    /// connection (and spawn exactly one reader) instead of racing.
+    dialing: Arc<Mutex<HashMap<u64, Arc<AsyncMutex<()>>>>>,
+    /// Handle to the accept loop, aborted on drop so a dropped transport does
+    /// not leak the task (and its `Endpoint` clone).
+    accept_task: tokio::task::JoinHandle<()>,
 }
 
 impl IrohTransport {
@@ -73,7 +79,7 @@ impl IrohTransport {
         let accept_ep = endpoint.clone();
         let accept_routes = routes.clone();
         let accept_tx = inbound_tx.clone();
-        tokio::spawn(async move {
+        let accept_task = tokio::spawn(async move {
             while let Some(incoming) = accept_ep.accept().await {
                 let routes = accept_routes.clone();
                 let tx = accept_tx.clone();
@@ -92,6 +98,8 @@ impl IrohTransport {
             inbound_tx,
             inbound_rx: Arc::new(Mutex::new(Some(inbound_rx))),
             conns: Arc::new(AsyncMutex::new(HashMap::new())),
+            dialing: Arc::new(Mutex::new(HashMap::new())),
+            accept_task,
         })
     }
 
@@ -114,6 +122,15 @@ impl IrohTransport {
     }
 }
 
+impl Drop for IrohTransport {
+    fn drop(&mut self) {
+        // Abort the accept loop, which drops its `Endpoint` clone, so a dropped
+        // transport does not leak the task or keep the endpoint alive. The
+        // transport is not `Clone`, so this owner is the only one and aborts once.
+        self.accept_task.abort();
+    }
+}
+
 #[async_trait]
 impl Transport for IrohTransport {
     async fn send(&self, peer: u64, frame: Frame) -> Result<(), TransportError> {
@@ -133,12 +150,27 @@ impl Transport for IrohTransport {
     }
 
     async fn dial(&self, peer: u64) -> Result<(), TransportError> {
-        // Idempotent: reuse a cached open stream.
-        {
-            let conns = self.conns.lock().await;
-            if conns.contains_key(&peer) {
-                return Ok(());
-            }
+        // Fast path: reuse a cached open stream (drop the map guard first).
+        if self.conns.lock().await.contains_key(&peer) {
+            return Ok(());
+        }
+
+        // Serialize dials to THIS peer so concurrent callers (e.g. the engine's
+        // `connect` and a live-push `send`) open exactly one connection and spawn
+        // exactly one reader. The std map lock is held only to clone the Arc.
+        let dial_lock = {
+            let mut dialing = self.dialing.lock().unwrap();
+            dialing
+                .entry(peer)
+                .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+                .clone()
+        };
+        let _dial_guard = dial_lock.lock().await;
+
+        // Re-check under the per-peer dial lock: a concurrent dial may have
+        // finished while we waited.
+        if self.conns.lock().await.contains_key(&peer) {
+            return Ok(());
         }
 
         let key = self.node_key(peer).ok_or(TransportError::Unreachable(peer))?;
@@ -169,12 +201,11 @@ impl Transport for IrohTransport {
             let _ = read_loop(recv, peer, tx).await;
         });
 
-        // Cache the send half. If a concurrent dial already inserted one, keep
-        // the existing entry (idempotent) and drop ours.
-        let mut conns = self.conns.lock().await;
-        conns
-            .entry(peer)
-            .or_insert_with(|| Arc::new(AsyncMutex::new(send)));
+        // Cache the send half; the per-peer dial lock guarantees no racing insert.
+        self.conns
+            .lock()
+            .await
+            .insert(peer, Arc::new(AsyncMutex::new(send)));
         Ok(())
     }
 
