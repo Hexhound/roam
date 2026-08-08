@@ -3,6 +3,7 @@
 mod error;
 mod identity;
 mod oplog;
+mod snapshot;
 
 pub use error::StorageError;
 pub use identity::{Identity, VerifyingKey};
