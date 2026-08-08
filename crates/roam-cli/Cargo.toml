@@ -1,0 +1,19 @@
+[package]
+name = "roam-cli"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "roam"
+path = "src/main.rs"
+
+[dependencies]
+roam-storage = { path = "../roam-storage" }
+roam-sync-core = { path = "../roam-sync-core" }
+roam-transport-iroh = { path = "../roam-transport-iroh" }
+iroh.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "io-std", "signal"] }
+clap.workspace = true
+anyhow.workspace = true

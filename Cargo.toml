@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/roam-crdt", "crates/roam-storage", "crates/roam-sync-core", "crates/roam-transport-iroh"]
+members = ["crates/roam-crdt", "crates/roam-storage", "crates/roam-sync-core", "crates/roam-transport-iroh", "crates/roam-cli"]
 
 [workspace.package]
 edition = "2021"
@@ -23,3 +23,4 @@ futures = "0.3"
 postcard = { version = "1", default-features = false, features = ["use-std"] }
 anyhow = "1"
 iroh = { version = "1.0.0", features = ["platform-verifier"] }
+clap = { version = "4", features = ["derive"] }
