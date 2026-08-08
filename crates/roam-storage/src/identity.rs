@@ -26,7 +26,7 @@ impl Identity {
     /// Generate a fresh identity with a random keypair and peer id.
     pub fn generate() -> Self {
         let signing_key = SigningKey::generate(&mut OsRng);
-        // Derive a stable, non-zero peer id from the public key.
+        // Derive a stable peer id from the public key (first 8 bytes, little-endian).
         let vk = signing_key.verifying_key().to_bytes();
         let peer_id = u64::from_le_bytes(vk[0..8].try_into().unwrap());
         Self {
@@ -49,6 +49,10 @@ impl Identity {
     }
 
     /// Persist to `path` (caller chooses a location outside the vault).
+    ///
+    /// The file holds a raw ed25519 secret key, so this writes it as owner-only
+    /// (`0600` on unix) and atomically (write to a temp file, then rename) — the
+    /// secret is irreplaceable, so a half-written file must never clobber it.
     pub fn save(&self, path: &Path) -> Result<(), StorageError> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -57,7 +61,16 @@ impl Identity {
             peer_id: self.peer_id,
             secret_key: B64.encode(self.signing_key.to_bytes()),
         };
-        std::fs::write(path, serde_json::to_vec_pretty(&file)?)?;
+        let bytes = serde_json::to_vec_pretty(&file)?;
+
+        let tmp = path.with_extension("key.tmp");
+        std::fs::write(&tmp, &bytes)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+        }
+        std::fs::rename(&tmp, path)?;
         Ok(())
     }
 
@@ -124,5 +137,59 @@ mod tests {
             id.verifying_key().to_bytes(),
             reloaded.verifying_key().to_bytes()
         );
+    }
+
+    #[test]
+    fn reloaded_identity_still_signs_correctly() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("identity.key");
+        let id = Identity::generate();
+        id.save(&path).unwrap();
+        let reloaded = Identity::load(&path).unwrap();
+
+        // The reloaded secret key must produce signatures the original public key verifies.
+        let msg = b"signed after reload";
+        let sig = reloaded.sign(msg);
+        assert!(id.verifying_key().verify(msg, &sig));
+    }
+
+    #[test]
+    fn load_rejects_malformed_files() {
+        let dir = tempdir().unwrap();
+
+        // Not JSON at all.
+        let bad_json = dir.path().join("bad.key");
+        std::fs::write(&bad_json, b"not json").unwrap();
+        assert!(matches!(
+            Identity::load(&bad_json),
+            Err(StorageError::Json(_))
+        ));
+
+        // Valid JSON, but the secret_key is not valid base64.
+        let bad_b64 = dir.path().join("badb64.key");
+        std::fs::write(&bad_b64, br#"{"peer_id":1,"secret_key":"!!!not base64!!!"}"#).unwrap();
+        assert!(matches!(
+            Identity::load(&bad_b64),
+            Err(StorageError::Base64(_))
+        ));
+
+        // Valid base64, but wrong length for an ed25519 secret key.
+        let wrong_len = dir.path().join("wronglen.key");
+        std::fs::write(&wrong_len, br#"{"peer_id":1,"secret_key":"YWJj"}"#).unwrap(); // "abc"
+        assert!(matches!(
+            Identity::load(&wrong_len),
+            Err(StorageError::MalformedIdentity)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saved_key_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("identity.key");
+        Identity::generate().save(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "identity file must be owner-only");
     }
 }
