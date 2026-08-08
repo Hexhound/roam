@@ -1,7 +1,13 @@
 use crate::error::StorageError;
 use std::path::Path;
 
-/// Write snapshot `bytes` atomically-ish to `path`.
+/// Write snapshot `bytes` to `path` via a temp file + rename (atomic on the
+/// same filesystem). Assumes a single writer.
+///
+/// Unlike the identity key and op-log, the snapshot is a **rebuildable cache**
+/// (the op-log is the source of truth), so this deliberately does NOT `fsync`
+/// before the rename — a crash that loses the newest snapshot just means a
+/// slower next load that replays the op-log, never data loss.
 // used by Store in the next unit
 #[allow(dead_code)]
 pub fn save(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
