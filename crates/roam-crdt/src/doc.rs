@@ -64,7 +64,12 @@ impl Document {
         Ok(Self { doc })
     }
 
-    /// The document's current version (all committed ops).
+    /// The document's current version, covering only **committed** ops.
+    ///
+    /// Note the asymmetry with [`Document::export_from`]/[`Document::snapshot`],
+    /// which auto-commit pending edits internally: `version()` does not. Call
+    /// [`Document::commit`] before `version()` if you have pending edits, or the
+    /// returned version will lag them (and a peer will re-send those ops).
     pub fn version(&self) -> Version {
         Version(self.doc.oplog_vv())
     }
@@ -148,9 +153,12 @@ mod tests {
         b.import(&a_delta).unwrap();
         a.import(&b_delta).unwrap();
 
-        // CRDT merge is deterministic: both sides equal, and non-empty.
+        // CRDT merge is deterministic: both sides equal, and NEITHER concurrent
+        // edit was dropped (both survive the merge).
         assert_eq!(a.text("note"), b.text("note"));
         assert!(a.text("note").starts_with("hello"));
+        assert!(a.text("note").contains(" from A"), "lost A's edit: {}", a.text("note"));
+        assert!(a.text("note").contains(" from B"), "lost B's edit: {}", a.text("note"));
     }
 
     #[test]
