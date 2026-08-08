@@ -5,8 +5,14 @@ use iroh::endpoint::presets;
 use iroh::{Endpoint, SecretKey};
 use roam_storage::Identity;
 
-/// The sync ALPN. A pairing ALPN is added in the pairing task.
+/// The sync ALPN — long-lived op/roster gossip.
 pub const SYNC_ALPN: &[u8] = b"roam/sync/1";
+
+/// The pairing ALPN — the one-shot trust-bootstrap handshake (see
+/// [`crate::pairing`]). Bound alongside [`SYNC_ALPN`] so a single live endpoint
+/// can also serve pairing (the GUI path), while the CLI/test path binds a
+/// one-shot endpoint that happens to carry both ALPNs.
+pub const PAIRING_ALPN: &[u8] = b"roam/pair/1";
 
 /// Build the ONE iroh endpoint for this device, bound to the SAME ed25519 key
 /// as `identity` (so the iroh `NodeId` equals the ed25519 verifying key), with
@@ -25,7 +31,7 @@ pub async fn build_endpoint(identity: &Identity) -> Result<Endpoint> {
     // full n0 discovery + relay stack (see the outl reference `bind.rs`).
     let endpoint = Endpoint::builder(presets::N0)
         .secret_key(secret)
-        .alpns(vec![SYNC_ALPN.to_vec()])
+        .alpns(vec![SYNC_ALPN.to_vec(), PAIRING_ALPN.to_vec()])
         .bind()
         .await
         .context("bind roam sync endpoint")?;

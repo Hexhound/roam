@@ -8,6 +8,7 @@ repository.workspace = true
 [dependencies]
 roam-sync-core = { path = "../roam-sync-core" }
 roam-storage = { path = "../roam-storage" }
+ed25519-dalek.workspace = true
 iroh.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
