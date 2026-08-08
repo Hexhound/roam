@@ -1,0 +1,10 @@
+# rust
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# editor / os
+*~
+.DS_Store
+.direnv/
+.devenv/
