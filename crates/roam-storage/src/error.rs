@@ -14,6 +14,8 @@ pub enum StorageError {
     MalformedEntry(String),
     #[error("signature verification failed for peer {0}")]
     BadSignature(u64),
+    #[error("invalid peer operation: {0}")]
+    Peer(String),
     #[error(transparent)]
     Crdt(#[from] roam_crdt::CrdtError),
 }

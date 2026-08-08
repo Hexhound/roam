@@ -19,7 +19,14 @@ pub struct Store {
 
 impl Store {
     /// Open (creating if needed) the vault at `root` for device `identity`.
-    /// Rebuilds the document from snapshot + all peer oplogs.
+    ///
+    /// Rebuilds the document from the snapshot (if any) plus a replay of THIS
+    /// device's own signed log. NOTE: peer logs (`ops-<peer>.jsonl`) are NOT yet
+    /// replayed here — peer ops survive a cold reopen only if a snapshot captured
+    /// them. Replaying peer logs safely needs a trusted `peer_id -> verifying key`
+    /// registry (`peers.json`), which lands with pairing in a later slice.
+    // TODO(peers.json): enumerate ops-*.jsonl and replay each peer log verified
+    // against its registered key.
     pub fn open(root: &Path, identity: Identity) -> Result<Self, StorageError> {
         let ops_dir = root.join("ops");
         let snap_path = root.join("snapshots").join("snapshot.loro");
@@ -66,10 +73,15 @@ impl Store {
 
     fn persist_new_ops(&mut self) -> Result<(), StorageError> {
         self.doc.commit();
-        let delta = self.doc.export_from(&self.persisted)?;
-        if !delta.is_empty() {
+        // Guard on the version, not `delta.is_empty()`: loro's updates export is
+        // never byte-empty (it always carries a format header), so an edit that
+        // produced no ops (e.g. a zero-length delete) must be detected by the
+        // version being unchanged — otherwise we'd append header-only junk.
+        let current = self.doc.version();
+        if current != self.persisted {
+            let delta = self.doc.export_from(&self.persisted)?;
             self.own_log.append(&self.identity, &delta)?;
-            self.persisted = self.doc.version();
+            self.persisted = current;
         }
         Ok(())
     }
@@ -97,9 +109,30 @@ impl Store {
         key: &VerifyingKey,
         log_bytes: Vec<u8>,
     ) -> Result<(), StorageError> {
+        // Never write foreign bytes over our OWN log.
+        if peer_id == self.identity.peer_id() {
+            return Err(StorageError::Peer(
+                "cannot import a peer log under our own peer id".into(),
+            ));
+        }
+
         let ops_dir = self.root.join("ops");
         std::fs::create_dir_all(&ops_dir)?;
         let peer_log_path = ops_dir.join(format!("ops-{peer_id}.jsonl"));
+
+        // Op logs are append-only: refuse a shorter/older resend that would
+        // truncate newer peer ops already on disk. (TODO: entry-level merge once
+        // peers.json + a real sync transport land; for now a wholesale, longer-or-
+        // equal replacement is sufficient since peers ship their full log.)
+        if let Ok(existing) = std::fs::read(&peer_log_path) {
+            if log_bytes.len() < existing.len() {
+                return Err(StorageError::Peer(format!(
+                    "refusing to shrink peer {peer_id} log ({} < {} bytes)",
+                    log_bytes.len(),
+                    existing.len()
+                )));
+            }
+        }
         std::fs::write(&peer_log_path, &log_bytes)?;
 
         let peer_log = OpLog::new(&ops_dir, peer_id);
@@ -107,6 +140,10 @@ impl Store {
             self.doc.import(&entry.update)?;
         }
         self.doc.commit();
+        // Peer ops are now part of our committed state; advance `persisted` so a
+        // later local edit does NOT re-export them into our OWN (own-key-signed)
+        // log — that would mis-attribute the peer's ops to us.
+        self.persisted = self.doc.version();
         Ok(())
     }
 }
@@ -169,5 +206,104 @@ mod tests {
 
         assert_eq!(a.text("note"), b.text("note"));
         assert_eq!(a.text("note").len(), 6); // both edits survived
+        assert!(a.text("note").contains("AAA"), "lost A: {}", a.text("note"));
+        assert!(a.text("note").contains("BBB"), "lost B: {}", a.text("note"));
+    }
+
+    #[test]
+    fn deletes_persist_across_reopen() {
+        let dir = tempdir().unwrap();
+        let vault = dir.path().join("vault");
+        let id = Identity::generate();
+
+        {
+            let mut store = Store::open(&vault, id.clone()).unwrap();
+            store.edit_text("note", 0, "hello world").unwrap();
+            store.delete_text("note", 5, 6).unwrap();
+        }
+
+        let reopened = Store::open(&vault, id).unwrap();
+        assert_eq!(reopened.text("note"), "hello");
+    }
+
+    #[test]
+    fn a_no_op_edit_appends_nothing() {
+        let dir = tempdir().unwrap();
+        let vault = dir.path().join("vault");
+        let id = Identity::generate();
+        let mut store = Store::open(&vault, id.clone()).unwrap();
+
+        store.edit_text("note", 0, "hi").unwrap();
+        let after_real = store.export_own_log().unwrap().len();
+        // Deleting zero chars produces no ops → the log must not grow.
+        store.delete_text("note", 0, 0).unwrap();
+        assert_eq!(store.export_own_log().unwrap().len(), after_real);
+    }
+
+    #[test]
+    fn import_peer_rejects_our_own_peer_id() {
+        let dir = tempdir().unwrap();
+        let id = Identity::generate();
+        let mut store = Store::open(dir.path(), id.clone()).unwrap();
+        let err = store.import_peer(id.peer_id(), &id.verifying_key(), Vec::new());
+        assert!(matches!(err, Err(StorageError::Peer(_))));
+    }
+
+    #[test]
+    fn import_peer_refuses_to_shrink_a_peer_log() {
+        let dir_a = tempdir().unwrap();
+        let dir_b = tempdir().unwrap();
+        let id_a = Identity::generate();
+        let id_b = Identity::generate();
+
+        let mut a = Store::open(dir_a.path(), id_a).unwrap();
+        let mut b = Store::open(dir_b.path(), id_b.clone()).unwrap();
+
+        b.edit_text("note", 0, "one").unwrap();
+        b.edit_text("note", 3, "two").unwrap();
+        let full = b.export_own_log().unwrap();
+        a.import_peer(id_b.peer_id(), &id_b.verifying_key(), full.clone())
+            .unwrap();
+
+        // A shorter/older resend must be refused, not silently truncate on disk.
+        let shorter = full[..full.len() / 2].to_vec();
+        let err = a.import_peer(id_b.peer_id(), &id_b.verifying_key(), shorter);
+        assert!(matches!(err, Err(StorageError::Peer(_))));
+    }
+
+    #[test]
+    fn edit_after_import_does_not_re_sign_peer_ops_into_own_log() {
+        // Regression: importing a peer must advance `persisted`, so a later local
+        // edit exports only OUR new op — not the peer's ops re-signed under our key.
+        let dir_a = tempdir().unwrap();
+        let dir_b = tempdir().unwrap();
+        let id_a = Identity::generate();
+        let id_b = Identity::generate();
+
+        let mut a = Store::open(dir_a.path(), id_a.clone()).unwrap();
+        let mut b = Store::open(dir_b.path(), id_b.clone()).unwrap();
+
+        a.edit_text("note", 0, "A").unwrap();
+        b.edit_text("note", 0, "B").unwrap();
+        a.import_peer(id_b.peer_id(), &id_b.verifying_key(), b.export_own_log().unwrap())
+            .unwrap();
+        a.edit_text("note", a.text("note").chars().count(), "C").unwrap();
+
+        // Reconstruct a document from ONLY a's own signed log. It must not contain
+        // B's edit — if it does, a re-signed B's ops under its own key.
+        let a_ops = dir_a.path().join("ops");
+        let entries = OpLog::new(&a_ops, id_a.peer_id())
+            .read_verified(&id_a.verifying_key())
+            .unwrap();
+        let rebuilt = roam_crdt::Document::new(id_a.peer_id()).unwrap();
+        for e in &entries {
+            // Ops causally depending on B's (unavailable here) simply stay pending.
+            let _ = rebuilt.import(&e.update);
+        }
+        assert!(
+            !rebuilt.text("note").contains("B"),
+            "own log leaked peer B's ops under our key: {:?}",
+            rebuilt.text("note")
+        );
     }
 }
