@@ -3,5 +3,5 @@
 mod doc;
 mod error;
 
-pub use doc::Document;
+pub use doc::{Document, Version};
 pub use error::CrdtError;
