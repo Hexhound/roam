@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = ["crates/roam-crdt", "crates/roam-storage"]
+
+[workspace.package]
+edition = "2021"
+license = "MPL-2.0"
+repository = "https://github.com/roam/roam-sync"
+
+[workspace.dependencies]
+loro = "1.13.9"
+ed25519-dalek = "2"
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+thiserror = "1"
+proptest = "1"
+tempfile = "3"

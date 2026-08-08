@@ -1,0 +1,12 @@
+[package]
+name = "roam-crdt"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+loro.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
