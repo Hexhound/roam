@@ -60,4 +60,20 @@ mod tests {
         doc.commit();
         assert_eq!(doc.text("note"), "hello");
     }
+
+    #[test]
+    fn positions_are_unicode_codepoints_not_bytes() {
+        // "café🌍" is 5 codepoints but 9 UTF-8 bytes. Deleting 2 codepoints at
+        // position 3 must remove "é🌍" — proving positions are codepoints, not bytes.
+        let doc = Document::new(1).unwrap();
+        doc.insert_text("note", 0, "café🌍").unwrap();
+        doc.delete_text("note", 3, 2).unwrap();
+        doc.commit();
+        assert_eq!(doc.text("note"), "caf");
+
+        // Insert at a codepoint boundary past a multi-byte char.
+        doc.insert_text("note", 3, "→x").unwrap();
+        doc.commit();
+        assert_eq!(doc.text("note"), "caf→x");
+    }
 }

@@ -6,7 +6,6 @@ license.workspace = true
 
 [dependencies]
 roam-crdt = { path = "../roam-crdt" }
-loro.workspace = true
 ed25519-dalek = { workspace = true, features = ["rand_core"] }
 rand.workspace = true
 serde = { workspace = true }
