@@ -1,6 +1,6 @@
 use crate::error::StorageError;
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey as DalekVerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey as DalekVerifyingKey};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -104,7 +104,9 @@ impl VerifyingKey {
     }
 
     pub fn verify(&self, msg: &[u8], sig: &Signature) -> bool {
-        self.0.verify(msg, sig).is_ok()
+        // verify_strict rejects non-canonical / malleable signatures — the
+        // recommended default for tamper detection.
+        self.0.verify_strict(msg, sig).is_ok()
     }
 }
 

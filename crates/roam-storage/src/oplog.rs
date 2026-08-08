@@ -64,17 +64,39 @@ impl OpLog {
     }
 
     /// Read every entry, verifying each signature against `key`.
-    /// Returns `Err` on the first tampered or malformed line.
+    ///
+    /// Fails closed: returns `Err` on the first tampered, malformed, or
+    /// wrong-peer line. The one tolerated corruption is a **torn tail** — a
+    /// crash mid-append can leave a partial final line with no trailing
+    /// newline; that single incomplete last line is dropped rather than
+    /// bricking the whole log. Interior malformed lines are still errors.
+    ///
+    /// Assumes a single writer per file (the log is per-peer: `ops-<peer>.jsonl`).
     pub fn read_verified(&self, key: &VerifyingKey) -> Result<Vec<Entry>, StorageError> {
         let text = match std::fs::read_to_string(&self.path) {
             Ok(t) => t,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(e.into()),
         };
+        // A completed append always ends with '\n'. A missing trailing newline
+        // means the final line was torn by a crash and may be tolerated.
+        let torn_tail = !text.is_empty() && !text.ends_with('\n');
+        let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+        let last = lines.len().saturating_sub(1);
+
         let mut out = Vec::new();
-        for line in text.lines().filter(|l| !l.trim().is_empty()) {
-            let parsed: EntryLine =
-                serde_json::from_str(line).map_err(|e| StorageError::MalformedEntry(e.to_string()))?;
+        for (i, line) in lines.iter().enumerate() {
+            let parsed: EntryLine = match serde_json::from_str(line) {
+                Ok(p) => p,
+                // Tolerate a parse failure ONLY on a torn final line.
+                Err(_) if i == last && torn_tail => break,
+                Err(e) => return Err(StorageError::MalformedEntry(e.to_string())),
+            };
+            // The on-disk `peer` is untrusted metadata; it must match this log's
+            // owner, or the entry is not authentically ours.
+            if parsed.peer != self.peer_id {
+                return Err(StorageError::BadSignature(parsed.peer));
+            }
             let update = B64
                 .decode(parsed.update.as_bytes())
                 .map_err(|e| StorageError::MalformedEntry(e.to_string()))?;
@@ -137,5 +159,68 @@ mod tests {
             matches!(result, Err(StorageError::BadSignature(_))),
             "tampered payload must fail signature verification, got {result:?}"
         );
+    }
+
+    #[test]
+    fn tolerates_a_torn_final_line_but_keeps_prior_entries() {
+        let dir = tempdir().unwrap();
+        let id = Identity::generate();
+        let log = OpLog::new(dir.path(), id.peer_id());
+        log.append(&id, b"good-one").unwrap();
+        log.append(&id, b"good-two").unwrap();
+
+        // Simulate a crash mid-append: append a partial line with NO newline.
+        let path = log.path();
+        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        std::io::Write::write_all(&mut file, br#"{"peer":1,"sig":"broke"#).unwrap();
+
+        // The two complete entries survive; the torn tail is dropped.
+        let entries = log.read_verified(&id.verifying_key()).unwrap();
+        let payloads: Vec<&[u8]> = entries.iter().map(|e| e.update.as_slice()).collect();
+        assert_eq!(payloads, vec![b"good-one".as_ref(), b"good-two".as_ref()]);
+    }
+
+    #[test]
+    fn rejects_a_malformed_interior_line() {
+        use crate::error::StorageError;
+        let dir = tempdir().unwrap();
+        let id = Identity::generate();
+        let log = OpLog::new(dir.path(), id.peer_id());
+        log.append(&id, b"first").unwrap();
+        log.append(&id, b"second").unwrap();
+
+        // Corrupt the FIRST (interior) line into invalid JSON; file still ends with '\n'.
+        let path = log.path();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut lines: Vec<&str> = text.lines().collect();
+        lines[0] = "{not valid json";
+        std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+
+        // An interior malformed line is real corruption — must error, not be skipped.
+        assert!(matches!(
+            log.read_verified(&id.verifying_key()),
+            Err(StorageError::MalformedEntry(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_an_entry_claiming_a_different_peer() {
+        use crate::error::StorageError;
+        let dir = tempdir().unwrap();
+        let id = Identity::generate();
+        let log = OpLog::new(dir.path(), id.peer_id());
+        log.append(&id, b"mine").unwrap();
+
+        // Flip the on-disk `peer` field to a value that isn't this log's owner.
+        let path = log.path();
+        let line = std::fs::read_to_string(&path).unwrap();
+        let mut v: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        v["peer"] = serde_json::Value::from(id.peer_id().wrapping_add(1));
+        std::fs::write(&path, format!("{}\n", v)).unwrap();
+
+        assert!(matches!(
+            log.read_verified(&id.verifying_key()),
+            Err(StorageError::BadSignature(_))
+        ));
     }
 }
