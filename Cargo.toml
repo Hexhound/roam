@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/roam-crdt", "crates/roam-storage"]
+members = ["crates/roam-crdt", "crates/roam-storage", "crates/roam-sync-core"]
 
 [workspace.package]
 edition = "2021"
@@ -17,3 +17,7 @@ base64 = "0.22"
 thiserror = "1"
 proptest = "1"
 tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+async-trait = "0.1"
+futures = "0.3"
+postcard = { version = "1", default-features = false, features = ["use-std"] }
