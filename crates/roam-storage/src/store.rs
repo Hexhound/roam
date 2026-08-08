@@ -7,6 +7,17 @@ use roam_crdt::{Document, Version};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+/// The `peer_id` a verifying key MUST map to: the first 8 little-endian bytes of
+/// the key (see `Identity::generate`). The roster binds every peer to this so op
+/// attribution (`peer_id -> key`) can never be poisoned by a mismatched pair.
+fn derived_peer_id(key_bytes: &[u8; 32]) -> u64 {
+    u64::from_le_bytes(
+        key_bytes[0..8]
+            .try_into()
+            .expect("32-byte key has an 8-byte prefix"),
+    )
+}
+
 /// A vault-backed CRDT document store. Layout under `root`:
 /// - `ops/ops-<peer>.jsonl` — one signed append-log per peer
 /// - `roster/roster-<peer>.jsonl` — one signed membership log per device
@@ -236,7 +247,14 @@ impl Store {
 
     /// Vouch for `peer_id` (holding `key_bytes`): append an `Add` to our own
     /// roster log, re-merge the peer set, and refresh the `peers.json` cache.
+    ///
+    /// Enforces the `peer_id == first-8-LE-bytes(key)` binding (see
+    /// [`derived_peer_id`]) BEFORE writing anything, so a joiner (e.g. via
+    /// pairing) can never register a `peer_id` that does not derive from the key
+    /// it presents — that would poison op attribution (`key_for(peer_id)` would
+    /// map to the wrong key).
     pub fn add_peer(&mut self, peer_id: u64, key_bytes: [u8; 32]) -> Result<(), StorageError> {
+        Self::check_peer_id_binding(peer_id, &key_bytes)?;
         self.own_roster
             .append(&self.identity, RosterOp::Add, peer_id, key_bytes)?;
         self.refresh_peers()
@@ -245,9 +263,23 @@ impl Store {
     /// Revoke `peer_id`: append a `Revoke` to our own roster log, re-merge the
     /// peer set, and refresh the `peers.json` cache.
     pub fn revoke_peer(&mut self, peer_id: u64, key_bytes: [u8; 32]) -> Result<(), StorageError> {
+        Self::check_peer_id_binding(peer_id, &key_bytes)?;
         self.own_roster
             .append(&self.identity, RosterOp::Revoke, peer_id, key_bytes)?;
         self.refresh_peers()
+    }
+
+    /// Reject a roster mutation whose `peer_id` does not match the key it is
+    /// bound to. Everywhere in roam a `peer_id` is the first 8 little-endian
+    /// bytes of the ed25519 verifying key (see `Identity::generate`), so this is
+    /// the single binding invariant every roster-add path must uphold.
+    fn check_peer_id_binding(peer_id: u64, key_bytes: &[u8; 32]) -> Result<(), StorageError> {
+        if peer_id != derived_peer_id(key_bytes) {
+            return Err(StorageError::Peer(
+                "peer_id does not match verifying key (first 8 LE bytes)".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Re-run the roster fixpoint from disk and rewrite the cache. Called after
@@ -580,6 +612,26 @@ mod tests {
         // Reopen must recover the complete edit and ignore the torn tail — no error.
         let reopened = Store::open(&vault, id).unwrap();
         assert_eq!(reopened.text("note"), "keep");
+    }
+
+    #[test]
+    fn add_peer_rejects_a_mismatched_peer_id_key() {
+        let dir = tempdir().unwrap();
+        let a = Identity::generate();
+        let b = Identity::generate();
+        let mut store = Store::open(dir.path(), a).unwrap();
+
+        // Wrong peer_id (does not derive from b's key) → refused before any write.
+        let bad_id = b.peer_id().wrapping_add(1);
+        let err = store.add_peer(bad_id, b.verifying_key().to_bytes());
+        assert!(matches!(err, Err(StorageError::Peer(_))), "mismatched peer_id must be refused");
+        assert!(store.roster().is_empty(), "a refused add must not touch the roster");
+
+        // The matching pair succeeds.
+        store
+            .add_peer(b.peer_id(), b.verifying_key().to_bytes())
+            .unwrap();
+        assert!(store.roster().iter().any(|p| p.peer_id == b.peer_id()));
     }
 
     #[test]

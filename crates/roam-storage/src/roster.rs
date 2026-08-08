@@ -80,6 +80,12 @@ pub fn merge_roster(entries: &mut [RosterEntry]) -> Vec<PeerRecord> {
     entries.sort_by_key(|e| (e.subject_peer, e.added_by, e.seq));
     let mut out: BTreeMap<u64, PeerRecord> = BTreeMap::new();
     for e in entries.iter() {
+        // Defense against a malicious trusted author injecting a mismatched
+        // entry: every peer_id MUST be the first 8 LE bytes of its key. Drop
+        // (don't brick the whole log on) an entry that breaks that binding.
+        if e.subject_peer != u64::from_le_bytes(e.subject_key[0..8].try_into().unwrap()) {
+            continue;
+        }
         let rec = out.entry(e.subject_peer).or_insert(PeerRecord {
             peer_id: e.subject_peer,
             verifying_key: e.subject_key,
@@ -267,6 +273,35 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn merge_roster_drops_a_mismatched_peer_id_entry() {
+        let a = Identity::generate();
+        let b = Identity::generate();
+        let b_key = b.verifying_key().to_bytes();
+
+        let mut entries = vec![
+            // Honest entry: peer_id derives from the key.
+            RosterEntry {
+                seq: 1,
+                op: RosterOp::Add,
+                subject_peer: b.peer_id(),
+                subject_key: b_key,
+                added_by: a.peer_id(),
+            },
+            // Poisoned entry: peer_id does NOT derive from the key.
+            RosterEntry {
+                seq: 2,
+                op: RosterOp::Add,
+                subject_peer: b.peer_id().wrapping_add(999),
+                subject_key: b_key,
+                added_by: a.peer_id(),
+            },
+        ];
+        let merged = merge_roster(&mut entries);
+        assert_eq!(merged.len(), 1, "the mismatched entry must be dropped");
+        assert_eq!(merged[0].peer_id, b.peer_id());
+    }
+
+    #[test]
     fn appends_and_reads_back_verified_roster_entries() {
         let dir = tempdir().unwrap();
         let a = Identity::generate();
@@ -313,8 +348,10 @@ mod tests {
 
     #[test]
     fn revoke_is_terminal_even_with_a_later_add_from_another_author() {
-        let x = 500u64;
         let key = [3u8; 32];
+        // The peer_id MUST derive from the key (first 8 LE bytes) or merge_roster
+        // drops the entry; this test is about revoke terminality, not the binding.
+        let x = u64::from_le_bytes(key[0..8].try_into().unwrap());
         let mut entries = vec![
             RosterEntry { seq: 1, op: RosterOp::Add,    subject_peer: x, subject_key: key, added_by: 1 },
             RosterEntry { seq: 2, op: RosterOp::Revoke, subject_peer: x, subject_key: key, added_by: 1 },

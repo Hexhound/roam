@@ -496,4 +496,54 @@ mod tests {
             "a peer with a forged proof must NOT be added to the roster"
         );
     }
+
+    /// Fail-closed: a joiner that presents a VALID key + proof but a `peer_id`
+    /// that does not derive from that key (first 8 LE bytes) is rejected at the
+    /// storage chokepoint, and A's roster does NOT gain it. Without the binding
+    /// the joiner could poison op attribution (`key_for(peer_id)` maps wrong).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pairing_rejects_a_mismatched_peer_id() {
+        let da = tempdir().unwrap();
+        let ia = Identity::generate();
+        let ib = Identity::generate();
+        let vault = VaultId::generate();
+
+        let mut sa = Store::open(da.path(), ia.clone()).unwrap();
+        let (token, host) = host_pairing(&ia, vault, &mut sa).await.unwrap();
+        let token_decoded = PairingToken::decode(&token).unwrap();
+        // A peer_id that does NOT match ib's key.
+        let bad_peer_id = ib.peer_id().wrapping_add(1);
+
+        // Malicious joiner: a VALID proof over the real secret, but a peer_id
+        // that does not derive from the presented key.
+        let bad_join = tokio::spawn(async move {
+            let endpoint = build_endpoint(&ib).await?;
+            let conn = endpoint
+                .connect(token_decoded.addr.clone(), PAIRING_ALPN)
+                .await?;
+            let (mut send, mut recv) = conn.open_bi().await?;
+            let proof = ib.sign(&token_decoded.secret).to_bytes().to_vec();
+            let req = JoinRequest {
+                verifying_key: ib.verifying_key().to_bytes(),
+                peer_id: bad_peer_id,
+                proof,
+            };
+            write_msg(&mut send, &req).await?;
+            send.finish()?;
+            let accepted: Result<JoinAccept> = read_msg(&mut recv).await;
+            endpoint.close().await;
+            anyhow::Ok(accepted.is_ok())
+        });
+
+        let host_res = host.accept_auto().await;
+        assert!(host_res.is_err(), "a mismatched peer_id must be rejected");
+
+        let joiner_got_accept = bad_join.await.unwrap().unwrap_or(false);
+        assert!(!joiner_got_accept, "rejected joiner must not receive a JoinAccept");
+
+        assert!(
+            sa.roster().is_empty(),
+            "a peer whose peer_id != derived(key) must NOT be added to the roster"
+        );
+    }
 }
