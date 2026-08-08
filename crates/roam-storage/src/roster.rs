@@ -56,6 +56,48 @@ impl RosterEntry {
     }
 }
 
+/// Whether a peer's ops are currently accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PeerStatus {
+    Active,
+    Revoked,
+}
+
+/// A materialized, deduped view of one peer derived from all roster logs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerRecord {
+    pub peer_id: u64,
+    /// ed25519 verifying key == iroh NodeId.
+    pub verifying_key: [u8; 32],
+    pub status: PeerStatus,
+}
+
+/// Fold a set of verified roster entries into the current peer set. Later
+/// entries (by any author) win: a `Revoke` after an `Add` yields `Revoked`.
+/// Entries are applied in a deterministic order: (subject_peer, added_by, seq).
+pub fn merge_roster(entries: &mut [RosterEntry]) -> Vec<PeerRecord> {
+    use std::collections::BTreeMap;
+    entries.sort_by_key(|e| (e.subject_peer, e.added_by, e.seq));
+    let mut out: BTreeMap<u64, PeerRecord> = BTreeMap::new();
+    for e in entries.iter() {
+        let rec = out.entry(e.subject_peer).or_insert(PeerRecord {
+            peer_id: e.subject_peer,
+            verifying_key: e.subject_key,
+            status: PeerStatus::Active,
+        });
+        rec.verifying_key = e.subject_key;
+        // Revocation is terminal in Slice 2 (prefer-deny): once ANY trusted
+        // author revokes a subject, no later Add from any author resurrects it.
+        // Key rotation / un-revoke is deferred. This makes status order-independent
+        // (`seq` is per-author, so it cannot order cross-author entries) and blocks
+        // the stolen-device attack where a stale Add masks a Revoke.
+        if e.op == RosterOp::Revoke {
+            rec.status = PeerStatus::Revoked;
+        }
+    }
+    out.into_values().collect()
+}
+
 /// An append-only, per-device signed roster log (`<dir>/roster-<peer>.jsonl`).
 /// Same durability + torn-tail rules as [`crate::OpLog`].
 pub struct RosterLog {
@@ -267,6 +309,21 @@ mod tests {
             log.read_verified(&a.verifying_key()),
             Err(StorageError::BadSignature(_))
         ));
+    }
+
+    #[test]
+    fn revoke_is_terminal_even_with_a_later_add_from_another_author() {
+        let x = 500u64;
+        let key = [3u8; 32];
+        let mut entries = vec![
+            RosterEntry { seq: 1, op: RosterOp::Add,    subject_peer: x, subject_key: key, added_by: 1 },
+            RosterEntry { seq: 2, op: RosterOp::Revoke, subject_peer: x, subject_key: key, added_by: 1 },
+            // Stale Add from a DIFFERENT, higher-id author must NOT resurrect X.
+            RosterEntry { seq: 1, op: RosterOp::Add,    subject_peer: x, subject_key: key, added_by: 2 },
+        ];
+        let peers = merge_roster(&mut entries);
+        let rec = peers.iter().find(|p| p.peer_id == x).unwrap();
+        assert_eq!(rec.status, PeerStatus::Revoked, "revocation must be terminal across authors");
     }
 
     #[test]

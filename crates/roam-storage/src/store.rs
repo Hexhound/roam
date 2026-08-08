@@ -1,13 +1,17 @@
 use crate::error::StorageError;
 use crate::identity::{Identity, VerifyingKey};
 use crate::oplog::OpLog;
+use crate::roster::{merge_roster, PeerRecord, PeerStatus, RosterEntry, RosterLog, RosterOp};
 use crate::snapshot;
 use roam_crdt::{Document, Version};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// A vault-backed CRDT document store. Layout under `root`:
 /// - `ops/ops-<peer>.jsonl` — one signed append-log per peer
+/// - `roster/roster-<peer>.jsonl` — one signed membership log per device
 /// - `snapshots/snapshot.loro` — fast-load snapshot (rebuildable)
+/// - `peers.json` — materialized, rebuildable cache of the merged roster
 pub struct Store {
     root: PathBuf,
     identity: Identity,
@@ -15,44 +19,120 @@ pub struct Store {
     own_log: OpLog,
     /// The document version already written to `own_log` (so we only append new ops).
     persisted: Version,
+    /// This device's own signed membership log.
+    own_roster: RosterLog,
+    /// Materialized view of the merged roster across all trusted logs.
+    peers: Vec<PeerRecord>,
 }
 
 impl Store {
     /// Open (creating if needed) the vault at `root` for device `identity`.
     ///
-    /// Rebuilds the document from the snapshot (if any) plus a replay of THIS
-    /// device's own signed log. NOTE: peer logs (`ops-<peer>.jsonl`) are NOT yet
-    /// replayed here — peer ops survive a cold reopen only if a snapshot captured
-    /// them. Replaying peer logs safely needs a trusted `peer_id -> verifying key`
-    /// registry (`peers.json`), which lands with pairing in a later slice.
-    // TODO(peers.json): enumerate ops-*.jsonl and replay each peer log verified
-    // against its registered key.
+    /// Rebuilds the document from the snapshot (if any), a replay of THIS
+    /// device's own signed log, and then a replay of every `Active` peer's log.
+    /// Peer trust comes from the replicated roster logs, not `peers.json` (a mere
+    /// cache) — `open()` always rebuilds the peer set from the signed roster logs
+    /// so a lost/stale cache can never affect correctness.
     pub fn open(root: &Path, identity: Identity) -> Result<Self, StorageError> {
         let ops_dir = root.join("ops");
+        let roster_dir = root.join("roster");
         let snap_path = root.join("snapshots").join("snapshot.loro");
 
-        // 1. Base document: from snapshot if present, else empty.
+        // 1. Rebuild the trusted peer set from the signed roster logs (fixpoint).
+        let peers = Self::rebuild_peers(root, identity.peer_id(), &identity.verifying_key())?;
+
+        // 2. Base document: from snapshot if present, else empty.
         let doc = match snapshot::load(&snap_path)? {
             Some(bytes) => Document::from_snapshot(identity.peer_id(), &bytes)?,
             None => Document::new(identity.peer_id())?,
         };
 
-        // 2. Replay our own log (verified against our own key).
+        // 3. Replay our own log (verified against our own key).
         let own_log = OpLog::new(&ops_dir, identity.peer_id());
         for entry in own_log.read_verified(&identity.verifying_key())? {
             doc.import(&entry.update)?;
         }
-        // (Peer logs are imported via `import_peer`, which knows the peer's key.)
+
+        // 4. Replay every Active peer's log, verified against the key the roster
+        //    vouches for. A missing peer op-log is fine (read_verified ⇒ empty).
+        for peer in peers.iter() {
+            if peer.status != PeerStatus::Active || peer.peer_id == identity.peer_id() {
+                continue;
+            }
+            let peer_key = match VerifyingKey::from_bytes(&peer.verifying_key) {
+                Ok(k) => k,
+                Err(_) => continue,
+            };
+            let peer_log = OpLog::new(&ops_dir, peer.peer_id);
+            for entry in peer_log.read_verified(&peer_key)? {
+                doc.import(&entry.update)?;
+            }
+        }
 
         doc.commit();
         let persisted = doc.version();
-        Ok(Self {
+        let own_roster = RosterLog::new(&roster_dir, identity.peer_id());
+        let store = Self {
             root: root.to_path_buf(),
             identity,
             doc,
             own_log,
             persisted,
-        })
+            own_roster,
+            peers,
+        };
+        store.write_peers_cache()?;
+        Ok(store)
+    }
+
+    /// Rebuild the trusted peer set from the signed roster logs under
+    /// `root/roster/`. Resolves the bootstrap cycle (verifying author X's roster
+    /// needs X's key, which itself comes from the roster) with a fixpoint:
+    /// start trusting only ourselves, then repeatedly read any roster log whose
+    /// author is already keyed, learning new subject keys, until no new author
+    /// becomes processable.
+    fn rebuild_peers(
+        root: &Path,
+        self_id: u64,
+        self_key: &VerifyingKey,
+    ) -> Result<Vec<PeerRecord>, StorageError> {
+        let roster_dir = root.join("roster");
+
+        // Trusted author keys (as raw bytes; `VerifyingKey` is not `Copy`), seeded
+        // with ourselves.
+        let mut trusted: HashMap<u64, [u8; 32]> = HashMap::new();
+        trusted.insert(self_id, self_key.to_bytes());
+
+        let mut processed: HashSet<u64> = HashSet::new();
+        let mut all_entries: Vec<RosterEntry> = Vec::new();
+
+        loop {
+            // Find an author we now trust, whose roster log we have not read yet.
+            let next = trusted
+                .keys()
+                .copied()
+                .find(|author| !processed.contains(author));
+            let Some(author) = next else { break };
+            processed.insert(author);
+
+            // A malformed trusted-key entry can't verify anything; skip its log.
+            let author_key = match VerifyingKey::from_bytes(&trusted[&author]) {
+                Ok(k) => k,
+                Err(_) => continue,
+            };
+            let log = RosterLog::new(&roster_dir, author);
+            let entries = log.read_verified(&author_key)?;
+            for entry in &entries {
+                // Learn subject keys this author vouches for (Add or Revoke both
+                // carry the key; a later fixpoint pass never removes trust).
+                trusted
+                    .entry(entry.subject_peer)
+                    .or_insert(entry.subject_key);
+            }
+            all_entries.extend(entries);
+        }
+
+        Ok(merge_roster(&mut all_entries))
     }
 
     pub fn text(&self, id: &str) -> String {
@@ -101,6 +181,90 @@ impl Store {
         }
     }
 
+    /// The roster directory under this vault (`root/roster`).
+    fn roster_dir(&self) -> PathBuf {
+        self.root.join("roster")
+    }
+
+    /// The current materialized roster (clone of the cached peer set).
+    pub fn roster(&self) -> Vec<PeerRecord> {
+        self.peers.clone()
+    }
+
+    /// Vouch for `peer_id` (holding `key_bytes`): append an `Add` to our own
+    /// roster log, re-merge the peer set, and refresh the `peers.json` cache.
+    pub fn add_peer(&mut self, peer_id: u64, key_bytes: [u8; 32]) -> Result<(), StorageError> {
+        self.own_roster
+            .append(&self.identity, RosterOp::Add, peer_id, key_bytes)?;
+        self.refresh_peers()
+    }
+
+    /// Revoke `peer_id`: append a `Revoke` to our own roster log, re-merge the
+    /// peer set, and refresh the `peers.json` cache.
+    pub fn revoke_peer(&mut self, peer_id: u64, key_bytes: [u8; 32]) -> Result<(), StorageError> {
+        self.own_roster
+            .append(&self.identity, RosterOp::Revoke, peer_id, key_bytes)?;
+        self.refresh_peers()
+    }
+
+    /// Re-run the roster fixpoint from disk and rewrite the cache. Called after
+    /// any roster mutation so `self.peers` and `peers.json` stay in sync.
+    fn refresh_peers(&mut self) -> Result<(), StorageError> {
+        self.peers = Self::rebuild_peers(
+            &self.root,
+            self.identity.peer_id(),
+            &self.identity.verifying_key(),
+        )?;
+        self.write_peers_cache()
+    }
+
+    /// The raw bytes of this device's own roster log (for copying to a peer).
+    pub fn export_own_roster(&self) -> Result<Vec<u8>, StorageError> {
+        match std::fs::read(self.own_roster.path()) {
+            Ok(b) => Ok(b),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Import a peer's roster-log bytes: verify against `key` before writing,
+    /// refuse an older/shorter resend, persist, then re-merge the peer set.
+    pub fn import_roster(
+        &mut self,
+        author: u64,
+        key: &VerifyingKey,
+        bytes: Vec<u8>,
+    ) -> Result<(), StorageError> {
+        // Never write foreign bytes over our OWN roster.
+        if author == self.identity.peer_id() {
+            return Err(StorageError::Peer(
+                "cannot import a roster log under our own peer id".into(),
+            ));
+        }
+
+        let roster_dir = self.roster_dir();
+        std::fs::create_dir_all(&roster_dir)?;
+        let roster_log = RosterLog::new(&roster_dir, author);
+        let roster_path = roster_log.path();
+
+        // Roster logs are append-only: refuse a shorter/older resend that would
+        // truncate newer entries already on disk.
+        if let Ok(existing) = std::fs::read(&roster_path) {
+            if bytes.len() < existing.len() {
+                return Err(StorageError::Peer(format!(
+                    "refusing to shrink roster {author} log ({} < {} bytes)",
+                    bytes.len(),
+                    existing.len()
+                )));
+            }
+        }
+
+        // Verify BEFORE persisting: a forged/tampered roster must never touch disk.
+        roster_log.verify_bytes(key, &bytes)?;
+        std::fs::write(&roster_path, &bytes)?;
+        self.refresh_peers()
+    }
+
     /// Import a peer's oplog bytes: write them to `ops/ops-<peer>.jsonl`,
     /// verify every entry against `key`, and merge into the document.
     pub fn import_peer(
@@ -109,6 +273,22 @@ impl Store {
         key: &VerifyingKey,
         log_bytes: Vec<u8>,
     ) -> Result<(), StorageError> {
+        // The roster is the trust boundary: only accept ops from a peer we
+        // currently vouch for. Unknown or revoked peers are refused outright.
+        match self.peers.iter().find(|p| p.peer_id == peer_id) {
+            Some(p) if p.status == PeerStatus::Active => {}
+            Some(_) => {
+                return Err(StorageError::Peer(format!(
+                    "refusing ops from revoked peer {peer_id}"
+                )));
+            }
+            None => {
+                return Err(StorageError::Peer(format!(
+                    "refusing ops from unknown peer {peer_id}"
+                )));
+            }
+        }
+
         // Never write foreign bytes over our OWN log.
         if peer_id == self.identity.peer_id() {
             return Err(StorageError::Peer(
@@ -148,6 +328,24 @@ impl Store {
         // later local edit does NOT re-export them into our OWN (own-key-signed)
         // log — that would mis-attribute the peer's ops to us.
         self.persisted = self.doc.version();
+        Ok(())
+    }
+
+    /// Rewrite the `peers.json` materialized cache via a temp file + rename.
+    ///
+    /// Like the snapshot, this is a **rebuildable cache** (the signed roster logs
+    /// are the source of truth, and `open()` always rebuilds from them), so it
+    /// deliberately does NOT `fsync` — a crash that loses the newest cache just
+    /// means a rebuild from the roster logs on next open, never lost trust.
+    fn write_peers_cache(&self) -> Result<(), StorageError> {
+        let path = self.root.join("peers.json");
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let tmp = path.with_extension("json.tmp");
+        let bytes = serde_json::to_vec(&self.peers)?;
+        std::fs::write(&tmp, &bytes)?;
+        std::fs::rename(&tmp, &path)?;
         Ok(())
     }
 }
@@ -201,6 +399,11 @@ mod tests {
 
         a.edit_text("note", 0, "AAA").unwrap();
         b.edit_text("note", 0, "BBB").unwrap();
+
+        // The roster is the trust boundary: each device must vouch for the other
+        // before its ops are accepted.
+        a.add_peer(id_b.peer_id(), id_b.verifying_key().to_bytes()).unwrap();
+        b.add_peer(id_a.peer_id(), id_a.verifying_key().to_bytes()).unwrap();
 
         // Copy each store's own oplog into the other and re-import.
         a.import_peer(id_b.peer_id(), &id_b.verifying_key(), b.export_own_log().unwrap())
@@ -263,6 +466,9 @@ mod tests {
         let mut a = Store::open(dir_a.path(), id_a).unwrap();
         let mut b = Store::open(dir_b.path(), id_b.clone()).unwrap();
 
+        // Trust b before importing its ops.
+        a.add_peer(id_b.peer_id(), id_b.verifying_key().to_bytes()).unwrap();
+
         b.edit_text("note", 0, "one").unwrap();
         b.edit_text("note", 3, "two").unwrap();
         let full = b.export_own_log().unwrap();
@@ -287,6 +493,7 @@ mod tests {
         let mut a = Store::open(dir_a.path(), id_a.clone()).unwrap();
         let mut b = Store::open(dir_b.path(), id_b.clone()).unwrap();
 
+        a.add_peer(id_b.peer_id(), id_b.verifying_key().to_bytes()).unwrap();
         a.edit_text("note", 0, "A").unwrap();
         b.edit_text("note", 0, "B").unwrap();
         a.import_peer(id_b.peer_id(), &id_b.verifying_key(), b.export_own_log().unwrap())
@@ -333,6 +540,63 @@ mod tests {
     }
 
     #[test]
+    fn add_peer_then_reopen_lists_the_peer() {
+        let dir = tempdir().unwrap();
+        let vault = dir.path().join("vault");
+        let a = Identity::generate();
+        let b = Identity::generate();
+
+        {
+            let mut store = Store::open(&vault, a.clone()).unwrap();
+            store.add_peer(b.peer_id(), b.verifying_key().to_bytes()).unwrap();
+        }
+        let reopened = Store::open(&vault, a).unwrap();
+        let roster = reopened.roster();
+        assert!(roster.iter().any(|p| p.peer_id == b.peer_id()
+            && p.status == crate::PeerStatus::Active));
+    }
+
+    #[test]
+    fn peer_ops_survive_a_cold_reopen_once_the_peer_is_in_the_roster() {
+        // The Slice-1 TODO(peers.json) gap: without a roster, a peer's ops vanished
+        // on cold reopen (no snapshot). With the roster, open() replays them.
+        let dir_a = tempdir().unwrap();
+        let dir_b = tempdir().unwrap();
+        let a_id = Identity::generate();
+        let b_id = Identity::generate();
+        let vault_a = dir_a.path().join("vault");
+
+        {
+            let mut a = Store::open(&vault_a, a_id.clone()).unwrap();
+            let mut b = Store::open(dir_b.path(), b_id.clone()).unwrap();
+            a.add_peer(b_id.peer_id(), b_id.verifying_key().to_bytes()).unwrap();
+            b.edit_text("note", 0, "from-b").unwrap();
+            a.import_peer(b_id.peer_id(), &b_id.verifying_key(), b.export_own_log().unwrap()).unwrap();
+            assert_eq!(a.text("note"), "from-b");
+        } // drop a: no snapshot written.
+
+        let reopened = Store::open(&vault_a, a_id).unwrap();
+        assert_eq!(reopened.text("note"), "from-b", "roster replay must restore peer ops");
+    }
+
+    #[test]
+    fn revoked_peer_ops_are_rejected_on_import() {
+        let dir_a = tempdir().unwrap();
+        let dir_b = tempdir().unwrap();
+        let a_id = Identity::generate();
+        let b_id = Identity::generate();
+
+        let mut a = Store::open(dir_a.path(), a_id).unwrap();
+        let mut b = Store::open(dir_b.path(), b_id.clone()).unwrap();
+        a.add_peer(b_id.peer_id(), b_id.verifying_key().to_bytes()).unwrap();
+        a.revoke_peer(b_id.peer_id(), b_id.verifying_key().to_bytes()).unwrap();
+
+        b.edit_text("note", 0, "sneaky").unwrap();
+        let err = a.import_peer(b_id.peer_id(), &b_id.verifying_key(), b.export_own_log().unwrap());
+        assert!(matches!(err, Err(StorageError::Peer(_))), "revoked peer ops must be refused");
+    }
+
+    #[test]
     fn import_peer_rejects_a_wrong_key_and_leaves_disk_untouched() {
         let dir_a = tempdir().unwrap();
         let dir_b = tempdir().unwrap();
@@ -342,6 +606,8 @@ mod tests {
 
         let mut a = Store::open(dir_a.path(), id_a).unwrap();
         let mut b = Store::open(dir_b.path(), id_b.clone()).unwrap();
+        // b is a trusted peer; the import must still fail on the wrong key alone.
+        a.add_peer(id_b.peer_id(), id_b.verifying_key().to_bytes()).unwrap();
         b.edit_text("note", 0, "peerdata").unwrap();
 
         // Verify against the WRONG key: must fail, not mutate the doc, and not

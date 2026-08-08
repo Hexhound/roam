@@ -12,5 +12,5 @@ pub use error::StorageError;
 pub use identity::{Identity, VerifyingKey};
 pub use ids::VaultId;
 pub use oplog::{Entry, OpLog};
-pub use roster::{RosterEntry, RosterLog, RosterOp};
+pub use roster::{merge_roster, PeerRecord, PeerStatus, RosterEntry, RosterLog, RosterOp};
 pub use store::Store;
