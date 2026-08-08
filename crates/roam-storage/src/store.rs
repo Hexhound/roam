@@ -186,6 +186,49 @@ impl Store {
         self.root.join("roster")
     }
 
+    /// This device's peer id (loro/index handle).
+    pub fn peer_id(&self) -> u64 {
+        self.identity.peer_id()
+    }
+
+    /// The committed document version, encoded for the `Have` wire frame.
+    pub fn doc_version_bytes(&self) -> Vec<u8> {
+        self.doc.version().to_bytes()
+    }
+
+    /// The raw bytes of `peer_id`'s stored oplog file (`ops/ops-<peer>.jsonl`),
+    /// for relaying a third-party log to another peer. NotFound ⇒ empty.
+    pub fn export_peer_log(&self, peer_id: u64) -> Result<Vec<u8>, StorageError> {
+        let path = self.root.join("ops").join(format!("ops-{peer_id}.jsonl"));
+        match std::fs::read(&path) {
+            Ok(b) => Ok(b),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Apply an appended chunk of `author`'s oplog received from a peer.
+    ///
+    /// The wire may carry only a suffix, so we concatenate `appended` onto the
+    /// bytes we already hold for `ops/ops-<author>.jsonl` and hand the whole log
+    /// to [`Store::import_peer`], which verifies, refuses to shrink, dedups, and
+    /// advances `persisted`. Because logs are append-only and loro dedups on
+    /// import, resending overlapping suffixes is safe. We never import our own
+    /// ops as a peer.
+    pub fn apply_peer_ops(
+        &mut self,
+        author: u64,
+        key: &VerifyingKey,
+        appended: &[u8],
+    ) -> Result<(), StorageError> {
+        if author == self.identity.peer_id() {
+            return Ok(());
+        }
+        let mut whole = self.export_peer_log(author)?;
+        whole.extend_from_slice(appended);
+        self.import_peer(author, key, whole)
+    }
+
     /// The current materialized roster (clone of the cached peer set).
     pub fn roster(&self) -> Vec<PeerRecord> {
         self.peers.clone()
@@ -594,6 +637,38 @@ mod tests {
         b.edit_text("note", 0, "sneaky").unwrap();
         let err = a.import_peer(b_id.peer_id(), &b_id.verifying_key(), b.export_own_log().unwrap());
         assert!(matches!(err, Err(StorageError::Peer(_))), "revoked peer ops must be refused");
+    }
+
+    #[test]
+    fn apply_peer_ops_appends_suffixes_and_converges() {
+        let dir_a = tempdir().unwrap();
+        let dir_b = tempdir().unwrap();
+        let id_a = Identity::generate();
+        let id_b = Identity::generate();
+
+        let mut a = Store::open(dir_a.path(), id_a).unwrap();
+        let mut b = Store::open(dir_b.path(), id_b.clone()).unwrap();
+        a.add_peer(id_b.peer_id(), id_b.verifying_key().to_bytes())
+            .unwrap();
+
+        // First op → whole log, applied as a suffix onto empty stored bytes.
+        b.edit_text("note", 0, "one").unwrap();
+        let first = b.export_own_log().unwrap();
+        a.apply_peer_ops(id_b.peer_id(), &id_b.verifying_key(), &first)
+            .unwrap();
+        assert_eq!(a.text("note"), "one");
+
+        // Second op → only the appended suffix beyond what a already holds.
+        b.edit_text("note", 3, "two").unwrap();
+        let full = b.export_own_log().unwrap();
+        let suffix = &full[first.len()..];
+        a.apply_peer_ops(id_b.peer_id(), &id_b.verifying_key(), suffix)
+            .unwrap();
+        assert_eq!(a.text("note"), "onetwo");
+
+        // Importing our own author id via apply_peer_ops is a no-op.
+        a.apply_peer_ops(a.peer_id(), &id_b.verifying_key(), &[1, 2, 3])
+            .unwrap();
     }
 
     #[test]
