@@ -133,10 +133,14 @@ impl Store {
                 )));
             }
         }
-        std::fs::write(&peer_log_path, &log_bytes)?;
 
+        // Verify BEFORE persisting: a forged/tampered peer log must never touch
+        // disk (it would become a live corruption source once `open` replays
+        // peer logs). Only after full verification do we write, then merge.
         let peer_log = OpLog::new(&ops_dir, peer_id);
-        for entry in peer_log.read_verified(key)? {
+        let entries = peer_log.verify_bytes(key, &log_bytes)?;
+        std::fs::write(&peer_log_path, &log_bytes)?;
+        for entry in entries {
             self.doc.import(&entry.update)?;
         }
         self.doc.commit();
@@ -305,5 +309,54 @@ mod tests {
             "own log leaked peer B's ops under our key: {:?}",
             rebuilt.text("note")
         );
+    }
+
+    #[test]
+    fn reopen_tolerates_a_torn_own_log_tail() {
+        let dir = tempdir().unwrap();
+        let vault = dir.path().join("vault");
+        let id = Identity::generate();
+
+        {
+            let mut store = Store::open(&vault, id.clone()).unwrap();
+            store.edit_text("note", 0, "keep").unwrap();
+        }
+
+        // Simulate a crash mid-append: a partial trailing line with no newline.
+        let own_log = vault.join("ops").join(format!("ops-{}.jsonl", id.peer_id()));
+        let mut f = std::fs::OpenOptions::new().append(true).open(&own_log).unwrap();
+        std::io::Write::write_all(&mut f, br#"{"peer":1,"sig":"tor"#).unwrap();
+
+        // Reopen must recover the complete edit and ignore the torn tail — no error.
+        let reopened = Store::open(&vault, id).unwrap();
+        assert_eq!(reopened.text("note"), "keep");
+    }
+
+    #[test]
+    fn import_peer_rejects_a_wrong_key_and_leaves_disk_untouched() {
+        let dir_a = tempdir().unwrap();
+        let dir_b = tempdir().unwrap();
+        let id_a = Identity::generate();
+        let id_b = Identity::generate();
+        let wrong = Identity::generate();
+
+        let mut a = Store::open(dir_a.path(), id_a).unwrap();
+        let mut b = Store::open(dir_b.path(), id_b.clone()).unwrap();
+        b.edit_text("note", 0, "peerdata").unwrap();
+
+        // Verify against the WRONG key: must fail, not mutate the doc, and not
+        // persist the peer log to disk (verify-before-write).
+        let err = a.import_peer(
+            id_b.peer_id(),
+            &wrong.verifying_key(),
+            b.export_own_log().unwrap(),
+        );
+        assert!(matches!(err, Err(StorageError::BadSignature(_))));
+        assert_eq!(a.text("note"), "");
+        let peer_log = dir_a
+            .path()
+            .join("ops")
+            .join(format!("ops-{}.jsonl", id_b.peer_id()));
+        assert!(!peer_log.exists(), "forged peer log must not be persisted");
     }
 }

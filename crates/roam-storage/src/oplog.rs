@@ -57,9 +57,25 @@ impl OpLog {
         };
         let mut json = serde_json::to_vec(&line)?;
         json.push(b'\n');
+
+        // Whether this append creates the file (vs. extends an existing one).
+        let is_create = !self.path.exists();
+
         let mut file = OpenOptions::new().create(true).append(true).open(&self.path)?;
         file.write_all(&json)?;
         file.sync_all()?;
+
+        // On file creation, the new directory entry itself must be flushed, or a
+        // power failure can lose the whole file (and thus the first op) despite
+        // the content sync above. Only needed on create; append-to-existing is fine.
+        #[cfg(unix)]
+        if is_create {
+            if let Some(dir) = self.path.parent() {
+                if let Ok(d) = std::fs::File::open(dir) {
+                    let _ = d.sync_all();
+                }
+            }
+        }
         Ok(())
     }
 
@@ -78,6 +94,19 @@ impl OpLog {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(e.into()),
         };
+        self.verify_text(key, &text)
+    }
+
+    /// Verify raw log `bytes` (as received from a peer) WITHOUT touching disk.
+    /// Same rules as [`OpLog::read_verified`]; lets a caller check bytes before
+    /// persisting them. Invalid UTF-8 is a malformed log.
+    pub fn verify_bytes(&self, key: &VerifyingKey, bytes: &[u8]) -> Result<Vec<Entry>, StorageError> {
+        let text = std::str::from_utf8(bytes)
+            .map_err(|e| StorageError::MalformedEntry(e.to_string()))?;
+        self.verify_text(key, text)
+    }
+
+    fn verify_text(&self, key: &VerifyingKey, text: &str) -> Result<Vec<Entry>, StorageError> {
         // A completed append always ends with '\n'. A missing trailing newline
         // means the final line was torn by a crash and may be tolerated.
         let torn_tail = !text.is_empty() && !text.ends_with('\n');
