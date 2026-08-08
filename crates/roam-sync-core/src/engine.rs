@@ -97,6 +97,58 @@ impl<T: Transport + 'static> Engine<T> {
         Ok(())
     }
 
+    /// Vouch for `peer` (holding `key`) locally, then gossip the updated roster
+    /// to every connected peer so they learn the new device (transitive mesh).
+    pub async fn add_peer(&self, peer: u64, key: [u8; 32]) -> anyhow::Result<()> {
+        {
+            let mut store = self.store.lock().await;
+            store.add_peer(peer, key)?;
+        }
+        self.broadcast_own_roster().await;
+        Ok(())
+    }
+
+    /// Revoke `peer` locally, then gossip the updated roster. The `Revoke` entry
+    /// is authored by an already-trusted device, so honest peers converge to
+    /// `Revoked` and `import_peer` refuses the revoked peer's later ops (the
+    /// stop-the-op behaviour comes for free from that existing guard). Full
+    /// defense against a malicious revoked peer is deferred (Slice-2 = basic
+    /// revoke).
+    pub async fn revoke_peer(&self, peer: u64, key: [u8; 32]) -> anyhow::Result<()> {
+        {
+            let mut store = self.store.lock().await;
+            store.revoke_peer(peer, key)?;
+        }
+        self.broadcast_own_roster().await;
+        Ok(())
+    }
+
+    /// Ship our own signed roster log to every currently-connected peer.
+    ///
+    /// Follows the no-lock-across-await rule: gather the roster bytes and the
+    /// connected-peer list under their respective locks, drop both guards, then
+    /// perform the transport sends.
+    async fn broadcast_own_roster(&self) {
+        let jsonl = {
+            let store = self.store.lock().await;
+            store.export_own_roster().unwrap_or_default()
+        };
+        let peers: Vec<u64> = {
+            let connected = self.connected.lock().await;
+            connected.iter().copied().collect()
+        };
+        for peer in peers {
+            self.send(
+                peer,
+                Frame::RosterOps {
+                    author: self.peer_id(),
+                    jsonl: jsonl.clone(),
+                },
+            )
+            .await;
+        }
+    }
+
     /// Handle one inbound frame from `peer`.
     pub async fn handle(&self, peer: u64, frame: Frame) -> anyhow::Result<()> {
         match frame {
@@ -146,13 +198,44 @@ impl<T: Transport + 'static> Engine<T> {
                     return Ok(());
                 }
                 let Some(key) = self.key_for(author).await else {
-                    // Author not yet trusted in our roster: drop (Task 5 relaxes
-                    // this with transitive learning).
+                    // Author not yet trusted in our roster: drop. Trust is only
+                    // ever extended transitively via an ALREADY-trusted author's
+                    // signed roster (below), never by an unknown peer.
                     return Ok(());
                 };
-                let mut store = self.store.lock().await;
-                if let Err(err) = store.import_roster(author, &key, jsonl) {
-                    let _ = err;
+                // Import the roster, then — still under the store lock — collect
+                // any newly-Active peer we are not yet connected to. We DROP the
+                // guard before dialing, because `connect` itself sends frames and
+                // must never run while holding the store lock (deadlock rule).
+                let new_peers: Vec<u64> = {
+                    let mut store = self.store.lock().await;
+                    if let Err(err) = store.import_roster(author, &key, jsonl) {
+                        // Verify/shrink failures: drop the frame, never crash.
+                        let _ = err;
+                        Vec::new()
+                    } else {
+                        let connected = self.connected.lock().await;
+                        store
+                            .roster()
+                            .into_iter()
+                            .filter(|p| {
+                                p.status == PeerStatus::Active
+                                    && p.peer_id != self.peer_id()
+                                    && !connected.contains(&p.peer_id)
+                            })
+                            .map(|p| p.peer_id)
+                            .collect()
+                    }
+                };
+                // Transitive mesh: dial every freshly-learned peer. A peer the
+                // transport cannot reach (e.g. an offline sibling) returns an
+                // error from `connect` — treat it as non-fatal so one unreachable
+                // peer does not abort the loop. The `!connected` guard above
+                // prevents re-connect loops and self-connects.
+                for new_peer in new_peers {
+                    if let Err(err) = self.connect(new_peer).await {
+                        let _ = err;
+                    }
                 }
             }
             Frame::RosterHave { .. } => {
