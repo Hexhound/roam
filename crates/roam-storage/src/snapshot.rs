@@ -8,8 +8,6 @@ use std::path::Path;
 /// (the op-log is the source of truth), so this deliberately does NOT `fsync`
 /// before the rename — a crash that loses the newest snapshot just means a
 /// slower next load that replays the op-log, never data loss.
-// used by Store in the next unit
-#[allow(dead_code)]
 pub fn save(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -21,8 +19,6 @@ pub fn save(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
 }
 
 /// Read a snapshot; `Ok(None)` if the file does not exist.
-// used by Store in the next unit
-#[allow(dead_code)]
 pub fn load(path: &Path) -> Result<Option<Vec<u8>>, StorageError> {
     match std::fs::read(path) {
         Ok(b) => Ok(Some(b)),
