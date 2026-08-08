@@ -56,6 +56,14 @@ impl Document {
         self.doc.commit();
     }
 
+    /// Load a document from a snapshot, then adopt `peer_id` for future edits.
+    pub fn from_snapshot(peer_id: u64, snapshot: &[u8]) -> Result<Self, CrdtError> {
+        let doc = LoroDoc::new();
+        doc.import(snapshot)?;
+        doc.set_peer_id(peer_id)?;
+        Ok(Self { doc })
+    }
+
     /// The document's current version (all committed ops).
     pub fn version(&self) -> Version {
         Version(self.doc.oplog_vv())
@@ -154,5 +162,20 @@ mod tests {
         let bytes = v.to_bytes();
         let v2 = Version::from_bytes(&bytes).unwrap();
         assert_eq!(v, v2);
+    }
+
+    #[test]
+    fn loads_from_snapshot_with_new_peer_id() {
+        let a = Document::new(1).unwrap();
+        a.insert_text("note", 0, "persisted").unwrap();
+        a.commit();
+        let snap = a.snapshot().unwrap();
+
+        // A fresh device (peer 2) loads the snapshot and can keep editing.
+        let b = Document::from_snapshot(2, &snap).unwrap();
+        assert_eq!(b.text("note"), "persisted");
+        b.insert_text("note", 9, "!").unwrap();
+        b.commit();
+        assert_eq!(b.text("note"), "persisted!");
     }
 }
