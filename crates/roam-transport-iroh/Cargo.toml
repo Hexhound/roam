@@ -1,0 +1,23 @@
+[package]
+name = "roam-transport-iroh"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+roam-sync-core = { path = "../roam-sync-core" }
+roam-storage = { path = "../roam-storage" }
+iroh.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+postcard.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+base64.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

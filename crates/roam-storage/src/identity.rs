@@ -48,6 +48,17 @@ impl Identity {
         self.signing_key.sign(msg)
     }
 
+    /// The raw 32-byte ed25519 secret, for constructing a transport key
+    /// (e.g. `iroh::SecretKey`).
+    ///
+    /// This is the SAME secret already persisted by [`Identity::save`]; it is
+    /// handed only to an in-process transport that must bind the SAME key so
+    /// the device's iroh `NodeId` equals its ed25519 verifying key. Never log
+    /// or serialize the returned bytes.
+    pub fn secret_bytes(&self) -> [u8; 32] {
+        self.signing_key.to_bytes()
+    }
+
     /// Persist to `path` (caller chooses a location outside the vault).
     ///
     /// The file holds a raw ed25519 secret key, so this writes it as owner-only
@@ -123,6 +134,17 @@ mod tests {
         assert!(id.verifying_key().verify(msg, &sig));
         // A different message must not verify.
         assert!(!id.verifying_key().verify(b"tampered", &sig));
+    }
+
+    #[test]
+    fn secret_bytes_reconstructs_the_same_key() {
+        let id = Identity::generate();
+        let rebuilt = SigningKey::from_bytes(&id.secret_bytes());
+        assert_eq!(
+            rebuilt.verifying_key().to_bytes(),
+            id.verifying_key().to_bytes(),
+            "the secret bytes must reconstruct the same verifying key (== iroh NodeId)"
+        );
     }
 
     #[test]
