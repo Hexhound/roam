@@ -551,3 +551,359 @@ fn edit_vs_delete_converges_regardless_of_sync_order() {
     assert_eq!(ab.1, EntryStatus::Live);
     assert_eq!(ab.2, "hello world\n");
 }
+
+// ===========================================================================
+// WS-F / F1 — THREE-device file-set convergence (A, B, C mutually trusted).
+//
+// The 2-device `sync`/`round`/`state` harness above generalizes cleanly: a
+// `sync` is a directed signed peer-merge for ANY ordered pair (roster trust is
+// established lazily per sender), so a fully-connected 3-device round is just
+// every ordered pair synced, then all three reconciled. Topology: complete
+// mesh A↔B↔C↔A — every device directly syncs every other, the strongest
+// convergence obligation.
+// ===========================================================================
+
+/// One full round over a complete 3-mesh: sync every ordered pair (so any
+/// device's newest ops reach both others directly), then reconcile all three.
+/// Bounded and deterministic — the LWW tiebreak is `(Lamport, peer_id)`.
+fn round3(a: &Device, b: &Device, c: &Device) {
+    sync(a, b);
+    sync(a, c);
+    sync(b, a);
+    sync(b, c);
+    sync(c, a);
+    sync(c, b);
+    a.scan();
+    b.scan();
+    c.scan();
+}
+
+/// Assert all three devices hold an identical `FileState` for `rel`/`container`,
+/// and return that shared state for further per-field assertions.
+fn converged3(a: &Device, b: &Device, c: &Device, rel: &str, container: &str) -> FileState {
+    let sa = state(a, rel, container);
+    let sb = state(b, rel, container);
+    let sc = state(c, rel, container);
+    assert_eq!(sa, sb, "A and B must converge to the same state");
+    assert_eq!(sb, sc, "B and C must converge to the same state");
+    sa
+}
+
+// ---------------------------------------------------------------------------
+// F1.1 — create on A propagates to B AND C.
+// ---------------------------------------------------------------------------
+#[test]
+fn create_propagates_a_to_b_and_c() {
+    let a = Device::new();
+    let b = Device::new();
+    let c = Device::new();
+    let rel = "note.md";
+    let container = cid(&a, rel);
+
+    import(&a, rel, "hello\n");
+    for _ in 0..3 {
+        round3(&a, &b, &c);
+    }
+
+    let final_state = converged3(&a, &b, &c, rel, &container);
+    assert_eq!(final_state.disk.as_deref(), Some(&b"hello\n"[..]));
+    assert!(final_state.sidecar_exists);
+    assert_eq!(final_state.status, Some(EntryStatus::Live));
+    assert_eq!(final_state.text, "hello\n");
+    // Explicit: the file is present on ALL three, not merely equal.
+    assert!(a.vault_file(rel).exists());
+    assert!(b.vault_file(rel).exists());
+    assert!(c.vault_file(rel).exists());
+
+    // Stability across an extra round.
+    let baseline = converged3(&a, &b, &c, rel, &container);
+    round3(&a, &b, &c);
+    assert_eq!(
+        converged3(&a, &b, &c, rel, &container),
+        baseline,
+        "3-device create must be stable across an extra round"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// F1.2 — delete on A (no concurrent edit) → gone on B and C, Tombstoned on all.
+// ---------------------------------------------------------------------------
+#[test]
+fn delete_propagates_a_to_b_and_c() {
+    let a = Device::new();
+    let b = Device::new();
+    let c = Device::new();
+    let rel = "note.md";
+    let container = cid(&a, rel);
+
+    import(&a, rel, "hello\n");
+    for _ in 0..3 {
+        round3(&a, &b, &c);
+    }
+    assert!(b.vault_file(rel).exists());
+    assert!(c.vault_file(rel).exists());
+
+    a.delete_file(&a.vault_file(rel));
+    for _ in 0..3 {
+        round3(&a, &b, &c);
+    }
+
+    let final_state = converged3(&a, &b, &c, rel, &container);
+    assert_eq!(final_state.disk, None, "delete must win: file absent");
+    assert!(!final_state.sidecar_exists);
+    assert_eq!(final_state.status, Some(EntryStatus::Tombstoned));
+    // Gone on B and C explicitly.
+    assert!(!b.vault_file(rel).exists());
+    assert!(!c.vault_file(rel).exists());
+
+    let baseline = converged3(&a, &b, &c, rel, &container);
+    round3(&a, &b, &c);
+    assert_eq!(
+        converged3(&a, &b, &c, rel, &container),
+        baseline,
+        "3-device delete must be stable across an extra round"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// F1.3 — rename on A → old gone / new present with content on B and C.
+// ---------------------------------------------------------------------------
+#[test]
+fn rename_propagates_a_to_b_and_c() {
+    let a = Device::new();
+    let b = Device::new();
+    let c = Device::new();
+    let old_container = cid(&a, "old.md");
+    let new_container = cid(&a, "new.md");
+
+    import(&a, "old.md", "content\n");
+    for _ in 0..3 {
+        round3(&a, &b, &c);
+    }
+    assert!(b.vault_file("old.md").exists());
+    assert!(c.vault_file("old.md").exists());
+
+    a.rename_file(&a.vault_file("old.md"), &a.vault_file("new.md"));
+    for _ in 0..3 {
+        round3(&a, &b, &c);
+    }
+
+    // New path: identical Live state on all three, holding the moved content.
+    let new_state = converged3(&a, &b, &c, "new.md", &new_container);
+    assert_eq!(new_state.disk.as_deref(), Some(&b"content\n"[..]));
+    assert_eq!(new_state.status, Some(EntryStatus::Live));
+    // Old path: gone / Tombstoned on all three.
+    let old_state = converged3(&a, &b, &c, "old.md", &old_container);
+    assert_eq!(old_state.disk, None);
+    assert_eq!(old_state.status, Some(EntryStatus::Tombstoned));
+
+    assert!(!b.vault_file("old.md").exists());
+    assert!(!c.vault_file("old.md").exists());
+    assert!(b.vault_file("new.md").exists());
+    assert!(c.vault_file("new.md").exists());
+
+    // Stability for both paths.
+    let base_new = converged3(&a, &b, &c, "new.md", &new_container);
+    let base_old = converged3(&a, &b, &c, "old.md", &old_container);
+    round3(&a, &b, &c);
+    assert_eq!(converged3(&a, &b, &c, "new.md", &new_container), base_new);
+    assert_eq!(converged3(&a, &b, &c, "old.md", &old_container), base_old);
+}
+
+// ---------------------------------------------------------------------------
+// F1.4 — concurrent edit-vs-delete across 3 devices → EDIT WINS on all three.
+//
+// A and B start synced with x.md; then CONCURRENTLY A deletes it while B edits
+// it. C is a PASSIVE third party — it was not party to the original file and
+// only observes the resolved file-set state as the mesh settles. A's delete is a
+// SINGLE op, so B's edit + Live `set_entry` out-Lamport it and the file-set
+// map's LWW picks Live — the analogue of the 2-device test #3, now with a third
+// device that must also converge to edit-wins.
+//
+// C is modeled as a fresh observer (no prior local copy) deliberately: the
+// bridge's `scan` re-projects a remotely-edited container onto disk only via the
+// remote-new path (Live + absent + no sidecar). A device that already holds a
+// clean-but-stale disk copy of a remotely-edited file is NOT re-projected by
+// `scan` at the bridge layer — a separate, pre-existing reconcile concern
+// outside WS-F's file-set convergence scope. Driving C as a passive newcomer
+// exercises exactly the 3-device LWW merge (A's tombstone + B's Live both reach
+// C; C resolves Live and projects the edit-wins content) that WS-F targets.
+// ---------------------------------------------------------------------------
+#[test]
+fn concurrent_edit_vs_delete_three_device_edit_wins_and_converges() {
+    let a = Device::new();
+    let b = Device::new();
+    let c = Device::new();
+    let rel = "x.md";
+    let container = cid(&a, rel);
+
+    // A and B start synced with x.md = "hello\n"; C has NOT seen the file yet.
+    import(&a, rel, "hello\n");
+    sync(&a, &b);
+    b.scan();
+    assert_eq!(std::fs::read(b.vault_file(rel)).unwrap(), b"hello\n");
+    assert!(!c.vault_file(rel).exists(), "C is a fresh passive observer");
+
+    // CONCURRENTLY (no sync between):
+    //  - A deletes x.md (single-op tombstone).
+    a.delete_file(&a.vault_file(rel));
+    //  - B edits + imports (container diverges; entry stays Live).
+    //  - C does nothing (passive third party; receives the resolved state below).
+    import(&b, rel, "hello world\n");
+
+    for _ in 0..4 {
+        round3(&a, &b, &c);
+    }
+
+    // CONVERGENCE: identical final state on all three, edit-wins.
+    let final_state = converged3(&a, &b, &c, rel, &container);
+    assert_eq!(
+        final_state.disk.as_deref(),
+        Some(&b"hello world\n"[..]),
+        "edit must win on all three: file present with the edited content"
+    );
+    assert_eq!(final_state.status, Some(EntryStatus::Live));
+    assert_eq!(final_state.text, "hello world\n");
+    assert!(a.vault_file(rel).exists());
+    assert!(b.vault_file(rel).exists());
+    assert!(c.vault_file(rel).exists());
+
+    // STABILITY across an extra round (asserted after a single round, so a
+    // period-2 oscillation can't alias as stable).
+    let baseline = converged3(&a, &b, &c, rel, &container);
+    round3(&a, &b, &c);
+    assert_eq!(
+        converged3(&a, &b, &c, rel, &container),
+        baseline,
+        "3-device edit-wins must be stable across an extra round"
+    );
+    round3(&a, &b, &c);
+    assert_eq!(
+        converged3(&a, &b, &c, rel, &container),
+        baseline,
+        "3-device edit-wins must be stable across a second extra round"
+    );
+}
+
+// ===========================================================================
+// WS-F / F2 — RELAYED peer-log path at the files layer.
+//
+// Topology: A↔B and B↔C, but NEVER A↔C directly. A's ops reach C ONLY because
+// B re-exports A's stored log to C. This mirrors the sync-core mesh test's
+// transitive gossip (`c_learns_b_transitively_through_a`) but drives it at the
+// Store level and asserts file-set / disk outcomes.
+//
+// HOW THE RELAY IS DRIVEN: after `sync(A, B)`, B durably holds A's signed log at
+// `ops/ops-<A>.jsonl`. `relay(via = B, author = A, to = C)` reads that with
+// `export_peer_log(A.peer_id())` — A's ORIGINAL signatures, untouched — and lands
+// it in C via `apply_peer_ops(A.peer_id(), &A_key, log)`. C independently trusts A
+// (roster `add_peer`, as it would after transitive roster gossip). No
+// `export_own_log` on A is ever shipped to C, and A and C never sync directly.
+// ===========================================================================
+
+/// `via` re-exports `author`'s stored (third-party) log to `to` — the RELAY
+/// path. `to` establishes roster trust in `author` lazily (mirroring transitive
+/// roster learning) and applies the relayed ops. Nothing here touches a direct
+/// `author`↔`to` channel.
+fn relay(via: &Device, author: &Device, to: &Device) {
+    let (_via_bridge, via_store) = via.open();
+    let log = via_store
+        .export_peer_log(author.identity.peer_id())
+        .unwrap();
+    assert!(
+        !log.is_empty(),
+        "relay precondition: `via` must already hold `author`'s log"
+    );
+
+    let mut store = Store::open(&to.store, to.identity.clone()).unwrap();
+    let author_key = author.identity.verifying_key();
+    if !store
+        .roster()
+        .iter()
+        .any(|p| p.peer_id == author.identity.peer_id())
+    {
+        store
+            .add_peer(author.identity.peer_id(), author_key.to_bytes())
+            .unwrap();
+    }
+    store
+        .apply_peer_ops(author.identity.peer_id(), &author_key, &log)
+        .unwrap();
+    // `store` drops here, releasing `to`'s store_root for the next `open()`.
+}
+
+// ---------------------------------------------------------------------------
+// F2.1 — a CREATE on A reaches C only via B's relay (no direct A↔C sync).
+// ---------------------------------------------------------------------------
+#[test]
+fn create_relayed_a_to_c_via_b() {
+    let a = Device::new();
+    let b = Device::new();
+    let c = Device::new();
+    let rel = "relayed.md";
+    let container = cid(&a, rel);
+
+    // A creates; A→B only.
+    import(&a, rel, "relay hello\n");
+    sync(&a, &b);
+    b.scan();
+    assert_eq!(std::fs::read(b.vault_file(rel)).unwrap(), b"relay hello\n");
+
+    // B relays A's log to C. There is NO A↔C sync anywhere.
+    relay(&b, &a, &c);
+    c.scan();
+
+    // C materialized A's file on disk with a Live entry, purely from the relay.
+    assert_eq!(
+        std::fs::read(c.vault_file(rel)).unwrap(),
+        b"relay hello\n",
+        "C must receive A's file via B's relay without a direct A↔C link"
+    );
+    assert!(sidecar_path(&c.vault_file(rel)).exists());
+    assert_eq!(
+        c.entry(&container).map(|e| e.status),
+        Some(EntryStatus::Live)
+    );
+    assert_eq!(c.store_text(&container), "relay hello\n");
+}
+
+// ---------------------------------------------------------------------------
+// F2.2 — a DELETE on A relayed the same way → C removes the file.
+// ---------------------------------------------------------------------------
+#[test]
+fn delete_relayed_a_to_c_via_b() {
+    let a = Device::new();
+    let b = Device::new();
+    let c = Device::new();
+    let rel = "relayed.md";
+    let container = cid(&a, rel);
+
+    // A creates → relay create to C via B; C now holds the file.
+    import(&a, rel, "relay hello\n");
+    sync(&a, &b);
+    b.scan();
+    relay(&b, &a, &c);
+    c.scan();
+    assert!(c.vault_file(rel).exists());
+
+    // A deletes; A→B carries the tombstone into B's stored A-log.
+    a.delete_file(&a.vault_file(rel));
+    sync(&a, &b);
+    b.scan();
+    assert!(!b.vault_file(rel).exists());
+
+    // B relays A's now-extended log to C (full log; apply_peer_ops handles the
+    // append-only prefix). C applies the tombstone with no direct A↔C link.
+    relay(&b, &a, &c);
+    c.scan();
+
+    assert!(
+        !c.vault_file(rel).exists(),
+        "C must remove the file from A's relayed delete, without a direct A↔C link"
+    );
+    assert!(!sidecar_path(&c.vault_file(rel)).exists());
+    assert_eq!(
+        c.entry(&container).map(|e| e.status),
+        Some(EntryStatus::Tombstoned)
+    );
+}
