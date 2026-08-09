@@ -1,8 +1,9 @@
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 use unicode_normalization::UnicodeNormalization;
 
 use crate::error::FilesError;
+use crate::fileset::FILESET_MAP_ID;
 
 /// Compute the stable container id for `file` within `vault_root`.
 ///
@@ -37,7 +38,38 @@ pub fn container_id(vault_root: &Path, file: &Path) -> Result<String, FilesError
     let joined = relative.join("/");
 
     // Apply Unicode NFC so decomposed and composed forms map to one id.
-    Ok(joined.nfc().collect())
+    let key: String = joined.nfc().collect();
+
+    // Reserved-name guard (B3): a real vault file literally named
+    // `__roam_fileset__` at the vault root resolves to exactly `FILESET_MAP_ID`,
+    // which would collide the file's text container with the well-known file-set
+    // map container. Reject it here — `container_id` is the single choke point
+    // every flow (import/scan/project/rename) passes through, and it is only ever
+    // called on real vault files (the map container is referenced by the constant
+    // directly, never via `container_id`), so no legitimate caller trips this.
+    // `path.rs` referencing `fileset::FILESET_MAP_ID` is a plain intra-crate
+    // `use`; Rust module graphs may be cyclic, so there is no dependency cycle.
+    if key == FILESET_MAP_ID {
+        return Err(FilesError::ReservedName(key));
+    }
+
+    Ok(key)
+}
+
+/// Reconstruct the on-disk path for a container-id `key` under `vault_root`.
+///
+/// This is the platform-correct inverse of [`container_id`]: a key is a
+/// `/`-separated vault-relative path, so we split on `/` and join each component
+/// onto `vault_root` via [`Path::push`]. That produces native separators on
+/// every platform (e.g. `vault\a\b.md` on Windows) instead of the literal
+/// `vault/a/b.md` string a bare `vault_root.join(key)` would yield on Windows.
+/// On unix the result is byte-identical to the old `join`.
+pub fn key_to_path(vault_root: &Path, key: &str) -> PathBuf {
+    let mut path = vault_root.to_path_buf();
+    for component in key.split('/') {
+        path.push(component);
+    }
+    path
 }
 
 /// Lexically normalize `path` into its `/`-oriented "normal" components,
@@ -131,6 +163,58 @@ mod tests {
         let vault = PathBuf::from("vault");
         let file = PathBuf::from("vault/a/b.md");
         assert_eq!(container_id(&vault, &file).unwrap(), "a/b.md");
+    }
+
+    #[test]
+    fn key_to_path_round_trips_nested_key_by_components() {
+        // B1: container_id(vault, vault/a/b.md) -> "a/b.md"; key_to_path must
+        // reconstruct vault/a/b.md. Compare by COMPONENTS (not the raw string) so
+        // the assertion holds regardless of the platform path separator.
+        let vault = PathBuf::from("/vault/root");
+        let original = vault.join("a").join("b.md");
+        let key = container_id(&vault, &original).unwrap();
+        assert_eq!(key, "a/b.md");
+
+        let reconstructed = key_to_path(&vault, &key);
+        let original_parts: Vec<_> = original.components().collect();
+        let reconstructed_parts: Vec<_> = reconstructed.components().collect();
+        assert_eq!(reconstructed_parts, original_parts);
+    }
+
+    #[test]
+    fn key_to_path_deeply_nested_round_trip() {
+        let vault = PathBuf::from("/vault/root");
+        let original = vault.join("deep").join("nested").join("path").join("n.md");
+        let key = container_id(&vault, &original).unwrap();
+        assert_eq!(key, "deep/nested/path/n.md");
+        let reconstructed = key_to_path(&vault, &key);
+        assert_eq!(
+            reconstructed.components().collect::<Vec<_>>(),
+            original.components().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn reserved_fileset_name_is_rejected() {
+        // B3: a vault-relative path that is exactly the file-set sentinel maps to
+        // FILESET_MAP_ID and must be rejected.
+        let vault = PathBuf::from("/vault/root");
+        let file = vault.join(FILESET_MAP_ID);
+        assert!(matches!(
+            container_id(&vault, &file),
+            Err(FilesError::ReservedName(name)) if name == FILESET_MAP_ID
+        ));
+    }
+
+    #[test]
+    fn sentinel_as_normal_filename_is_allowed() {
+        // A file that merely CONTAINS the sentinel (different key) is fine.
+        let vault = PathBuf::from("/vault/root");
+        let file = vault.join("notes").join("__roam_fileset__.md");
+        assert_eq!(
+            container_id(&vault, &file).unwrap(),
+            "notes/__roam_fileset__.md"
+        );
     }
 
     #[test]

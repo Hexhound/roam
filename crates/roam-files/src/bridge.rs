@@ -51,7 +51,7 @@ use roam_storage::Store;
 
 use crate::error::FilesError;
 use crate::fileset::{EntryKind, EntryStatus, FileEntry, FILESET_MAP_ID};
-use crate::path::container_id;
+use crate::path::{container_id, key_to_path};
 use crate::rebase::merge_local_onto_remote;
 use crate::sidecar::{sidecar_path, text_hash, Sidecar};
 use crate::textdiff::{diff_to_ops, TextOp};
@@ -101,6 +101,21 @@ impl FolderBridge {
     /// changes since the last sync is a no-op that leaves the sidecar untouched.
     pub fn import_file(&self, store: &mut Store, file: &Path) -> Result<SyncOutcome, FilesError> {
         let container = container_id(&self.vault_root, file)?;
+
+        // Case-only-collision guard (B2). On a case-insensitive filesystem two
+        // keys that differ ONLY by case (`a.md` vs `A.md`) name the SAME disk
+        // file, so tracking the second would silently clobber the first. Reject
+        // (don't clobber) before any mutation. The check is at the CRDT-key
+        // level — on a truly case-insensitive FS both names are the same disk
+        // file anyway; this stops two DISTINCT live keys from ever coexisting.
+        // Comparison is ASCII-case-insensitive (see `FilesError::CaseCollision`).
+        // A byte-identical re-import (same `a.md` again) is NOT a collision.
+        if let Some(existing) = live_case_collision(store, &container) {
+            return Err(FilesError::CaseCollision {
+                existing,
+                incoming: container,
+            });
+        }
 
         // Read bytes then decode so a non-UTF-8 file is a distinct error from
         // an IO failure.
@@ -389,7 +404,7 @@ impl FolderBridge {
             if store.get_entry(FILESET_MAP_ID, key).is_some() {
                 continue;
             }
-            if !sidecar_path(&self.vault_root.join(key)).exists() {
+            if !sidecar_path(&key_to_path(&self.vault_root, key)).exists() {
                 continue;
             }
             store.set_entry(
@@ -414,11 +429,10 @@ impl FolderBridge {
             if entry.status != EntryStatus::Live || present.contains(&key) {
                 continue;
             }
-            // `vault_root.join(key)` inverts container_id → absolute path. The
-            // key is a `/`-separated vault-relative path, so this is correct on
-            // unix; on Windows the `/` separators would need translating to `\`
-            // (out of scope — this crate targets unix vaults).
-            let file = self.vault_root.join(&key);
+            // `key_to_path` inverts container_id → absolute path, splitting the
+            // `/`-separated vault-relative key and joining each component so the
+            // result uses native separators on every platform (B1).
+            let file = key_to_path(&self.vault_root, &key);
             let sidecar = sidecar_path(&file);
             if !sidecar.exists() {
                 // Absent file with no sidecar: a remote-new entry this device
@@ -459,7 +473,7 @@ impl FolderBridge {
         // --- Step 3: apply remote state onto disk. ---
         for (key, value) in store.entries(FILESET_MAP_ID) {
             let entry = FileEntry::from_value(&value)?;
-            let file = self.vault_root.join(&key);
+            let file = key_to_path(&self.vault_root, &key);
             let file_present = present.contains(&key);
             match entry.status {
                 EntryStatus::Live => {
@@ -682,6 +696,31 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), FilesError> {
             Err(FilesError::Io(err))
         }
     }
+}
+
+/// Find an existing LIVE file-set key that case-insensitively collides with
+/// `incoming` but is not byte-identical to it (B2). Returns the colliding
+/// existing key, or `None` when there is no case-only collision.
+///
+/// Only `Live` entries are considered: a tombstoned key names no live disk
+/// file, so it cannot be clobbered. An unparseable entry value is skipped
+/// (treated as non-colliding) rather than aborting the import. The match uses
+/// `eq_ignore_ascii_case`; full Unicode case-folding is not applied.
+fn live_case_collision(store: &Store, incoming: &str) -> Option<String> {
+    for (key, value) in store.entries(FILESET_MAP_ID) {
+        if key == incoming {
+            continue; // byte-identical: the same file, never a collision.
+        }
+        if !key.eq_ignore_ascii_case(incoming) {
+            continue;
+        }
+        if let Ok(entry) = FileEntry::from_value(&value) {
+            if entry.status == EntryStatus::Live {
+                return Some(key);
+            }
+        }
+    }
+    None
 }
 
 /// Remove `path` if it exists, treating a `NotFound` as success (already gone)
@@ -1169,6 +1208,45 @@ mod tests {
         let sidecar = Sidecar::load(&file).unwrap().unwrap();
         assert_eq!(sidecar.last_synced_text, store.text(&container));
         assert_eq!(sidecar.last_synced_text, "XYZ hello world END\n");
+    }
+
+    #[test]
+    fn case_only_collision_is_rejected() {
+        // B2: import `a.md`, then a DISTINCT `A.md`. On a case-insensitive FS
+        // both are the same disk file, so the second must be refused rather than
+        // silently clobbering the first at the CRDT-key level.
+        let dir = tempdir().unwrap();
+        let (b, mut store) = bridge(dir.path());
+        let vault = dir.path().join("vault");
+        let lower = vault.join("a.md");
+        let upper = vault.join("A.md");
+        std::fs::write(&lower, "lower\n").unwrap();
+        std::fs::write(&upper, "UPPER\n").unwrap();
+
+        b.import_file(&mut store, &lower).unwrap();
+
+        let result = b.import_file(&mut store, &upper);
+        assert!(matches!(
+            result,
+            Err(FilesError::CaseCollision { existing, incoming })
+                if existing == "a.md" && incoming == "A.md"
+        ));
+    }
+
+    #[test]
+    fn byte_identical_reimport_is_not_a_collision() {
+        // Re-importing the SAME key (byte-identical) must not be flagged as a
+        // case collision — it is just an idempotent re-import.
+        let dir = tempdir().unwrap();
+        let (b, mut store) = bridge(dir.path());
+        let file = dir.path().join("vault").join("a.md");
+        std::fs::write(&file, "hello\n").unwrap();
+
+        b.import_file(&mut store, &file).unwrap();
+        // Second import of the identical key: fine (no-op, no collision).
+        let outcome = b.import_file(&mut store, &file).unwrap();
+        assert_eq!(outcome.ops_applied, 0);
+        assert!(!outcome.changed);
     }
 
     #[test]

@@ -40,4 +40,30 @@ pub enum FilesError {
     /// (or otherwise resolve) before projecting. Holds the affected path.
     #[error("refusing to overwrite un-imported local edits: {0}")]
     DirtyFile(PathBuf),
+
+    /// Two container keys differ only by letter case (e.g. `a.md` vs `A.md`).
+    /// On a case-insensitive filesystem both keys map to the SAME on-disk file,
+    /// so materializing the second would silently clobber the first. Refused so
+    /// the collision surfaces instead of destroying data. `existing` is the live
+    /// key already tracked; `incoming` is the colliding key being introduced.
+    ///
+    /// The comparison is ASCII-case-insensitive (`eq_ignore_ascii_case`), which
+    /// covers the common `A`/`a` clobber; full Unicode case-folding is not
+    /// applied (a rarer source of case-insensitive-FS collisions).
+    #[error("case-only key collision: {incoming:?} collides with existing {existing:?}")]
+    CaseCollision {
+        /// The live key already present in the file-set map.
+        existing: String,
+        /// The colliding key being introduced.
+        incoming: String,
+    },
+
+    /// A vault file resolved to a container id that collides with a reserved,
+    /// well-known container id (e.g. the file-set map's [`FILESET_MAP_ID`]). Such
+    /// a file cannot be tracked without its text container overwriting the
+    /// reserved container, so it is rejected. Holds the offending key.
+    ///
+    /// [`FILESET_MAP_ID`]: crate::FILESET_MAP_ID
+    #[error("reserved container id cannot be used as a vault file: {0}")]
+    ReservedName(String),
 }
