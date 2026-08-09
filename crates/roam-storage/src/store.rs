@@ -162,6 +162,25 @@ impl Store {
         self.persist_new_ops()
     }
 
+    /// Set a file-set-map entry, commit, and durably append the resulting signed
+    /// delta. Rides the exact same commit + version-guarded export + own-log
+    /// append path as `edit_text`, so the map op merges through the standard
+    /// export/import peer path with no roster/transport changes.
+    pub fn set_entry(&mut self, map_id: &str, key: &str, value: &str) -> Result<(), StorageError> {
+        self.doc.set_entry(map_id, key, value)?;
+        self.persist_new_ops()
+    }
+
+    /// The current value for `key` in map `map_id`, if any.
+    pub fn get_entry(&self, map_id: &str, key: &str) -> Option<String> {
+        self.doc.get_entry(map_id, key)
+    }
+
+    /// All key/value pairs in map `map_id`.
+    pub fn entries(&self, map_id: &str) -> Vec<(String, String)> {
+        self.doc.entries(map_id)
+    }
+
     fn persist_new_ops(&mut self) -> Result<(), StorageError> {
         self.doc.commit();
         // Guard on the version, not `delta.is_empty()`: loro's updates export is
@@ -901,6 +920,84 @@ mod tests {
             "overlapping suffix duplicated a boundary entry on disk"
         );
         assert_eq!(a.text("note"), "l0l1l2");
+    }
+
+    #[test]
+    fn map_entries_persist_across_reopen() {
+        let dir = tempdir().unwrap();
+        let vault = dir.path().join("vault");
+        let id = Identity::generate();
+
+        {
+            let mut store = Store::open(&vault, id.clone()).unwrap();
+            store.set_entry("m", "k", "v").unwrap();
+        } // drop: everything is on disk now.
+
+        // Reopen from a cold Store — oplog replay must restore the map state.
+        let reopened = Store::open(&vault, id).unwrap();
+        assert_eq!(reopened.get_entry("m", "k"), Some("v".to_string()));
+    }
+
+    #[test]
+    fn two_stores_converge_map_entries_by_exchanging_oplogs() {
+        let dir_a = tempdir().unwrap();
+        let dir_b = tempdir().unwrap();
+        let id_a = Identity::generate();
+        let id_b = Identity::generate();
+
+        let mut a = Store::open(dir_a.path(), id_a.clone()).unwrap();
+        let mut b = Store::open(dir_b.path(), id_b.clone()).unwrap();
+
+        a.set_entry("m", "k", "from-A").unwrap();
+        b.set_entry("m", "k", "from-B").unwrap();
+
+        // The roster is the trust boundary: each device must vouch for the other
+        // before its ops are accepted.
+        a.add_peer(id_b.peer_id(), id_b.verifying_key().to_bytes()).unwrap();
+        b.add_peer(id_a.peer_id(), id_a.verifying_key().to_bytes()).unwrap();
+
+        // Exchange own-logs both directions via the real peer-merge API.
+        a.apply_peer_ops(id_b.peer_id(), &id_b.verifying_key(), &b.export_own_log().unwrap())
+            .unwrap();
+        b.apply_peer_ops(id_a.peer_id(), &id_a.verifying_key(), &a.export_own_log().unwrap())
+            .unwrap();
+
+        // Both converge to the single LWW winner for the key.
+        let winner = a.get_entry("m", "k");
+        assert!(winner.is_some(), "converged winner must be set");
+        assert_eq!(winner, b.get_entry("m", "k"), "stores did not converge");
+    }
+
+    #[test]
+    fn a_redundant_set_entry_appends_nothing() {
+        let dir = tempdir().unwrap();
+        let vault = dir.path().join("vault");
+        let id = Identity::generate();
+        let mut store = Store::open(&vault, id.clone()).unwrap();
+
+        store.set_entry("m", "k", "v").unwrap();
+        let after_real = store.export_own_log().unwrap().len();
+        // Setting the SAME key+value produces no state change → the version guard
+        // in persist_new_ops must keep the own log from growing.
+        store.set_entry("m", "k", "v").unwrap();
+        assert_eq!(store.export_own_log().unwrap().len(), after_real);
+    }
+
+    #[test]
+    fn map_and_text_coexist_across_reopen() {
+        let dir = tempdir().unwrap();
+        let vault = dir.path().join("vault");
+        let id = Identity::generate();
+
+        {
+            let mut store = Store::open(&vault, id.clone()).unwrap();
+            store.edit_text("note", 0, "hello").unwrap();
+            store.set_entry("m", "k", "v").unwrap();
+        }
+
+        let reopened = Store::open(&vault, id).unwrap();
+        assert_eq!(reopened.text("note"), "hello");
+        assert_eq!(reopened.get_entry("m", "k"), Some("v".to_string()));
     }
 
     #[test]
