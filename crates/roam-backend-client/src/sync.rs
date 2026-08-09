@@ -1,1 +1,187 @@
-// filled in later tasks
+use crate::crypto::VaultKey;
+use crate::entries::{local_blobs, local_entries, reassemble_log, split_log_lines};
+use crate::transport::Backend;
+use roam_storage::{Store, VerifyingKey};
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use tokio::sync::Mutex;
+
+/// One full reconcile pass against the backend: push what the backend lacks,
+/// pull what the local store lacks, apply pulled ops through the existing
+/// idempotent import path. Stateless — the manifest diff each round is
+/// authoritative; a stale manifest just defers work to the next round.
+///
+/// INVARIANT: every mutation of `store` goes through the SAME `Arc<Mutex<Store>>`
+/// the iroh Engine holds, so the two apply paths never race.
+pub async fn reconcile_once<B: Backend>(
+    store: &Arc<Mutex<Store>>,
+    backend: &Arc<B>,
+    key: &VaultKey,
+) -> anyhow::Result<()> {
+    let bucket = key.bucket_id();
+
+    let (local_entries_vec, local_blobs_vec, self_peer) = {
+        let guard = store.lock().await;
+        (
+            local_entries(&guard, key)?,
+            local_blobs(&guard, key)?,
+            guard.peer_id(),
+        )
+    };
+    let local_entry_ids: BTreeMap<String, Vec<u8>> = local_entries_vec.into_iter().collect();
+    let local_blob_ids: BTreeMap<String, String> = local_blobs_vec.into_iter().collect();
+
+    let manifest = backend.manifest(&bucket).await?;
+    let remote_entry_ids: std::collections::BTreeSet<String> =
+        manifest.entry_ids.into_iter().collect();
+    let remote_blob_ids: std::collections::BTreeSet<String> =
+        manifest.blob_ids.into_iter().collect();
+
+    // Upload entries the backend lacks (encrypt the line bytes).
+    for (id, line) in &local_entry_ids {
+        if !remote_entry_ids.contains(id) {
+            let ct = key.seal(line);
+            backend.put_entry(&bucket, id, ct).await?;
+        }
+    }
+    // Upload blobs the backend lacks (encrypt the plaintext bytes).
+    for (id, content_hash) in &local_blob_ids {
+        if !remote_blob_ids.contains(id) {
+            let bytes = {
+                let guard = store.lock().await;
+                guard.blobs().get(content_hash)?.unwrap_or_default()
+            };
+            let ct = key.seal(&bytes);
+            backend.put_blob(&bucket, id, ct).await?;
+        }
+    }
+
+    // Fetch blobs we lack, decrypt, store.
+    for id in &remote_blob_ids {
+        if local_blob_ids.contains_key(id) {
+            continue;
+        }
+        if let Some(ct) = backend.get_blob(&bucket, id).await? {
+            let plaintext = key.open(&ct)?;
+            let guard = store.lock().await;
+            guard.blobs().put(&plaintext)?;
+        }
+    }
+
+    // Fetch entries we lack, per peer, in strict index order, then import.
+    let has_missing = remote_entry_ids
+        .iter()
+        .any(|id| !local_entry_ids.contains_key(id));
+    if has_missing {
+        import_missing_entries(store, backend, key, &bucket, self_peer).await?;
+    }
+
+    Ok(())
+}
+
+/// For every roster peer, pull backend entries beyond what we hold locally, in
+/// strict index order, then import the reassembled suffix via `apply_peer_ops`.
+async fn import_missing_entries<B: Backend>(
+    store: &Arc<Mutex<Store>>,
+    backend: &Arc<B>,
+    key: &VaultKey,
+    bucket: &str,
+    self_peer: u64,
+) -> anyhow::Result<()> {
+    let peers: Vec<(u64, VerifyingKey)> = {
+        let guard = store.lock().await;
+        guard
+            .roster()
+            .into_iter()
+            .filter(|r| r.peer_id != self_peer)
+            .filter_map(|r| {
+                VerifyingKey::from_bytes(&r.verifying_key)
+                    .ok()
+                    .map(|k| (r.peer_id, k))
+            })
+            .collect()
+    };
+
+    for (peer_id, vkey) in peers {
+        let mut index = {
+            let guard = store.lock().await;
+            split_log_lines(&guard.export_peer_log(peer_id).unwrap_or_default()).len() as u64
+        };
+        let mut fetched: Vec<Vec<u8>> = Vec::new();
+        loop {
+            let id = key.entry_id(peer_id, index);
+            match backend.get_entry(bucket, &id).await? {
+                Some(ct) => {
+                    fetched.push(key.open(&ct)?);
+                    index += 1;
+                }
+                None => break,
+            }
+        }
+        if fetched.is_empty() {
+            continue;
+        }
+        let appended = reassemble_log(&fetched);
+        let mut guard = store.lock().await;
+        let _ = guard.apply_peer_ops(peer_id, &vkey, &appended);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::VaultKey;
+    use crate::transport::MemoryBackend;
+    use roam_storage::{Identity, Store};
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    async fn store_at(dir: &std::path::Path) -> Arc<Mutex<Store>> {
+        Arc::new(Mutex::new(Store::open(dir, Identity::generate()).unwrap()))
+    }
+
+    #[tokio::test]
+    async fn edits_on_a_flow_to_b_purely_through_the_backend() {
+        let key = VaultKey([9u8; 32]);
+        let backend = Arc::new(MemoryBackend::default());
+        let a_dir = tempfile::tempdir().unwrap();
+        let b_dir = tempfile::tempdir().unwrap();
+        let a = store_at(a_dir.path()).await;
+        let b = store_at(b_dir.path()).await;
+
+        let (a_peer, a_key) = {
+            let g = a.lock().await;
+            (g.peer_id(), g.identity_verifying_bytes())
+        };
+        let (b_peer, b_key) = {
+            let g = b.lock().await;
+            (g.peer_id(), g.identity_verifying_bytes())
+        };
+        a.lock().await.add_peer(b_peer, b_key).unwrap();
+        b.lock().await.add_peer(a_peer, a_key).unwrap();
+
+        a.lock().await.set_entry("files", "note", "hello").unwrap();
+
+        reconcile_once(&a, &backend, &key).await.unwrap();
+        reconcile_once(&b, &backend, &key).await.unwrap();
+
+        assert_eq!(
+            b.lock().await.get_entry("files", "note"),
+            Some("hello".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_is_idempotent() {
+        let key = VaultKey([9u8; 32]);
+        let backend = Arc::new(MemoryBackend::default());
+        let dir = tempfile::tempdir().unwrap();
+        let s = store_at(dir.path()).await;
+        s.lock().await.set_entry("files", "k", "v").unwrap();
+        reconcile_once(&s, &backend, &key).await.unwrap();
+        let v1 = s.lock().await.doc_version_bytes();
+        reconcile_once(&s, &backend, &key).await.unwrap();
+        assert_eq!(s.lock().await.doc_version_bytes(), v1);
+    }
+}
