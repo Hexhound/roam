@@ -18,6 +18,22 @@ fn derived_peer_id(key_bytes: &[u8; 32]) -> u64 {
     )
 }
 
+/// Whether the version vector encoded in `superset` causally DOMINATES the one
+/// in `subset` (`superset ⊇ subset`) — i.e. everything `subset` has observed,
+/// `superset` has observed too. Both args are [`roam_crdt::Version`] bytes
+/// (as produced by [`Store::doc_version_bytes`]).
+///
+/// CONSERVATIVE on any error: if EITHER side fails to decode, returns `false`
+/// (treat as "not dominated"). For the tombstone GC this means an unparseable
+/// acked version can never make a tombstone look stable — GC only ever errs
+/// toward retaining a tombstone, never toward dropping one prematurely.
+pub fn version_dominates(superset: &[u8], subset: &[u8]) -> bool {
+    match (Version::from_bytes(superset), Version::from_bytes(subset)) {
+        (Ok(sup), Ok(sub)) => sup.includes(&sub),
+        _ => false,
+    }
+}
+
 /// A vault-backed CRDT document store. Layout under `root`:
 /// - `ops/ops-<peer>.jsonl` — one signed append-log per peer
 /// - `roster/roster-<peer>.jsonl` — one signed membership log per device
@@ -168,6 +184,16 @@ impl Store {
     /// export/import peer path with no roster/transport changes.
     pub fn set_entry(&mut self, map_id: &str, key: &str, value: &str) -> Result<(), StorageError> {
         self.doc.set_entry(map_id, key, value)?;
+        self.persist_new_ops()
+    }
+
+    /// Remove `key` from map `map_id`, commit, and durably append the resulting
+    /// signed delete op. This is a real CRDT map-delete (see
+    /// [`roam_crdt::Document::remove_entry`]) that propagates to peers, so it
+    /// rides the same export/import path as [`Store::set_entry`]. Used by the
+    /// tombstone garbage collector once a tombstone is causally stable.
+    pub fn remove_entry(&mut self, map_id: &str, key: &str) -> Result<(), StorageError> {
+        self.doc.remove_entry(map_id, key)?;
         self.persist_new_ops()
     }
 
@@ -1005,6 +1031,80 @@ mod tests {
         let reopened = Store::open(&vault, id).unwrap();
         assert_eq!(reopened.text("note"), "hello");
         assert_eq!(reopened.get_entry("m", "k"), Some("v".to_string()));
+    }
+
+    #[test]
+    fn remove_entry_drops_the_key_and_persists_across_reopen() {
+        let dir = tempdir().unwrap();
+        let vault = dir.path().join("vault");
+        let id = Identity::generate();
+
+        {
+            let mut store = Store::open(&vault, id.clone()).unwrap();
+            store.set_entry("m", "k", "v").unwrap();
+            assert_eq!(store.get_entry("m", "k"), Some("v".to_string()));
+            store.remove_entry("m", "k").unwrap();
+            assert_eq!(store.get_entry("m", "k"), None, "removed key must read absent");
+        }
+
+        // The delete op is durable: a cold reopen replays it and the key stays gone.
+        let reopened = Store::open(&vault, id).unwrap();
+        assert_eq!(reopened.get_entry("m", "k"), None, "removal must survive reopen");
+    }
+
+    #[test]
+    fn remove_entry_propagates_to_a_trusted_peer() {
+        let dir_a = tempdir().unwrap();
+        let dir_b = tempdir().unwrap();
+        let id_a = Identity::generate();
+        let id_b = Identity::generate();
+
+        let mut a = Store::open(dir_a.path(), id_a.clone()).unwrap();
+        let mut b = Store::open(dir_b.path(), id_b.clone()).unwrap();
+        b.add_peer(id_a.peer_id(), id_a.verifying_key().to_bytes()).unwrap();
+
+        // A sets then removes the key; both ops ride A's own signed log.
+        a.set_entry("m", "k", "v").unwrap();
+        a.remove_entry("m", "k").unwrap();
+
+        b.apply_peer_ops(id_a.peer_id(), &id_a.verifying_key(), &a.export_own_log().unwrap())
+            .unwrap();
+        assert_eq!(b.get_entry("m", "k"), None, "removal must converge on the peer");
+    }
+
+    #[test]
+    fn version_dominates_matches_causal_order() {
+        let dir = tempdir().unwrap();
+        let vault = dir.path().join("vault");
+        let id = Identity::generate();
+        let mut store = Store::open(&vault, id).unwrap();
+
+        store.edit_text("note", 0, "abc").unwrap();
+        let early = store.doc_version_bytes();
+        store.edit_text("note", 3, "def").unwrap();
+        let late = store.doc_version_bytes();
+
+        assert!(version_dominates(&late, &early), "later ⊇ earlier");
+        assert!(version_dominates(&late, &late), "a version dominates itself");
+        assert!(!version_dominates(&early, &late), "earlier must NOT dominate later");
+        // Garbage bytes never dominate (conservative decode-failure guard).
+        assert!(!version_dominates(&[0xff, 0x00, 0x13], &early));
+        assert!(!version_dominates(&late, &[0xff, 0x00, 0x13]));
+    }
+
+    #[test]
+    fn version_dominates_is_false_for_concurrent_versions() {
+        // Two independent stores produce concurrent versions: neither dominates.
+        let dir_a = tempdir().unwrap();
+        let dir_b = tempdir().unwrap();
+        let mut a = Store::open(dir_a.path(), Identity::generate()).unwrap();
+        let mut b = Store::open(dir_b.path(), Identity::generate()).unwrap();
+        a.edit_text("note", 0, "aaa").unwrap();
+        b.edit_text("note", 0, "bbb").unwrap();
+        let va = a.doc_version_bytes();
+        let vb = b.doc_version_bytes();
+        assert!(!version_dominates(&va, &vb));
+        assert!(!version_dominates(&vb, &va));
     }
 
     #[test]

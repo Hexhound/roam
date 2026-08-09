@@ -68,6 +68,26 @@ pub struct FileEntry {
     /// old readers still see exactly the old shape.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub renamed_from: Option<String>,
+    /// For a [`EntryStatus::Tombstoned`] entry, a hex-encoded
+    /// [`roam_storage::version_dominates`]-comparable document version vector
+    /// that CAUSALLY INCLUDES the tombstone op — the "creation version" the
+    /// causally-stable GC predicate requires every trusted peer to dominate
+    /// before the tombstone may be dropped. `None` for a `Live` entry, and also
+    /// for an old-format tombstone written before this field existed (which is
+    /// therefore never GC-eligible — conservative).
+    ///
+    /// It is a CONSERVATIVE checkpoint, not the precise op id of the map write:
+    /// loro's public API surfaces only a map key's last-editor `PeerID`, not the
+    /// `(peer, counter)` op id, so the precise-op-id approach is not soundly
+    /// available. The checkpoint is the document version RIGHT AFTER the
+    /// tombstone op is committed, so a peer whose acked version dominates it has
+    /// provably observed the tombstone (and possibly more) — GC fires later than
+    /// a precise op id would, never earlier.
+    ///
+    /// On-wire: `#[serde(default, skip_serializing_if = "Option::is_none")]` for
+    /// the same forward/backward compatibility as `renamed_from`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tombstoned_at: Option<String>,
 }
 
 impl FileEntry {
@@ -97,6 +117,7 @@ mod tests {
             status,
             content_hash: "abc123".to_string(),
             renamed_from: None,
+            tombstoned_at: None,
         }
     }
 
@@ -138,6 +159,7 @@ mod tests {
                 status: EntryStatus::Live,
                 content_hash: "deadbeef".to_string(),
                 renamed_from: None,
+                tombstoned_at: None,
             }
         );
     }
@@ -169,11 +191,47 @@ mod tests {
             status: EntryStatus::Live,
             content_hash: "abc123".to_string(),
             renamed_from: Some("old.md".to_string()),
+            tombstoned_at: None,
         };
         let value = entry.to_value();
         assert!(value.contains("renamed_from"));
         assert!(value.contains("old.md"));
         assert_eq!(FileEntry::from_value(&value).unwrap(), entry);
+    }
+
+    #[test]
+    fn tombstoned_at_omitted_from_wire_when_none() {
+        // A `None` checkpoint must be OMITTED so old readers see the old shape.
+        let value = sample(EntryStatus::Tombstoned).to_value();
+        assert!(
+            !value.contains("tombstoned_at"),
+            "None must not serialize a key: {value}"
+        );
+    }
+
+    #[test]
+    fn tombstoned_at_round_trips_when_set() {
+        let entry = FileEntry {
+            kind: EntryKind::Text,
+            status: EntryStatus::Tombstoned,
+            content_hash: "abc123".to_string(),
+            renamed_from: None,
+            tombstoned_at: Some("00ff13".to_string()),
+        };
+        let value = entry.to_value();
+        assert!(value.contains("tombstoned_at"));
+        assert!(value.contains("00ff13"));
+        assert_eq!(FileEntry::from_value(&value).unwrap(), entry);
+    }
+
+    #[test]
+    fn old_shape_without_tombstoned_at_still_deserializes() {
+        // A tombstone written before the GC checkpoint field existed must parse,
+        // defaulting `tombstoned_at` to `None` (thus never GC-eligible).
+        let json = r#"{"kind":"text","status":"tombstoned","content_hash":"cafe"}"#;
+        let entry = FileEntry::from_value(json).unwrap();
+        assert_eq!(entry.tombstoned_at, None);
+        assert_eq!(entry.status, EntryStatus::Tombstoned);
     }
 
     #[test]

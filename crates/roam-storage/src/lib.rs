@@ -13,4 +13,4 @@ pub use identity::{Identity, VerifyingKey};
 pub use ids::VaultId;
 pub use oplog::{Entry, OpLog};
 pub use roster::{merge_roster, PeerRecord, PeerStatus, RosterEntry, RosterLog, RosterOp};
-pub use store::Store;
+pub use store::{version_dominates, Store};

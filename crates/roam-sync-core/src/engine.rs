@@ -15,6 +15,15 @@ pub struct Engine<T: Transport> {
     transport: Arc<T>,
     /// Per-peer byte offset of our own oplog already pushed to that peer.
     sent_offsets: Arc<Mutex<HashMap<u64, usize>>>,
+    /// Per-peer LAST-ACKED document version vector (`roam_crdt::Version` bytes),
+    /// learned from each inbound [`Frame::Have`]. This is what the peer has told
+    /// us it holds — the ground truth for "has peer P observed op X?" that the
+    /// causally-stable tombstone GC predicate consumes. Distinct from
+    /// `sent_offsets`, which only tracks what WE pushed (never what the peer
+    /// APPLIED). Updates are monotonic: a Have is recorded only when it
+    /// causally dominates the version we already had for that peer, so an
+    /// out-of-order/stale Have can never lower a peer's acked version.
+    acked_versions: Arc<Mutex<HashMap<u64, Vec<u8>>>>,
     /// Peers we have already answered with our own `Hello` bundle. Guards the
     /// one-time reverse handshake so two peers that both connect (and both see
     /// each other's `Hello`) never trade `Hello`s forever.
@@ -45,6 +54,7 @@ impl<T: Transport + 'static> Engine<T> {
             store: Arc::new(Mutex::new(store)),
             transport,
             sent_offsets: Arc::new(Mutex::new(HashMap::new())),
+            acked_versions: Arc::new(Mutex::new(HashMap::new())),
             connected: Arc::new(Mutex::new(HashSet::new())),
             changed: Arc::new(tokio::sync::Notify::new()),
         }
@@ -66,8 +76,17 @@ impl<T: Transport + 'static> Engine<T> {
         self.changed.clone()
     }
 
-    fn peer_id(&self) -> u64 {
+    pub fn peer_id(&self) -> u64 {
         self.identity.peer_id()
+    }
+
+    /// Snapshot of every peer's last-acked document version (`Version` bytes),
+    /// learned from inbound [`Frame::Have`]s (see [`Engine::acked_versions`]).
+    /// This is the per-peer view the causally-stable tombstone GC predicate
+    /// consumes: a peer ABSENT from this map has never told us what it holds, so
+    /// GC must treat it as not-yet-observed (never GC on its behalf).
+    pub async fn acked_versions(&self) -> HashMap<u64, Vec<u8>> {
+        self.acked_versions.lock().await.clone()
     }
 
     /// Open a connection: send Hello, RosterHave, Have, offer our logs and
@@ -175,6 +194,9 @@ impl<T: Transport + 'static> Engine<T> {
         // and released on its own (no store lock held across it).
         self.connected.lock().await.remove(&peer);
         self.sent_offsets.lock().await.remove(&peer);
+        // Drop the revoked peer's acked version too: a revoked peer is no longer
+        // a trusted witness, so GC must not count it as having observed anything.
+        self.acked_versions.lock().await.remove(&peer);
         self.broadcast_own_roster().await;
         Ok(())
     }
@@ -235,12 +257,31 @@ impl<T: Transport + 'static> Engine<T> {
                 // simplest correct response is to offer everything we hold; loro
                 // dedups on import. We never answer Ops with Have, so there is no
                 // ping-pong.
-                if roam_crdt::Version::from_bytes(&doc_version).is_err() {
+                let Ok(incoming) = roam_crdt::Version::from_bytes(&doc_version) else {
                     return Ok(());
-                }
+                };
                 // Read-side revoke gate: a revoked peer must not pull the document.
                 if !self.is_active(peer).await {
                     return Ok(());
+                }
+                // C1 — record this peer's acked version (what it has told us it
+                // holds), MONOTONICALLY: only overwrite when the incoming version
+                // causally dominates the one we already have, so a reordered or
+                // stale Have can never REGRESS a peer's acked version (which would
+                // be unsafe for GC — it could make an offline peer look caught-up).
+                {
+                    let mut acked = self.acked_versions.lock().await;
+                    let replace = match acked.get(&peer) {
+                        None => true,
+                        Some(prev) => match roam_crdt::Version::from_bytes(prev) {
+                            Ok(prev) => incoming.includes(&prev),
+                            // Corrupt stored bytes: replace with the decodable one.
+                            Err(_) => true,
+                        },
+                    };
+                    if replace {
+                        acked.insert(peer, doc_version.clone());
+                    }
                 }
                 self.push_logs(peer).await;
             }

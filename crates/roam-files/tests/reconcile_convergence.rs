@@ -35,10 +35,11 @@
 //! own store root directly (the store root is the value the test itself supplied
 //! to the device).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use roam_files::{
-    container_id, sidecar_path, EntryStatus, FileEntry, FolderBridge, FILESET_MAP_ID,
+    container_id, sidecar_path, EntryStatus, FileEntry, FolderBridge, GcContext, FILESET_MAP_ID,
 };
 use roam_storage::{Identity, Store};
 use tempfile::tempdir;
@@ -957,4 +958,249 @@ fn delete_relayed_a_to_c_via_b() {
         c.entry(&container).map(|e| e.status),
         Some(EntryStatus::Tombstoned)
     );
+}
+
+// ===========================================================================
+// WS-C — causally-stable tombstone garbage collection.
+//
+// A tombstone may be DROPPED (real CRDT map-delete) only once every trusted,
+// non-revoked peer has ACKED a document version that dominates the tombstone's
+// creation checkpoint. Until then the tombstone is retained, so no offline
+// peer's stale `Live` entry can resurrect the file. The peer-version data is
+// handed to the bridge as a plain-data `GcContext` (the engine's C1 tracking
+// is the real source; here the tests supply each peer's current version, which
+// is exactly what that peer would advertise in a `Have`).
+// ===========================================================================
+
+/// The document version bytes `d` currently holds — what it would advertise in
+/// a `Have`, and thus the "acked version" a peer that has fully synced from `d`
+/// would report.
+fn peer_version(d: &Device) -> Vec<u8> {
+    let (_bridge, store) = d.open();
+    store.doc_version_bytes()
+}
+
+/// Run a GC-aware reconcile on `d`. `trusted` is the full trusted-peer set (as
+/// plain data); `acked` gives each peer's acked version. A trusted peer NOT in
+/// `acked` models a peer we have never heard from (e.g. offline during the
+/// delete) — the GC predicate must then refuse to drop the tombstone.
+fn gc_scan(d: &Device, trusted: &[&Device], acked: &[(&Device, Vec<u8>)]) {
+    let (bridge, mut store) = d.open();
+    let gc = GcContext {
+        self_peer: d.identity.peer_id(),
+        trusted_peers: trusted.iter().map(|p| p.identity.peer_id()).collect(),
+        acked_versions: acked
+            .iter()
+            .map(|(p, v)| (p.identity.peer_id(), v.clone()))
+            .collect::<HashMap<_, _>>(),
+    };
+    bridge.scan_gc(&mut store, None, Some(&gc)).unwrap();
+}
+
+/// Set up a 3-device mesh where A created and then deleted `rel`, fully synced,
+/// so all three hold the tombstone (file removed) with an embedded checkpoint.
+fn deleted_and_synced(rel: &str) -> (Device, Device, Device, String) {
+    let a = Device::new();
+    let b = Device::new();
+    let c = Device::new();
+    let container = cid(&a, rel);
+
+    import(&a, rel, "hello\n");
+    for _ in 0..2 {
+        round3(&a, &b, &c);
+    }
+    // Sanity: all three materialized the live file.
+    assert!(a.vault_file(rel).exists());
+    assert!(b.vault_file(rel).exists());
+    assert!(c.vault_file(rel).exists());
+
+    a.delete_file(&a.vault_file(rel));
+    for _ in 0..2 {
+        round3(&a, &b, &c);
+    }
+    for d in [&a, &b, &c] {
+        assert_eq!(
+            d.entry(&container).map(|e| e.status),
+            Some(EntryStatus::Tombstoned),
+            "every device must hold the tombstone before GC"
+        );
+        assert!(!d.vault_file(rel).exists());
+    }
+    (a, b, c, container)
+}
+
+// ---------------------------------------------------------------------------
+// C4.1 — a tombstone is NOT GC'd while any trusted peer has not acked it.
+// ---------------------------------------------------------------------------
+#[test]
+fn tombstone_retained_until_all_trusted_peers_ack() {
+    let rel = "note.md";
+    let (a, b, c, container) = deleted_and_synced(rel);
+
+    // A knows B has acked (current version dominates the tombstone) but has NO
+    // acked version for C (C omitted). The predicate must be FALSE → no GC.
+    gc_scan(&a, &[&b, &c], &[(&b, peer_version(&b))]);
+    assert_eq!(
+        a.entry(&container).map(|e| e.status),
+        Some(EntryStatus::Tombstoned),
+        "tombstone must be retained while a trusted peer (C) has not acked"
+    );
+
+    // Even giving C a STALE (pre-delete) version must not qualify: a version
+    // that does not dominate the checkpoint is not an ack.
+    let c_stale = {
+        // C's version from BEFORE it saw the delete: reconstruct by taking a
+        // fresh device that only synced the create. Simplest proxy: an empty
+        // (brand-new) device version never dominates. Use a fresh device.
+        let fresh = Device::new();
+        peer_version(&fresh)
+    };
+    gc_scan(&a, &[&b, &c], &[(&b, peer_version(&b)), (&c, c_stale)]);
+    assert_eq!(
+        a.entry(&container).map(|e| e.status),
+        Some(EntryStatus::Tombstoned),
+        "a non-dominating (stale) acked version must not qualify as observed"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// C4.2 — once ALL trusted peers have acked, the tombstone IS GC'd, the delete
+// propagates, and the file stays deleted everywhere (no resurrection).
+// ---------------------------------------------------------------------------
+#[test]
+fn tombstone_gcd_once_all_acked_and_stays_deleted() {
+    let rel = "note.md";
+    let (a, b, c, container) = deleted_and_synced(rel);
+
+    // All trusted peers have acked (both current versions dominate the
+    // checkpoint) → A drops the tombstone entirely.
+    gc_scan(&a, &[&b, &c], &[(&b, peer_version(&b)), (&c, peer_version(&c))]);
+    assert_eq!(
+        a.entry(&container),
+        None,
+        "a causally-stable tombstone must be GC'd (map entry removed)"
+    );
+
+    // Propagate the map-delete to B and C and reconcile everywhere.
+    for _ in 0..2 {
+        round3(&a, &b, &c);
+    }
+
+    // No resurrection: the file is absent on ALL three and no entry lingers.
+    for d in [&a, &b, &c] {
+        assert!(!d.vault_file(rel).exists(), "file must stay deleted after GC");
+        assert!(!sidecar_path(&d.vault_file(rel)).exists());
+        assert_eq!(d.entry(&container), None, "the GC'd entry must be gone everywhere");
+    }
+
+    // Convergence + stability across an extra round.
+    let baseline = converged3(&a, &b, &c, rel, &container);
+    round3(&a, &b, &c);
+    assert_eq!(
+        converged3(&a, &b, &c, rel, &container),
+        baseline,
+        "post-GC state must be stable across an extra round"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// C4.3 — OFFLINE-PEER SAFETY (the critical test). C is offline during A's
+// delete; A and B hold the tombstone but MUST NOT GC it. When C reconnects it
+// converges to deleted; only AFTER C acks may GC happen.
+// ---------------------------------------------------------------------------
+#[test]
+fn offline_peer_blocks_gc_until_it_reconnects_and_acks() {
+    let a = Device::new();
+    let b = Device::new();
+    let c = Device::new(); // trusted but OFFLINE during the whole create+delete.
+    let rel = "note.md";
+    let container = cid(&a, rel);
+
+    // A creates + deletes, syncing ONLY with B. C never participates.
+    import(&a, rel, "hello\n");
+    for _ in 0..2 {
+        round(&a, &b);
+    }
+    assert!(a.vault_file(rel).exists() && b.vault_file(rel).exists());
+    a.delete_file(&a.vault_file(rel));
+    for _ in 0..2 {
+        round(&a, &b);
+    }
+    assert_eq!(a.entry(&container).map(|e| e.status), Some(EntryStatus::Tombstoned));
+    assert_eq!(b.entry(&container).map(|e| e.status), Some(EntryStatus::Tombstoned));
+
+    // A and B both try to GC with C in the trusted set but with NO acked version
+    // for C (it was offline). Both must REFUSE to drop the tombstone.
+    gc_scan(&a, &[&b, &c], &[(&b, peer_version(&b))]);
+    gc_scan(&b, &[&a, &c], &[(&a, peer_version(&a))]);
+    assert_eq!(
+        a.entry(&container).map(|e| e.status),
+        Some(EntryStatus::Tombstoned),
+        "A must not GC while offline C has not acked"
+    );
+    assert_eq!(
+        b.entry(&container).map(|e| e.status),
+        Some(EntryStatus::Tombstoned),
+        "B must not GC while offline C has not acked"
+    );
+
+    // C reconnects and syncs from A: it must converge to DELETED (never had the
+    // file on disk; the tombstone reconciles to absent).
+    sync(&a, &c);
+    c.scan();
+    assert!(!c.vault_file(rel).exists(), "reconnected C must converge to deleted");
+    assert_eq!(c.entry(&container).map(|e| e.status), Some(EntryStatus::Tombstoned));
+
+    // NOW C has acked (its current version dominates the tombstone). A may GC.
+    gc_scan(&a, &[&b, &c], &[(&b, peer_version(&b)), (&c, peer_version(&c))]);
+    assert_eq!(
+        a.entry(&container),
+        None,
+        "GC is allowed only AFTER the formerly-offline peer has acked"
+    );
+
+    // The map-delete propagates and everyone converges to file-absent, no entry.
+    for _ in 0..2 {
+        round3(&a, &b, &c);
+    }
+    for d in [&a, &b, &c] {
+        assert!(!d.vault_file(rel).exists());
+        assert_eq!(d.entry(&container), None);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// C4.4 — GC must not cause divergence: a peer that has already GC'd and one
+// that has not both still converge to "file absent".
+// ---------------------------------------------------------------------------
+#[test]
+fn gc_does_not_diverge_a_peer_that_gcd_from_one_that_has_not() {
+    let rel = "note.md";
+    let (a, b, c, container) = deleted_and_synced(rel);
+
+    // Only A GCs; B and C still hold the tombstone entry.
+    gc_scan(&a, &[&b, &c], &[(&b, peer_version(&b)), (&c, peer_version(&c))]);
+    assert_eq!(a.entry(&container), None, "A dropped the entry");
+    assert_eq!(
+        b.entry(&container).map(|e| e.status),
+        Some(EntryStatus::Tombstoned),
+        "B still holds the tombstone (transiently divergent entry state)"
+    );
+
+    // Despite the transient entry-state difference, the OBSERVABLE file state is
+    // identical NOW (file absent on all), and after propagation the entries also
+    // converge (B and C receive A's map-delete).
+    for d in [&a, &b, &c] {
+        assert!(!d.vault_file(rel).exists(), "file absent on all regardless of GC state");
+    }
+    for _ in 0..2 {
+        round3(&a, &b, &c);
+    }
+    let converged = converged3(&a, &b, &c, rel, &container);
+    assert_eq!(converged.status, None, "all converge to no entry after the map-delete propagates");
+    assert!(converged.disk.is_none(), "all converge to file-absent");
+
+    // Stable across an extra round (idempotent).
+    round3(&a, &b, &c);
+    assert_eq!(converged3(&a, &b, &c, rel, &container).status, None);
 }

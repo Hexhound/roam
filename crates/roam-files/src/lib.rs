@@ -15,7 +15,7 @@ mod rebase;
 mod sidecar;
 mod textdiff;
 
-pub use bridge::{FolderBridge, SyncOutcome};
+pub use bridge::{FolderBridge, GcContext, SyncOutcome};
 pub use error::FilesError;
 pub use fileset::{EntryKind, EntryStatus, FileEntry, FILESET_MAP_ID};
 pub use rebase::Conflict;

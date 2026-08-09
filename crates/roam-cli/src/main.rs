@@ -14,7 +14,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
-use roam_files::{FilesError, FolderBridge, SyncOutcome};
+use roam_files::{FilesError, FolderBridge, GcContext, SyncOutcome};
 use roam_storage::{Identity, PeerStatus, Store, VaultId};
 use roam_sync_core::engine::Engine;
 use roam_transport_iroh::{host_pairing, join_pairing, IrohTransport, PairingToken};
@@ -247,11 +247,32 @@ async fn run_scan(
 ) -> anyhow::Result<Vec<(PathBuf, SyncOutcome)>> {
     let store = engine.store(); // Arc<Mutex<Store>>
     let bridge = bridge.clone(); // FolderBridge is just a PathBuf (derives Clone).
+    // Gather the causally-stable-GC inputs BEFORE the blocking closure: the
+    // per-peer acked versions are behind their own async mutex (fetched here,
+    // never across the store guard), and `self_peer` is cheap. The trusted-peer
+    // roster is read inside the closure from the already-held store guard.
+    let self_peer = engine.peer_id();
+    let acked_versions = engine.acked_versions().await;
     tokio::task::spawn_blocking(move || {
         let mut guard = store.blocking_lock(); // OK on a blocking thread.
+        // Trusted, non-revoked peers (a roster snapshot). A tombstone may only be
+        // GC'd once EVERY one of these has acked past it; a peer absent from
+        // `acked_versions` (never heard from) keeps the tombstone alive.
+        let trusted_peers = guard
+            .roster()
+            .into_iter()
+            .filter(|p| p.status == PeerStatus::Active)
+            .map(|p| p.peer_id)
+            .collect();
+        let gc = GcContext {
+            self_peer,
+            trusted_peers,
+            acked_versions,
+        };
         // `hint = None` walks + imports the whole vault (the poll fallback);
-        // `Some(set)` limits the read+diff to the watcher's changed paths.
-        bridge.scan_hinted(&mut guard, hint.as_ref()) // sync disk IO, store locked.
+        // `Some(set)` limits the read+diff to the watcher's changed paths. The
+        // GC sweep runs as a final step and drops only causally-stable tombstones.
+        bridge.scan_gc(&mut guard, hint.as_ref(), Some(&gc)) // sync disk IO, store locked.
     })
     .await? // JoinError (panic) -> anyhow.
     .map_err(Into::into) // FilesError -> anyhow.

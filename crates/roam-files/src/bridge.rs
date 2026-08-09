@@ -40,14 +40,30 @@
 //! the tombstone). Renames ride this as a delete of the old path plus a
 //! create of the new one.
 //!
-//! Remaining scope: tombstones are retained forever (**no garbage
-//! collection**), and only [`EntryKind::Text`] is handled — **binary/blob
-//! content is still deferred** to a later slice.
+//! ## #5 — Tombstone garbage collection: causally-stable GC (resolved)
+//!
+//! Tombstones are no longer retained forever. [`FolderBridge::scan_gc`] runs an
+//! optional final sweep that DROPS a `Tombstoned` entry (a real, propagating
+//! CRDT map-delete via [`Store::remove_entry`]) once it is CAUSALLY STABLE —
+//! every trusted, non-revoked peer has acked a document version that dominates
+//! the tombstone's creation checkpoint ([`FileEntry::tombstoned_at`]). A peer
+//! that has not acked (e.g. was offline during the delete) keeps the tombstone
+//! alive, so no peer's stale `Live` entry can resurrect the file. The predicate
+//! and peer-version data arrive as a plain-data [`GcContext`] (no engine/tokio
+//! dependency); `scan`/`scan_hinted` pass `None` and skip the sweep entirely.
+//!
+//! The sweep drops only the small MAP entry; the file's TEXT container is left
+//! intact (required for cross-device convergence — see [`FolderBridge::scan_gc`]).
+//!
+//! Remaining scope: reclaiming the orphaned text container is a space-only
+//! follow-up (the container is invisible to reconcile and to fresh peers once
+//! its map entry is gone); and only [`EntryKind::Text`] is handled —
+//! **binary/blob content is still deferred** to a later slice.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use roam_storage::Store;
+use roam_storage::{version_dominates, Store};
 
 use crate::error::FilesError;
 use crate::fileset::{EntryKind, EntryStatus, FileEntry, FILESET_MAP_ID};
@@ -95,6 +111,60 @@ impl SyncOutcome {
             changed: true,
             conflicts: Vec::new(),
         }
+    }
+}
+
+/// Plain-data snapshot the causally-stable tombstone GC needs, passed into
+/// [`FolderBridge::scan_gc`]. Deliberately runtime-agnostic (no engine/tokio
+/// dependency): the caller (the sync engine / CLI) gathers this from its roster
+/// and per-peer acked-version tracking and hands it in, and the bridge computes
+/// stability itself using [`roam_storage::version_dominates`].
+///
+/// SAFETY CONTRACT: a tombstone is GC-eligible only when EVERY peer in
+/// [`trusted_peers`](Self::trusted_peers) (other than [`self_peer`](Self::self_peer))
+/// has an entry in [`acked_versions`](Self::acked_versions) whose version
+/// dominates the tombstone's checkpoint. A trusted peer that is ABSENT from
+/// `acked_versions` (never heard from — e.g. offline during the delete) makes
+/// the tombstone NON-eligible, which is exactly what stops a later-reconnecting
+/// peer from resurrecting the file.
+#[derive(Debug, Clone, Default)]
+pub struct GcContext {
+    /// This device's own peer id. Always treated as having observed the
+    /// tombstone (it authored or already holds it), so it never blocks GC.
+    pub self_peer: u64,
+    /// The trusted, non-revoked peer ids (a roster snapshot). Every one of these
+    /// (except `self_peer`) must have acked the tombstone before it may drop.
+    pub trusted_peers: Vec<u64>,
+    /// Each peer's last-acked document version (`roam_storage`-comparable bytes).
+    /// A peer missing here has never told us what it holds → not-yet-observed.
+    pub acked_versions: HashMap<u64, Vec<u8>>,
+}
+
+impl GcContext {
+    /// Whether `entry` (assumed [`EntryStatus::Tombstoned`]) is causally stable
+    /// — every trusted non-self peer has acked a version dominating the
+    /// tombstone's checkpoint. A tombstone with no checkpoint
+    /// ([`FileEntry::tombstoned_at`] `None`, e.g. old-format) is NEVER stable.
+    fn tombstone_is_stable(&self, entry: &FileEntry) -> bool {
+        let Some(hex) = &entry.tombstoned_at else {
+            return false;
+        };
+        let Some(tombstone_vv) = hex_decode(hex) else {
+            return false;
+        };
+        for &peer in &self.trusted_peers {
+            if peer == self.self_peer {
+                continue; // self always counts as having observed it.
+            }
+            match self.acked_versions.get(&peer) {
+                // The peer's acked version must DOMINATE the tombstone checkpoint.
+                Some(acked) if version_dominates(acked, &tombstone_vv) => {}
+                // Missing acked version, or a version that does not dominate:
+                // this peer has NOT provably observed the tombstone → not stable.
+                _ => return false,
+            }
+        }
+        true
     }
 }
 
@@ -240,6 +310,7 @@ impl FolderBridge {
                 status: EntryStatus::Live,
                 content_hash: text_hash(&file_text),
                 renamed_from: None,
+                tombstoned_at: None,
             }
             .to_value(),
         )?;
@@ -269,17 +340,7 @@ impl FolderBridge {
             None => text_hash(&store.text(&container)),
         };
 
-        store.set_entry(
-            FILESET_MAP_ID,
-            &container,
-            &FileEntry {
-                kind: EntryKind::Text,
-                status: EntryStatus::Tombstoned,
-                content_hash: hash,
-                renamed_from: None,
-            }
-            .to_value(),
-        )?;
+        write_tombstone(store, &container, EntryKind::Text, hash)?;
 
         // Remove the disk file; already-gone is fine, other IO errors propagate.
         remove_if_present(file)?;
@@ -395,7 +456,7 @@ impl FolderBridge {
     /// Only [`EntryKind::Text`] entries participate; the map holds no other kind
     /// this slice.
     pub fn scan(&self, store: &mut Store) -> Result<Vec<(PathBuf, SyncOutcome)>, FilesError> {
-        self.scan_hinted(store, None)
+        self.scan_gc(store, None, None)
     }
 
     /// Reconcile, but in Step 1 only (re)import the hinted paths instead of
@@ -416,6 +477,36 @@ impl FolderBridge {
         &self,
         store: &mut Store,
         hint: Option<&HashSet<PathBuf>>,
+    ) -> Result<Vec<(PathBuf, SyncOutcome)>, FilesError> {
+        self.scan_gc(store, hint, None)
+    }
+
+    /// Reconcile (as [`scan_hinted`](Self::scan_hinted)) and, when a
+    /// [`GcContext`] is supplied, run a causally-stable tombstone GC sweep as a
+    /// final step: every [`EntryStatus::Tombstoned`] entry that the context
+    /// deems stable (every trusted non-self peer has acked a version dominating
+    /// the tombstone's checkpoint) is DROPPED via [`Store::remove_entry`] — a
+    /// real CRDT map-delete that propagates so peers converge to the key being
+    /// absent.
+    ///
+    /// SAFETY: the sweep only removes the small file-set MAP entry; the file's
+    /// TEXT container is left intact. This is deliberate and load-bearing for
+    /// convergence — a device that has GC'd and one that has not must still agree
+    /// on the container's text, so we never `delete_root_container` here (that
+    /// would diverge `store.text(key)` across devices until the container-delete
+    /// op propagated). Reclaiming the orphaned text container is a separate,
+    /// space-only follow-up (see the module TODO), not a correctness concern:
+    /// with no map entry the container is invisible to reconcile and to fresh
+    /// peers bootstrapping from a snapshot.
+    ///
+    /// `gc: None` skips the sweep entirely (identical to
+    /// [`scan_hinted`](Self::scan_hinted) / [`scan`](Self::scan)), preserving
+    /// backward compatibility for callers with no peer-version data.
+    pub fn scan_gc(
+        &self,
+        store: &mut Store,
+        hint: Option<&HashSet<PathBuf>>,
+        gc: Option<&GcContext>,
     ) -> Result<Vec<(PathBuf, SyncOutcome)>, FilesError> {
         // --- Step 1: flush local disk edits into the CRDT. ---
         // The dir walk is ALWAYS done (correctness): Steps 2/3 need an accurate
@@ -471,6 +562,7 @@ impl FolderBridge {
                     status: EntryStatus::Live,
                     content_hash: text_hash(&store.text(key)),
                     renamed_from: None,
+                    tombstoned_at: None,
                 }
                 .to_value(),
             )?;
@@ -507,17 +599,7 @@ impl FolderBridge {
                 Ok(Some(sidecar)) => sidecar.last_synced_hash,
                 _ => text_hash(&store.text(&key)),
             };
-            store.set_entry(
-                FILESET_MAP_ID,
-                &key,
-                &FileEntry {
-                    kind: entry.kind,
-                    status: EntryStatus::Tombstoned,
-                    content_hash,
-                    renamed_from: None,
-                }
-                .to_value(),
-            )?;
+            write_tombstone(store, &key, entry.kind, content_hash)?;
             remove_if_present(&sidecar)?;
             outcomes.push((file, SyncOutcome::changed_no_ops()));
         }
@@ -609,6 +691,7 @@ impl FolderBridge {
                                 status: EntryStatus::Live,
                                 content_hash: current_hash,
                                 renamed_from: None,
+                                tombstoned_at: None,
                             }
                             .to_value(),
                         )?;
@@ -624,6 +707,31 @@ impl FolderBridge {
                             Err(err) => return Err(err),
                         }
                     }
+                }
+            }
+        }
+
+        // --- Step 4 (optional): causally-stable tombstone GC sweep. ---
+        // Runs ONLY when a GcContext is provided. Drops every Tombstoned entry
+        // that is provably stable (every trusted non-self peer has acked a
+        // version dominating the tombstone checkpoint) via a real, propagating
+        // CRDT map-delete. `entries` is an owned snapshot, so removing keys while
+        // iterating it is safe. Removal is idempotent — an already-absent key
+        // won't reappear in a later snapshot, so a second scan is a no-op.
+        if let Some(gc) = gc {
+            for (key, value) in store.entries(FILESET_MAP_ID) {
+                let entry = FileEntry::from_value(&value)?;
+                if entry.status != EntryStatus::Tombstoned {
+                    continue;
+                }
+                if gc.tombstone_is_stable(&entry) {
+                    // Real map-key removal (see `Store::remove_entry`). The text
+                    // container is intentionally left intact (see the doc above).
+                    store.remove_entry(FILESET_MAP_ID, &key)?;
+                    outcomes.push((
+                        key_to_path(&self.vault_root, &key),
+                        SyncOutcome::changed_no_ops(),
+                    ));
                 }
             }
         }
@@ -704,20 +812,11 @@ impl FolderBridge {
                 // Rename provenance: link the new container back to the old one,
                 // since Loro can't carry the edit history across (see the fn doc).
                 renamed_from: Some(from_container.clone()),
+                tombstoned_at: None,
             }
             .to_value(),
         )?;
-        store.set_entry(
-            FILESET_MAP_ID,
-            &from_container,
-            &FileEntry {
-                kind: EntryKind::Text,
-                status: EntryStatus::Tombstoned,
-                content_hash: hash,
-                renamed_from: None,
-            }
-            .to_value(),
-        )?;
+        write_tombstone(store, &from_container, EntryKind::Text, hash)?;
 
         // Disk: write the destination FIRST (creates `to` file + sidecar,
         // byte-stable), then remove the source. Removing `from` only after `to`
@@ -776,6 +875,85 @@ fn live_case_collision(store: &Store, incoming: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Write a tombstone for `key` with an embedded, causally-sound GC checkpoint
+/// ([`FileEntry::tombstoned_at`]).
+///
+/// The checkpoint MUST causally include the tombstone op itself — otherwise a
+/// peer that has seen everything BEFORE the delete (but not the delete) would
+/// pass the GC predicate while still holding a stale `Live` entry, and could
+/// resurrect the file. Since loro's public API cannot hand us the `(peer,
+/// counter)` op id of a map write, we achieve this with a two-op write:
+///
+///   1. Write the tombstone WITHOUT a checkpoint. This is the causal event.
+///   2. Read the document version — which now INCLUDES op 1 — and re-write the
+///      tombstone embedding it as the checkpoint.
+///
+/// A peer that only has op 1 already reads `Tombstoned` (op 2 merely enriches
+/// the value with the checkpoint), so the two-op split never opens a
+/// resurrection window. A peer whose acked version dominates the recorded
+/// checkpoint has provably observed op 1 — the tombstone.
+fn write_tombstone(
+    store: &mut Store,
+    key: &str,
+    kind: EntryKind,
+    content_hash: String,
+) -> Result<(), FilesError> {
+    // Op 1 — the tombstone itself (no checkpoint yet).
+    store.set_entry(
+        FILESET_MAP_ID,
+        key,
+        &FileEntry {
+            kind,
+            status: EntryStatus::Tombstoned,
+            content_hash: content_hash.clone(),
+            renamed_from: None,
+            tombstoned_at: None,
+        }
+        .to_value(),
+    )?;
+    // The committed doc version now causally includes op 1.
+    let checkpoint = hex_encode(&store.doc_version_bytes());
+    // Op 2 — re-write embedding the checkpoint (peers with only op 1 already see
+    // Tombstoned; this just adds the GC checkpoint).
+    store.set_entry(
+        FILESET_MAP_ID,
+        key,
+        &FileEntry {
+            kind,
+            status: EntryStatus::Tombstoned,
+            content_hash,
+            renamed_from: None,
+            tombstoned_at: Some(checkpoint),
+        }
+        .to_value(),
+    )?;
+    Ok(())
+}
+
+/// Lowercase-hex encode arbitrary bytes (for embedding version-vector bytes in
+/// the JSON [`FileEntry::tombstoned_at`] string). Inverse of [`hex_decode`].
+fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
+/// Decode a lowercase-hex string produced by [`hex_encode`]. Returns `None` on
+/// odd length or a non-hex digit (so a corrupt checkpoint is treated as "no
+/// checkpoint" — conservatively non-GC-eligible).
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect()
 }
 
 /// Remove `path` if it exists, treating a `NotFound` as success (already gone)
@@ -1636,6 +1814,7 @@ mod tests {
                 status: EntryStatus::Live,
                 content_hash: text_hash("hello\n"),
                 renamed_from: None,
+                tombstoned_at: None,
             }
         );
     }
@@ -1762,6 +1941,7 @@ mod tests {
             status: EntryStatus::Live,
             content_hash: hash,
             renamed_from: None,
+            tombstoned_at: None,
         }
         .to_value()
     }
@@ -1772,6 +1952,7 @@ mod tests {
             status: EntryStatus::Tombstoned,
             content_hash: hash,
             renamed_from: None,
+            tombstoned_at: None,
         }
         .to_value()
     }
