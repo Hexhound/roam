@@ -77,6 +77,10 @@ enum Command {
         /// absent, the legacy REPL runs (backward compatible).
         #[arg(long)]
         folder: Option<PathBuf>,
+        /// Optional backend URL. When set, sync also pushes/pulls encrypted ops
+        /// to this zero-knowledge store as an always-on fallback.
+        #[arg(long)]
+        backend: Option<String>,
     },
     /// Print roster + document status for a vault (read-only).
     Status {
@@ -99,7 +103,8 @@ async fn main() -> Result<()> {
             vault,
             identity,
             folder,
-        } => sync(&vault, &identity, folder).await,
+            backend,
+        } => sync(&vault, &identity, folder, backend).await,
         Command::Status { vault } => status(&vault).await,
     }
 }
@@ -190,15 +195,54 @@ async fn pair(vault: &Path, identity_path: &Path, token: String) -> Result<()> {
 /// Dispatch `sync`: `--folder` runs the real-folder sync loop; without it the
 /// legacy interactive "note" REPL runs (backward compatible). Both share the
 /// transport/engine setup via [`setup_engine`].
-async fn sync(vault: &Path, identity_path: &Path, folder: Option<PathBuf>) -> Result<()> {
+async fn sync(
+    vault: &Path,
+    identity_path: &Path,
+    folder: Option<PathBuf>,
+    backend: Option<String>,
+) -> Result<()> {
     // Honor Ctrl-C from a dedicated task so the signal interrupts even a
     // long-running dial/scan inside the select loop (see `spawn_ctrl_c_exit`).
     spawn_ctrl_c_exit();
     let engine = setup_engine(vault, identity_path).await?;
+    spawn_backend_sync(&engine, backend);
     match folder {
         Some(folder) => sync_folder(engine, vault, folder).await,
         None => sync_repl(engine).await,
     }
+}
+
+/// When `--backend <url>` is set, spawn a periodic task that reconciles the
+/// vault against the zero-knowledge backend store, using the Engine's OWN
+/// `Arc<Mutex<Store>>` (via `store_handle()`) so the backend-apply and
+/// iroh-apply paths serialize on one lock (spec §8.1). Runs regardless of
+/// whether `--folder` is set, so it covers both the folder-sync and REPL
+/// paths (both are dispatched from `sync` right after this call).
+fn spawn_backend_sync(engine: &Arc<Engine<IrohTransport>>, backend: Option<String>) {
+    let Some(backend_url) = backend else {
+        return;
+    };
+    use roam_backend_client::crypto::VaultKey;
+    use roam_backend_client::http::HttpBackend;
+    use roam_backend_client::sync::reconcile_once;
+
+    // TODO(pairing slice): replace with the vault key delivered over the
+    // proven pairing stream. For now, derive deterministically from the vault
+    // id so a single vault's devices agree on bucket/entry ids.
+    let vault_key = VaultKey(blake3::hash(engine.vault_id_bytes().as_slice()).into());
+    let backend = Arc::new(HttpBackend::new(&backend_url));
+    let store = engine.store_handle();
+
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(5));
+        loop {
+            tick.tick().await;
+            if let Err(err) = reconcile_once(&store, &backend, &vault_key).await {
+                eprintln!("backend sync error: {err}");
+            }
+        }
+    });
+    println!("backend sync enabled: {backend_url}");
 }
 
 /// Build the transport + engine, spawn its receive loop, and connect to every
