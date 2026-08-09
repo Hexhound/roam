@@ -214,7 +214,7 @@ async fn sync(
 
 /// When `--backend <url>` is set, spawn a periodic task that reconciles the
 /// vault against the zero-knowledge backend store, using the Engine's OWN
-/// `Arc<Mutex<Store>>` (via `store_handle()`) so the backend-apply and
+/// `Arc<Mutex<Store>>` (via `store()`) so the backend-apply and
 /// iroh-apply paths serialize on one lock (spec §8.1). Runs regardless of
 /// whether `--folder` is set, so it covers both the folder-sync and REPL
 /// paths (both are dispatched from `sync` right after this call).
@@ -231,7 +231,7 @@ fn spawn_backend_sync(engine: &Arc<Engine<IrohTransport>>, backend: Option<Strin
     // id so a single vault's devices agree on bucket/entry ids.
     let vault_key = VaultKey(blake3::hash(engine.vault_id_bytes().as_slice()).into());
     let backend = Arc::new(HttpBackend::new(&backend_url));
-    let store = engine.store_handle();
+    let store = engine.store();
 
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(5));

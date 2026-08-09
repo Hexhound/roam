@@ -1,5 +1,5 @@
 use crate::crypto::VaultKey;
-use roam_storage::{StorageError, Store};
+use roam_storage::{PeerStatus, StorageError, Store};
 
 /// Split a per-peer op-log into its individual JSONL line-entries. Each returned
 /// chunk includes its trailing `\n` so that [`reassemble_log`] is a byte-exact
@@ -24,11 +24,14 @@ pub fn reassemble_log(lines: &[Vec<u8>]) -> Vec<u8> {
     lines.iter().flatten().copied().collect()
 }
 
-/// The set of peers whose logs this device holds: its own, plus every roster peer.
+/// The set of peers whose logs this device holds: its own, plus every ACTIVE
+/// roster peer. Revoked peers are excluded — mirrors the iroh channel's
+/// Active-only filter and the backend's own Active-only read/import path, so we
+/// don't waste an upload relaying a log the backend would refuse to honor anyway.
 pub fn held_peers(store: &Store) -> Vec<u64> {
     let mut peers = vec![store.peer_id()];
     for rec in store.roster() {
-        if rec.peer_id != store.peer_id() {
+        if rec.peer_id != store.peer_id() && rec.status == PeerStatus::Active {
             peers.push(rec.peer_id);
         }
     }
@@ -96,5 +99,37 @@ mod tests {
     fn reassemble_is_the_inverse_of_split() {
         let log = b"{\"a\":1}\n{\"b\":2}\n".to_vec();
         assert_eq!(reassemble_log(&split_log_lines(&log)), log);
+    }
+
+    #[test]
+    fn held_peers_excludes_revoked() {
+        use roam_storage::Identity;
+
+        let dir = tempfile::tempdir().unwrap();
+        let me = Identity::generate();
+        let active = Identity::generate();
+        let revoked = Identity::generate();
+
+        let mut store = Store::open(dir.path(), me.clone()).unwrap();
+        store
+            .add_peer(active.peer_id(), active.verifying_key().to_bytes())
+            .unwrap();
+        store
+            .add_peer(revoked.peer_id(), revoked.verifying_key().to_bytes())
+            .unwrap();
+        store
+            .revoke_peer(revoked.peer_id(), revoked.verifying_key().to_bytes())
+            .unwrap();
+
+        let peers = held_peers(&store);
+        assert!(peers.contains(&me.peer_id()), "must include own log");
+        assert!(
+            peers.contains(&active.peer_id()),
+            "must include the still-active peer"
+        );
+        assert!(
+            !peers.contains(&revoked.peer_id()),
+            "must exclude the revoked peer"
+        );
     }
 }

@@ -79,14 +79,10 @@ impl<T: Transport + 'static> Engine<T> {
         }
     }
 
-    pub fn store(&self) -> Arc<Mutex<Store>> {
-        self.store.clone()
-    }
-
     /// The shared store handle. The backend sync task MUST use this exact
     /// `Arc<Mutex<Store>>` so its apply path and the iroh apply path serialize
     /// on one lock (spec §8.1).
-    pub fn store_handle(&self) -> Arc<Mutex<Store>> {
+    pub fn store(&self) -> Arc<Mutex<Store>> {
         self.store.clone()
     }
 
