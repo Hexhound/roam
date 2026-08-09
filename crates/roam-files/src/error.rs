@@ -27,4 +27,10 @@ pub enum FilesError {
     /// A sidecar metadata file could not be parsed or written.
     #[error("sidecar error: {0}")]
     Sidecar(String),
+
+    /// After applying computed ops to a container, the store's text did not
+    /// match the file text — a symptom of an offset/diff bug. The message
+    /// includes the affected container id.
+    #[error("desync: {0}")]
+    Desync(String),
 }

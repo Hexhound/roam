@@ -7,11 +7,13 @@
 //! Task 1 provides the crate scaffold and [`path::container_id`], which
 //! maps a file under a vault root to a normalized, vault-relative id.
 
+mod bridge;
 mod error;
 mod path;
 mod sidecar;
 mod textdiff;
 
+pub use bridge::{FolderBridge, SyncOutcome};
 pub use error::FilesError;
 pub use path::container_id;
 pub use sidecar::{sidecar_path, text_hash, Sidecar};
