@@ -314,6 +314,13 @@ fn spawn_vault_watcher(
 /// The real-folder sync loop (Tasks c + d). Imports local disk edits and projects
 /// remote edits, in both directions, until Ctrl-C.
 async fn sync_folder(engine: Arc<Engine<IrohTransport>>, folder: PathBuf) -> Result<()> {
+    // Ensure the vault folder exists before anything reads or watches it: a
+    // fresh `--folder` path is created on first run (matching the note REPL,
+    // which needs no pre-existing files). Without this the fs watcher fails to
+    // attach ("No such file or directory") and every scan walks nothing.
+    std::fs::create_dir_all(&folder)
+        .with_context(|| format!("create vault folder {}", folder.display()))?;
+
     let bridge = FolderBridge::new(&folder);
 
     // Initial publish: import the current vault contents into the store, then
@@ -330,6 +337,13 @@ async fn sync_folder(engine: Arc<Engine<IrohTransport>>, folder: PathBuf) -> Res
     // inotify limit), warn and continue POLL-ONLY — correctness never depends on
     // the watcher, only latency does.
     let (fs_tx, mut fs_rx) = mpsc::unbounded_channel::<PathBuf>();
+    // Retain our OWN sender for the loop's lifetime so the channel never closes,
+    // even if the watcher fails to start (it moves+drops the sender it is given).
+    // A closed channel makes `fs_rx.recv()` return `None` immediately on every
+    // iteration, hot-spinning the `select!` and starving the Ctrl-C branch — the
+    // daemon would then refuse to stop. Holding this sender keeps the fs branch
+    // pending in poll-only mode instead.
+    let _fs_tx_keepalive = fs_tx.clone();
     let _watcher = match spawn_vault_watcher(&folder, fs_tx) {
         Ok(watcher) => {
             println!("fs watcher active (low-latency); 500ms poll is the fallback.");
