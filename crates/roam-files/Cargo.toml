@@ -1,0 +1,18 @@
+[package]
+name = "roam-files"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+roam-storage = { path = "../roam-storage" }
+thiserror.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+unicode-normalization = "0.1"
+blake3 = "1"
+similar = "2"
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile.workspace = true
