@@ -97,6 +97,35 @@ async fn sync_until(endpoint: &Endpoint, mut done: impl FnMut() -> bool, label: 
     }
 }
 
+/// Blob-aware convergence pump. Blobs are PULL-based: gossip carries only the
+/// Blob file-set entry (the blob-ref), not the bytes, so before a fetched blob
+/// can be projected to disk the endpoint must request the missing bytes
+/// (`request_missing_blobs` → BlobWant → peer replies BlobData). Each round
+/// requests any missing blobs, waits briefly for the reply to arrive and fire
+/// `changed()`, then scans (which projects a now-local blob to disk). Used on
+/// the RECEIVING side of a binary-file scenario.
+async fn sync_until_with_blobs(
+    endpoint: &Endpoint,
+    mut done: impl FnMut() -> bool,
+    label: &str,
+) {
+    let start = Instant::now();
+    loop {
+        endpoint.engine.request_missing_blobs().await;
+        scan(endpoint).await;
+        if done() {
+            return;
+        }
+        if start.elapsed() > CONVERGE_TIMEOUT {
+            panic!(
+                "timed out after {:?} waiting for: {label}",
+                CONVERGE_TIMEOUT
+            );
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
 /// Read the file-set entry for `file` from `endpoint`'s store, if present.
 async fn entry_for(endpoint: &Endpoint, file: &Path) -> Option<FileEntry> {
     let container = container_id(&endpoint.vault, file).expect("container id");
@@ -272,4 +301,51 @@ async fn real_folder_create_delete_rename_syncs_over_iroh() {
         "B's new.md must carry the renamed content"
     );
     assert!(!old_b.exists(), "old.md must be gone from B's disk");
+
+    // ================================================================
+    // Phase 4 — BINARY (blob) create then delete propagates A -> B.
+    // Exercises the full pull-based blob path over the real transport: the
+    // Blob file-set entry gossips, B requests the missing bytes
+    // (BlobWant/BlobData), then projects them byte-identically to disk (D5).
+    // ================================================================
+    let pic_a = vault_a.join("pic.png");
+    let pic_b = vault_b.join("pic.png");
+    // Non-UTF-8 payload with an asset extension → routes to the blob store.
+    let pixels: Vec<u8> = vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0xff, 0x00, 0x7f];
+    std::fs::write(&pic_a, &pixels).unwrap();
+    scan(&a).await; // import_blob (bytes + Live Blob entry + marker) + gossip.
+
+    sync_until_with_blobs(&b, || pic_b.exists(), "pic.png to appear on B").await;
+    assert_eq!(
+        std::fs::read(&pic_b).unwrap(),
+        pixels,
+        "B's pic.png must be byte-identical to A's blob"
+    );
+    let entry = entry_for(&b, &pic_b)
+        .await
+        .expect("B must have a file-set entry for pic.png");
+    assert_eq!(entry.status, EntryStatus::Live, "pic.png entry on B must be Live");
+
+    // Delete the binary on A (raw fs remove → scan detects the local delete via
+    // the presence marker and writes a Blob tombstone), gossip it.
+    std::fs::remove_file(&pic_a).unwrap();
+    scan(&a).await;
+    let entry_a = entry_for(&a, &pic_a)
+        .await
+        .expect("A must retain a tombstone entry for pic.png");
+    assert_eq!(
+        entry_a.status,
+        EntryStatus::Tombstoned,
+        "pic.png entry on A must be Tombstoned after local delete"
+    );
+
+    sync_until(&b, || !pic_b.exists(), "pic.png to be removed from B").await;
+    let entry_b = entry_for(&b, &pic_b)
+        .await
+        .expect("B must retain a tombstone entry for pic.png");
+    assert_eq!(
+        entry_b.status,
+        EntryStatus::Tombstoned,
+        "pic.png entry on B must be Tombstoned",
+    );
 }
