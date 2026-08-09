@@ -422,10 +422,16 @@ impl Store {
         std::fs::create_dir_all(&ops_dir)?;
         let peer_log_path = ops_dir.join(format!("ops-{peer_id}.jsonl"));
 
-        // Op logs are append-only: refuse a shorter/older resend that would
-        // truncate newer peer ops already on disk. (TODO: entry-level merge once
-        // peers.json + a real sync transport land; for now a wholesale, longer-or-
-        // equal replacement is sufficient since peers ship their full log.)
+        // Op logs are append-only and single-author, so every correct copy of an
+        // author's log is byte-prefix-consistent. The entry-level reconciliation
+        // is now done up-stack by [`Store::apply_peer_ops`] (prefix-aware +
+        // overlap-trim merge), enabled by the roster (peers.json) and the iroh
+        // transport that have since landed — so this method receives an already
+        // merged, longer-or-equal `log_bytes` on that path. This length check is
+        // the remaining truncation guard: refuse a shorter/older resend that would
+        // clobber newer peer ops already on disk. (`apply_peer_ops` never trips it
+        // — it always yields a longer-or-equal log; it only catches a raw,
+        // out-of-band shorter `import_peer` call.)
         if let Ok(existing) = std::fs::read(&peer_log_path) {
             if log_bytes.len() < existing.len() {
                 return Err(StorageError::Peer(format!(
@@ -700,8 +706,9 @@ mod tests {
 
     #[test]
     fn peer_ops_survive_a_cold_reopen_once_the_peer_is_in_the_roster() {
-        // The Slice-1 TODO(peers.json) gap: without a roster, a peer's ops vanished
-        // on cold reopen (no snapshot). With the roster, open() replays them.
+        // Regression (resolved by the roster / peers.json, now landed): before it,
+        // a peer's ops vanished on cold reopen when no snapshot existed. Now that
+        // the roster vouches for the peer, open() replays its ops, so they survive.
         let dir_a = tempdir().unwrap();
         let dir_b = tempdir().unwrap();
         let a_id = Identity::generate();

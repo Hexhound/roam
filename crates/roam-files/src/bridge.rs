@@ -512,6 +512,19 @@ impl FolderBridge {
                     let current_hash = text_hash(&store.text(&key));
                     if current_hash == entry.content_hash {
                         // Delete wins: no edit landed after the tombstone.
+                        //
+                        // EDGE (accepted): the guard is content-hash based, so a
+                        // concurrent edit that REVERTS the container to EXACTLY
+                        // the tombstoned (last-synced) text hashes back to
+                        // `entry.content_hash` and is indistinguishable from "no
+                        // edit landed" — delete still wins and that revert edit is
+                        // dropped. This is acceptable: the dropped edit reproduced
+                        // already-synced content byte-for-byte, so no UNIQUE
+                        // content is lost (only a no-op round-trip back to the
+                        // synced text). Any edit that ends at DIFFERENT content
+                        // changes the hash and takes the resurrection branch
+                        // below. See the `resurrection_guard_hash_collision_*`
+                        // test, which pins this behavior.
                         remove_if_present(&file)?;
                         remove_if_present(&sidecar_path(&file))?;
                         outcomes.push((
@@ -1947,6 +1960,61 @@ mod tests {
         b.scan(&mut store).unwrap();
         assert_eq!(fileset_snapshot(&store), before);
         assert_eq!(std::fs::read(&file).unwrap(), disk_before);
+    }
+
+    #[test]
+    fn resurrection_guard_hash_collision_drops_a_revert_to_synced_edit() {
+        // EDGE (pinned): the resurrection guard is content-hash based. If a
+        // concurrent edit REVERTS the container to EXACTLY the last-synced text,
+        // the container's current hash equals the tombstone hash, so DELETE WINS
+        // and that revert edit is dropped (the file is removed). This is
+        // acceptable because the dropped edit reproduced already-synced content
+        // byte-for-byte — no UNIQUE content is lost. This test pins the current
+        // behavior so any future change to the guard is caught.
+        let dir = tempdir().unwrap();
+        let (b, mut store) = bridge(dir.path());
+        let vault = dir.path().join("vault");
+        let file = vault.join("note.md");
+
+        // Import "hello\n": container seeded, Live entry, sidecar records it.
+        std::fs::write(&file, "hello\n").unwrap();
+        b.import_file(&mut store, &file).unwrap();
+        let container = container_id(&vault, &file).unwrap();
+        let synced_hash = text_hash("hello\n");
+
+        // A remote tombstone arrives recording the LAST-SYNCED hash (the content
+        // this device last synced — "hello\n").
+        store
+            .set_entry(FILESET_MAP_ID, &container, &tombstoned(synced_hash.clone()))
+            .unwrap();
+
+        // A concurrent edit merges into the container AFTER the tombstone but
+        // happens to REVERT to exactly the last-synced text: insert "X" then
+        // delete it, leaving "hello\n". The container hash collides with the
+        // tombstone hash.
+        store.edit_text(&container, 5, "X").unwrap();
+        store.delete_text(&container, 5, 1).unwrap();
+        assert_eq!(store.text(&container), "hello\n");
+        assert_eq!(text_hash(&store.text(&container)), synced_hash);
+
+        b.scan(&mut store).unwrap();
+
+        // Delete wins: the guard sees current_hash == tombstone hash, so the file
+        // and its sidecar are removed and the entry stays Tombstoned.
+        assert!(
+            !file.exists(),
+            "delete wins: the hash-collision revert edit is dropped"
+        );
+        assert!(
+            !sidecar_path(&file).exists(),
+            "sidecar removed alongside the file"
+        );
+        let entry = fileset_entry(&store, &container).unwrap();
+        assert_eq!(entry.status, EntryStatus::Tombstoned);
+        // The container is intentionally left intact (history/resurrection); only
+        // the file-set entry + disk file reflect the delete. No unique content is
+        // lost — the dropped edit was byte-identical to the already-synced text.
+        assert_eq!(store.text(&container), "hello\n");
     }
 
     #[test]
