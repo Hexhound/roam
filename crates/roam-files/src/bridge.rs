@@ -127,7 +127,24 @@ impl SyncOutcome {
 /// `acked_versions` (never heard from — e.g. offline during the delete) makes
 /// the tombstone NON-eligible, which is exactly what stops a later-reconnecting
 /// peer from resurrecting the file.
-#[derive(Debug, Clone, Default)]
+///
+/// An EMPTY [`trusted_peers`](Self::trusted_peers) set is treated as NEVER
+/// stable (see [`tombstone_is_stable`](Self::tombstone_is_stable)), so an
+/// incomplete/empty roster snapshot can never trivially GC every tombstone. In
+/// practice callers always include `self` in the trusted set, but this makes GC
+/// safe-by-construction regardless of caller discipline. For the same reason
+/// `GcContext` deliberately does NOT derive `Default` — a caller must build a
+/// real context from actual roster + acked-version data.
+///
+/// TRUST DEPENDENCY: GC correctness assumes trusted peers HONESTLY report the
+/// document version they have applied in their `Have` frames — the acked
+/// versions here are peer-reported. A malicious or buggy TRUSTED peer that
+/// advertises a version it does not actually hold could advance its recorded
+/// ack and drive PREMATURE GC (and thus resurrection on a peer that really
+/// still holds a stale `Live`). This is accepted under the project's current
+/// deferred trust model (trusted peers are assumed honest); revisit when the
+/// security slice lands.
+#[derive(Debug, Clone)]
 pub struct GcContext {
     /// This device's own peer id. Always treated as having observed the
     /// tombstone (it authored or already holds it), so it never blocks GC.
@@ -145,7 +162,21 @@ impl GcContext {
     /// — every trusted non-self peer has acked a version dominating the
     /// tombstone's checkpoint. A tombstone with no checkpoint
     /// ([`FileEntry::tombstoned_at`] `None`, e.g. old-format) is NEVER stable.
+    ///
+    /// An EMPTY [`trusted_peers`](Self::trusted_peers) set is treated as NEVER
+    /// stable: with no known peer set there is no evidence any holder has
+    /// observed the tombstone, so GC would otherwise vacuously fire and let an
+    /// Active-but-offline peer resurrect the file on reconnect. GC requires the
+    /// real trusted peer set (which always includes `self`).
+    ///
+    /// GC correctness depends on trusted peers honestly reporting their applied
+    /// version in `Have` frames — see the [`GcContext`] TRUST DEPENDENCY note.
     fn tombstone_is_stable(&self, entry: &FileEntry) -> bool {
+        // Empty trusted set → never stable (defense-in-depth against an
+        // incomplete/empty roster snapshot GC-ing every checkpointed tombstone).
+        if self.trusted_peers.is_empty() {
+            return false;
+        }
         let Some(hex) = &entry.tombstoned_at else {
             return false;
         };
@@ -1088,6 +1119,51 @@ mod tests {
     use super::*;
     use roam_storage::Identity;
     use tempfile::tempdir;
+
+    /// A fully-checkpointed tombstone entry (so only the trusted-peer predicate,
+    /// not a missing checkpoint, decides stability).
+    fn checkpointed_tombstone() -> FileEntry {
+        FileEntry {
+            kind: EntryKind::Text,
+            status: EntryStatus::Tombstoned,
+            content_hash: "abc123".to_string(),
+            renamed_from: None,
+            // Any well-formed hex checkpoint; the empty-set guard fires before it
+            // is ever decoded, so its exact value is irrelevant here.
+            tombstoned_at: Some("00ff".to_string()),
+        }
+    }
+
+    #[test]
+    fn empty_trusted_set_is_never_stable_even_when_checkpointed() {
+        // Defense-in-depth: an empty/incomplete roster snapshot must NOT vacuously
+        // GC every checkpointed tombstone (which would let an Active-but-offline
+        // peer resurrect the file). Empty trusted set → never eligible.
+        let gc = GcContext {
+            self_peer: 1,
+            trusted_peers: Vec::new(),
+            acked_versions: HashMap::new(),
+        };
+        assert!(
+            !gc.tombstone_is_stable(&checkpointed_tombstone()),
+            "an empty trusted-peer set must never make a tombstone GC-eligible"
+        );
+    }
+
+    #[test]
+    fn self_only_trusted_set_is_stable_when_checkpointed() {
+        // The real single-device case: the roster contains only `self`. With no
+        // OTHER holder, a checkpointed tombstone IS stable (self always counts).
+        let gc = GcContext {
+            self_peer: 1,
+            trusted_peers: vec![1],
+            acked_versions: HashMap::new(),
+        };
+        assert!(
+            gc.tombstone_is_stable(&checkpointed_tombstone()),
+            "a self-only trusted set must allow GC of a checkpointed tombstone"
+        );
+    }
 
     /// Build a bridge over a `vault/` subdir plus a separately-opened store
     /// rooted at a `store/` subdir of one tempdir. The bridge is stateless; the
