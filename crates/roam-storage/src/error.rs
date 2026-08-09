@@ -16,6 +16,8 @@ pub enum StorageError {
     BadSignature(u64),
     #[error("invalid peer operation: {0}")]
     Peer(String),
+    #[error("blob store error: {0}")]
+    Blob(String),
     #[error(transparent)]
     Crdt(#[from] roam_crdt::CrdtError),
 }

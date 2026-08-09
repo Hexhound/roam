@@ -1,5 +1,6 @@
 //! roam-storage — op-log-is-truth persistence for roam-crdt documents.
 
+mod blob;
 mod error;
 mod identity;
 mod ids;
@@ -8,6 +9,7 @@ mod roster;
 mod snapshot;
 mod store;
 
+pub use blob::BlobStore;
 pub use error::StorageError;
 pub use identity::{Identity, VerifyingKey};
 pub use ids::VaultId;
