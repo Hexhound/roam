@@ -11,10 +11,6 @@ pub enum FilesError {
     #[error(transparent)]
     Io(#[from] std::io::Error),
 
-    /// The file is not valid UTF-8 text and cannot be handled as such.
-    #[error("file is not text: {0}")]
-    NotText(PathBuf),
-
     /// The resolved path escapes the vault root.
     #[error("path escapes vault: {0}")]
     PathEscapesVault(PathBuf),

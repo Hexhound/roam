@@ -248,21 +248,20 @@ impl FolderBridge {
             });
         }
 
-        // Read bytes, then route TEXT vs BLOB by decoding UTF-8:
-        // - UTF-8 OK           → TEXT path (OT-rebase into a text container).
-        // - NOT UTF-8, md/org  → a CORRUPT text note: NotText (preserved).
-        // - NOT UTF-8, other   → BLOB path (bytes → BlobStore, Blob entry).
-        //
-        // The md/org carve-out keeps a non-UTF-8 `.md`/`.org` an error (a broken
-        // text note is not silently reinterpreted as an asset); only files with a
-        // tracked ASSET extension (see `is_asset_file`) become blobs.
+        // Read bytes, then route TEXT vs BLOB purely by CONTENT (never by
+        // extension): decode the bytes as UTF-8.
+        // - UTF-8 OK  → TEXT path (OT-rebase into a text container). This is the
+        //   only char-mergeable form; latin-1 that happens to be valid UTF-8
+        //   merges as text too. Nothing is transcoded.
+        // - NOT UTF-8 → BLOB path (bytes → BlobStore, Blob entry), ALWAYS,
+        //   regardless of extension. A `.md` with invalid UTF-8, a UTF-16 file, a
+        //   binary asset — all are whole-file blobs (whole-file sync, no
+        //   char-merge). There is no md/org carve-out: nothing is reinterpreted,
+        //   only classified by what the bytes actually are.
         let bytes = std::fs::read(file)?;
         let file_text = match String::from_utf8(bytes) {
             Ok(text) => text,
             Err(err) => {
-                if is_vault_file(file) {
-                    return Err(FilesError::NotText(file.to_path_buf()));
-                }
                 let outcome = self.import_blob(store, &container, err.into_bytes())?;
                 // Record device-local presence: this device now HAS the blob on
                 // disk, so a later scan that finds the file gone (marker still
@@ -589,12 +588,13 @@ impl FolderBridge {
     /// and is itself idempotent: a second `scan` with no external change makes
     /// no further mutations.
     ///
-    /// **Step 1 — flush local disk → CRDT.** Recursively import every
-    /// `*.md`/`*.org` file under `vault_root` ([`import_file`](Self::import_file),
-    /// which upserts a [`EntryStatus::Live`] entry and writes a sidecar). Sidecar
-    /// (`.roammeta`) files are skipped; a [`FilesError::NotText`] file is skipped
-    /// rather than aborting the scan. The set of container ids present on disk is
-    /// remembered for the later steps.
+    /// **Step 1 — flush local disk → CRDT.** Recursively import every regular
+    /// file under `vault_root` ([`import_file`](Self::import_file), which upserts
+    /// a [`EntryStatus::Live`] entry; text files also get a sidecar). Files are
+    /// classified by CONTENT: valid UTF-8 becomes text, everything else a blob.
+    /// Hidden files/directories and our own `.roammeta`/`.roamblob` metadata are
+    /// skipped. The set of container ids present on disk is remembered for the
+    /// later steps.
     ///
     /// **Step 2 — detect local deletions.** For each `Live` entry whose file is
     /// absent from disk BUT whose sidecar still exists (proof this device once
@@ -632,7 +632,7 @@ impl FolderBridge {
     /// file. A hinted path that is not actually a vault file on disk (outside the
     /// vault, a symlink, or absent) is silently ignored, because Step 1 only ever
     /// imports the intersection of the hint with the discovered vault files —
-    /// exactly the same filtering (NotText/symlink/extension) a full walk applies.
+    /// exactly the same filtering (hidden/symlink/sidecar) a full walk applies.
     pub fn scan_hinted(
         &self,
         store: &mut Store,
@@ -675,8 +675,8 @@ impl FolderBridge {
         collect_vault_files(&self.vault_root, &mut files)?;
         files.sort();
 
-        // Container ids that exist on disk (all discovered vault files, even a
-        // NotText one that import will skip — it still "exists" for Step 2/3).
+        // Container ids that exist on disk (all discovered vault files; a
+        // non-UTF-8 file imports as a blob rather than being skipped).
         let mut present: HashSet<String> = HashSet::new();
         for file in &files {
             present.insert(container_id(&self.vault_root, file)?);
@@ -691,11 +691,10 @@ impl FolderBridge {
 
         let mut outcomes = Vec::new();
         for file in to_import {
-            match self.import_file(store, &file) {
-                Ok(outcome) => outcomes.push((file, outcome)),
-                Err(FilesError::NotText(_)) => continue,
-                Err(err) => return Err(err),
-            }
+            // Every discovered file imports (text or blob by content); a genuine
+            // error (Desync, IO, ...) aborts the scan rather than being skipped.
+            let outcome = self.import_file(store, &file)?;
+            outcomes.push((file, outcome));
         }
 
         // --- Step 1b: heal present files with NO file-set entry at all. ---
@@ -705,8 +704,9 @@ impl FolderBridge {
         // propagate to peers. Heal ONLY a totally-absent entry: a `Tombstoned`
         // entry is owned by Step 3 (delete-wins/resurrection) and a `Live` one
         // is already fine — this must not disturb the "no-op import keeps a
-        // remote Tombstoned entry" behavior. Require a sidecar so a raw NotText
-        // file skipped in Step 1 (empty container) is never force-entried.
+        // remote Tombstoned entry" behavior. Require a sidecar so only TEXT files
+        // are healed here (a blob is entried by `import_blob` directly and carries
+        // a `.roamblob` marker, not a `.roammeta` sidecar).
         for key in &present {
             if store.get_entry(FILESET_MAP_ID, key).is_some() {
                 continue;
@@ -1033,7 +1033,7 @@ impl FolderBridge {
 
         // Flush any pending local disk edits on `from` first, so the container
         // reflects the LATEST disk content before we copy it. A missing `from`
-        // file has nothing to flush; a NotText file propagates its error.
+        // file has nothing to flush.
         if from.exists() {
             self.import_file(store, from)?;
         }
@@ -1246,9 +1246,13 @@ fn remove_if_present(path: &Path) -> Result<(), FilesError> {
     }
 }
 
-/// Recursively collect `*.md`/`*.org` files under `dir` into `out`, skipping
-/// sidecar files (any other extension, including `.roammeta`). A missing
-/// directory yields no files rather than an error.
+/// Recursively collect importable files under `dir` into `out`. Every regular
+/// file is collected regardless of extension (or lack of one) — `import_file`
+/// classifies each by CONTENT (UTF-8 → text, otherwise blob). Only an explicit
+/// exclusion set is skipped (see [`is_excluded_from_walk`]): hidden files and
+/// hidden directories (a leading-dot component anywhere), our own `.roammeta`
+/// sidecars and `.roamblob` markers, and symlinks. A missing directory yields
+/// no files rather than an error.
 ///
 /// Symlinks are skipped entirely (neither descended into nor imported): a
 /// symlinked directory that points at an ancestor (e.g. `vault/loop -> vault`)
@@ -1269,56 +1273,46 @@ fn collect_vault_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), FilesEr
             continue;
         }
         let path = entry.path();
+        // A hidden entry is skipped whether it is a file or a directory. Skipping
+        // a hidden DIR here also prevents descent, so a leading-dot component
+        // anywhere in the tree (`.git/`, `.obsidian/`, `.foo.md.swp`) excludes
+        // everything beneath it.
+        if is_hidden(&path) {
+            continue;
+        }
         if file_type.is_dir() {
             collect_vault_files(&path, out)?;
-        } else if is_vault_file(&path) || is_asset_file(&path) {
-            // Text notes (md/org) AND tracked binary assets are both collected:
-            // import routes each by content (see `import_file`). Everything else
-            // (a bare `.txt`, a `.roammeta` sidecar) is ignored.
+        } else if !is_internal_sidecar(&path) {
+            // Any regular file (any extension, or none) is imported; content
+            // decides text-vs-blob inside `import_file`. Only our own metadata
+            // files (`.roammeta` / `.roamblob`) are excluded.
             out.push(path);
         }
     }
     Ok(())
 }
 
-/// Whether `path` has a vault text extension (`md` or `org`, case-insensitive).
-fn is_vault_file(path: &Path) -> bool {
-    match path.extension().and_then(|ext| ext.to_str()) {
-        Some(ext) => {
-            let ext = ext.to_ascii_lowercase();
-            ext == "md" || ext == "org"
-        }
-        None => false,
-    }
+/// Whether `path`'s final component begins with a dot: a hidden file
+/// (`.DS_Store`, an editor `.foo.md.swp`) or a hidden directory (`.git`,
+/// `.obsidian`). Used by the folder walk to skip such entries and to avoid
+/// descending into hidden directories.
+fn is_hidden(path: &Path) -> bool {
+    path.file_name()
+        .map(|name| name.to_string_lossy().starts_with('.'))
+        .unwrap_or(false)
 }
 
-/// Whether `path` is a tracked BINARY asset (routed to the blob store) by its
-/// extension. An explicit allowlist, deliberately DISJOINT from the text vault
-/// extensions ([`is_vault_file`]) and from ignored files (a bare `.txt`, a
-/// `.roammeta` sidecar): only these become [`EntryKind::Blob`] entries. New
-/// asset kinds are added here as they are supported.
-fn is_asset_file(path: &Path) -> bool {
-    match path.extension().and_then(|ext| ext.to_str()) {
-        Some(ext) => matches!(
-            ext.to_ascii_lowercase().as_str(),
-            "png" | "jpg"
-                | "jpeg"
-                | "gif"
-                | "webp"
-                | "bmp"
-                | "ico"
-                | "pdf"
-                | "mp3"
-                | "mp4"
-                | "mov"
-                | "webm"
-                | "wav"
-                | "ogg"
-                | "zip"
-                | "bin"
-        ),
-        None => false,
-    }
+/// Whether `path` is one of our own internal metadata files that must never be
+/// imported as vault content: a `.roammeta` text sidecar or a `.roamblob`
+/// presence marker (both are named by appending the suffix to a real file's
+/// name, so they do NOT begin with a dot and need this explicit check).
+fn is_internal_sidecar(path: &Path) -> bool {
+    path.file_name()
+        .map(|name| {
+            let name = name.to_string_lossy();
+            name.ends_with(".roammeta") || name.ends_with(".roamblob")
+        })
+        .unwrap_or(false)
 }
 
 /// Reconcile the sidecar after applying the import ops, then decide the result.
@@ -1843,16 +1837,21 @@ mod tests {
     }
 
     #[test]
-    fn non_utf8_file_is_not_text() {
+    fn non_utf8_file_is_a_blob() {
+        // Classification is by CONTENT, not extension: a non-UTF-8 file is ALWAYS
+        // a whole-file blob now (no char-merge), regardless of its extension.
         let dir = tempdir().unwrap();
         let (b, mut store) = bridge(dir.path());
-        let file = dir.path().join("vault").join("binary.md");
+        let vault = dir.path().join("vault");
+        let file = vault.join("binary.md");
         std::fs::write(&file, [0xff, 0xfe]).unwrap();
 
-        assert!(matches!(
-            b.import_file(&mut store, &file),
-            Err(FilesError::NotText(_))
-        ));
+        let outcome = b.import_file(&mut store, &file).unwrap();
+        assert!(outcome.changed);
+        let container = container_id(&vault, &file).unwrap();
+        let entry = fileset_entry(&store, &container).unwrap();
+        assert_eq!(entry.kind, EntryKind::Blob);
+        assert_eq!(entry.status, EntryStatus::Live);
     }
 
     #[test]
@@ -2028,6 +2027,82 @@ mod tests {
     }
 
     #[test]
+    fn txt_utf8_imports_as_text_and_round_trips() {
+        // A `.txt` (previously outside the allowlist) with UTF-8 content is now
+        // classified as TEXT by content and round-trips byte-for-byte.
+        let dir = tempdir().unwrap();
+        let (b, mut store) = bridge(dir.path());
+        let file = dir.path().join("vault").join("plain.txt");
+        let original = "just some text\nwith a second line";
+        std::fs::write(&file, original).unwrap();
+        let original_bytes = std::fs::read(&file).unwrap();
+
+        b.import_file(&mut store, &file).unwrap();
+        let container = container_id(&dir.path().join("vault"), &file).unwrap();
+        assert_eq!(fileset_entry(&store, &container).unwrap().kind, EntryKind::Text);
+
+        std::fs::remove_file(&file).unwrap();
+        b.project_file(&mut store, &file).unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), original_bytes);
+    }
+
+    #[test]
+    fn no_extension_utf8_imports_as_text() {
+        // A file with NO extension and UTF-8 content classifies as TEXT.
+        let dir = tempdir().unwrap();
+        let (b, mut store) = bridge(dir.path());
+        let vault = dir.path().join("vault");
+        let file = vault.join("README");
+        std::fs::write(&file, "readme body\n").unwrap();
+
+        b.import_file(&mut store, &file).unwrap();
+        let container = container_id(&vault, &file).unwrap();
+        assert_eq!(fileset_entry(&store, &container).unwrap().kind, EntryKind::Text);
+        assert_eq!(store.text(&container), "readme body\n");
+    }
+
+    #[test]
+    fn utf16_file_imports_as_blob() {
+        // UTF-16 bytes (interior NUL, invalid UTF-8) are not char-mergeable text:
+        // they classify as a whole-file BLOB. Nothing is transcoded.
+        let dir = tempdir().unwrap();
+        let (b, mut store) = bridge(dir.path());
+        let vault = dir.path().join("vault");
+        let file = vault.join("note.txt");
+        // UTF-16LE with a BOM (0xff 0xfe) then "é" (0xe9 0x00): interior NUL and a
+        // lone 0xff/0xfe make this invalid UTF-8, so it must classify as a blob.
+        let bytes = [0xffu8, 0xfe, 0xe9, 0x00];
+        std::fs::write(&file, bytes).unwrap();
+
+        b.import_file(&mut store, &file).unwrap();
+        let container = container_id(&vault, &file).unwrap();
+        assert_eq!(fileset_entry(&store, &container).unwrap().kind, EntryKind::Blob);
+    }
+
+    #[test]
+    fn walk_skips_dotfiles_and_dot_dirs() {
+        // The folder walk imports files of any extension but must skip anything
+        // hidden: a leading-dot file, and everything inside a dot-directory
+        // (`.git`, `.obsidian`, editor `.swp` files, ...).
+        let dir = tempdir().unwrap();
+        let (b, mut store) = bridge(dir.path());
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+        let visible = vault.join("visible.md");
+        std::fs::write(&visible, "keep me\n").unwrap();
+        // A dotfile beside it.
+        std::fs::write(vault.join(".hidden.md"), "skip me\n").unwrap();
+        // A `.md` buried inside a dot-directory — must not be descended into.
+        let git = vault.join(".git");
+        std::fs::create_dir_all(&git).unwrap();
+        std::fs::write(git.join("config.md"), "not a note\n").unwrap();
+
+        let outcomes = b.scan(&mut store).unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].0, visible);
+    }
+
+    #[test]
     fn project_then_import_is_a_no_op() {
         let dir = tempdir().unwrap();
         let (b, mut store) = bridge(dir.path());
@@ -2077,16 +2152,19 @@ mod tests {
     }
 
     #[test]
-    fn scan_imports_md_and_org_ignoring_others() {
+    fn scan_imports_any_extension_but_skips_sidecars() {
+        // Content-based classification: files of ANY extension (`.md`, `.org`,
+        // `.txt`, ...) are imported. Only our own `.roammeta` sidecar is skipped.
         let dir = tempdir().unwrap();
         let (b, mut store) = bridge(dir.path());
         let vault = dir.path().join("vault");
         let one = vault.join("one.md");
         let two = vault.join("nested").join("two.org");
+        let three = vault.join("plain.txt");
         std::fs::create_dir_all(vault.join("nested")).unwrap();
         std::fs::write(&one, "one body").unwrap();
         std::fs::write(&two, "two body").unwrap();
-        std::fs::write(vault.join("ignore.txt"), "ignore me").unwrap();
+        std::fs::write(&three, "three body").unwrap();
         // A stray but valid sidecar sitting beside one.md — scan must not treat
         // it as an importable file.
         Sidecar {
@@ -2099,10 +2177,10 @@ mod tests {
         .unwrap();
 
         let outcomes = b.scan(&mut store).unwrap();
-        assert_eq!(outcomes.len(), 2);
+        assert_eq!(outcomes.len(), 3);
         for (path, outcome) in &outcomes {
             assert!(outcome.changed);
-            assert!(path == &one || path == &two);
+            assert!(path == &one || path == &two || path == &three);
             let container = container_id(&vault, path).unwrap();
             let expected = std::fs::read_to_string(path).unwrap();
             assert_eq!(store.text(&container), expected);
@@ -2110,19 +2188,25 @@ mod tests {
     }
 
     #[test]
-    fn scan_skips_non_utf8_md_without_aborting() {
+    fn scan_imports_non_utf8_md_as_blob() {
         let dir = tempdir().unwrap();
         let (b, mut store) = bridge(dir.path());
         let vault = dir.path().join("vault");
         let good = vault.join("good.md");
+        let bad = vault.join("bad.md");
         std::fs::write(&good, "good").unwrap();
-        std::fs::write(vault.join("bad.md"), [0xff, 0xff]).unwrap();
+        std::fs::write(&bad, [0xff, 0xff]).unwrap();
 
+        // Both files import: the UTF-8 one as text, the non-UTF-8 one as a blob.
         let outcomes = b.scan(&mut store).unwrap();
-        assert_eq!(outcomes.len(), 1);
-        assert_eq!(outcomes[0].0, good);
-        let container = container_id(&vault, &good).unwrap();
-        assert_eq!(store.text(&container), "good");
+        assert_eq!(outcomes.len(), 2);
+
+        let good_c = container_id(&vault, &good).unwrap();
+        assert_eq!(store.text(&good_c), "good");
+        assert_eq!(fileset_entry(&store, &good_c).unwrap().kind, EntryKind::Text);
+
+        let bad_c = container_id(&vault, &bad).unwrap();
+        assert_eq!(fileset_entry(&store, &bad_c).unwrap().kind, EntryKind::Blob);
     }
 
     #[cfg(unix)]
@@ -2195,22 +2279,21 @@ mod tests {
     }
 
     #[test]
-    fn errored_import_does_not_write_live_entry() {
-        // A NotText import errors before any ops/sidecar/entry write, so no
-        // file-set entry must be created.
+    fn non_utf8_md_writes_live_blob_entry() {
+        // Content-based classification: a non-UTF-8 `.md` is a blob, so import
+        // writes a Live Blob file-set entry (it no longer errors out).
         let dir = tempdir().unwrap();
         let (b, mut store) = bridge(dir.path());
         let vault = dir.path().join("vault");
         let file = vault.join("binary.md");
         std::fs::write(&file, [0xff, 0xfe]).unwrap();
 
-        assert!(matches!(
-            b.import_file(&mut store, &file),
-            Err(FilesError::NotText(_))
-        ));
+        b.import_file(&mut store, &file).unwrap();
 
         let container = container_id(&vault, &file).unwrap();
-        assert!(fileset_entry(&store, &container).is_none());
+        let entry = fileset_entry(&store, &container).unwrap();
+        assert_eq!(entry.kind, EntryKind::Blob);
+        assert_eq!(entry.status, EntryStatus::Live);
     }
 
     #[test]
@@ -3044,21 +3127,21 @@ mod tests {
     }
 
     #[test]
-    fn binary_md_is_still_not_text_not_blob() {
-        // A `.md`/`.org` file that fails UTF-8 is a CORRUPT TEXT note, not an
-        // asset: it stays a NotText error and creates no blob entry (unchanged).
+    fn binary_md_becomes_a_blob() {
+        // A `.md`/`.org` file that fails UTF-8 is now classified by CONTENT: it
+        // becomes a whole-file blob, not a text note. Extension is irrelevant.
         let dir = tempdir().unwrap();
         let (b, mut store) = bridge(dir.path());
         let vault = dir.path().join("vault");
         let file = vault.join("corrupt.md");
-        std::fs::write(&file, [0xff, 0xfe]).unwrap();
+        let bytes = [0xff, 0xfe];
+        std::fs::write(&file, bytes).unwrap();
 
-        assert!(matches!(
-            b.import_file(&mut store, &file),
-            Err(FilesError::NotText(_))
-        ));
+        b.import_file(&mut store, &file).unwrap();
         let container = container_id(&vault, &file).unwrap();
-        assert!(fileset_entry(&store, &container).is_none());
+        let entry = fileset_entry(&store, &container).unwrap();
+        assert_eq!(entry.kind, EntryKind::Blob);
+        assert_eq!(entry.content_hash, roam_storage::BlobStore::hash(&bytes));
     }
 
     #[test]

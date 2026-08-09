@@ -391,7 +391,13 @@ async fn sync_folder(engine: Arc<Engine<IrohTransport>>, folder: PathBuf) -> Res
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 println!("\nstopping.");
-                return Ok(());
+                // Exit the process directly instead of unwinding to `main` and
+                // letting the tokio runtime drop. iroh spawns background driver
+                // tasks/threads (magicsock, relay, discovery) that do not all wind
+                // down on drop, so `Runtime::drop` blocks and the daemon hangs
+                // after printing "stopping." The store is committed+persisted on
+                // every scan/apply, so a hard exit loses no state.
+                std::process::exit(0);
             }
             // Local-change poll: guaranteed fallback for both directions. Runs a
             // FULL scan (`None` hint) so a missed/coalesced-away watcher event
@@ -439,8 +445,8 @@ async fn sync_folder(engine: Arc<Engine<IrohTransport>>, folder: PathBuf) -> Res
 /// Run one reconcile scan and, if anything changed, gossip local ops to peers.
 ///
 /// Task (d) error handling lives here: a `run_scan` error NEVER propagates — it is
-/// logged and the loop continues. `NotText`/`DirtyFile` are classified as benign
-/// per-file conditions (quieter note); anything else (including a `spawn_blocking`
+/// logged and the loop continues. `DirtyFile` is classified as a benign
+/// per-file condition (quieter note); anything else (including a `spawn_blocking`
 /// panic surfaced as a non-`FilesError` `anyhow`) gets a louder warning. Either
 /// way the daemon keeps running.
 async fn scan_and_maybe_flush(
@@ -534,10 +540,10 @@ fn describe_outcome(path: &Path, outcome: &SyncOutcome, exists: bool) -> Option<
 
 /// Whether a scan error is a known-benign, per-file condition. Both benign and
 /// non-benign scan errors are non-fatal to the loop; this only picks the log
-/// verbosity. `NotText`/`DirtyFile` are expected during normal use (a binary file
-/// dropped in the folder, or a file with un-imported local edits mid-project).
+/// verbosity. `DirtyFile` is expected during normal use (a file with un-imported
+/// local edits mid-project).
 fn is_benign_scan_error(err: &FilesError) -> bool {
-    matches!(err, FilesError::NotText(_) | FilesError::DirtyFile(_))
+    matches!(err, FilesError::DirtyFile(_))
 }
 
 /// The legacy interactive "note" REPL (backward compatible). Type lines to append
@@ -559,7 +565,13 @@ async fn sync_repl(engine: Arc<Engine<IrohTransport>>) -> Result<()> {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 println!("\nstopping.");
-                return Ok(());
+                // Exit the process directly instead of unwinding to `main` and
+                // letting the tokio runtime drop. iroh spawns background driver
+                // tasks/threads (magicsock, relay, discovery) that do not all wind
+                // down on drop, so `Runtime::drop` blocks and the daemon hangs
+                // after printing "stopping." The store is committed+persisted on
+                // every scan/apply, so a hard exit loses no state.
+                std::process::exit(0);
             }
             // stdin line -> append at the current end of the note.
             //
@@ -746,10 +758,7 @@ mod tests {
     }
 
     #[test]
-    fn benign_scan_errors_are_not_text_or_dirty_file() {
-        assert!(is_benign_scan_error(&FilesError::NotText(PathBuf::from(
-            "x.md"
-        ))));
+    fn benign_scan_errors_are_dirty_file() {
         assert!(is_benign_scan_error(&FilesError::DirtyFile(PathBuf::from(
             "x.md"
         ))));
