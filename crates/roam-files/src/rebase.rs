@@ -22,6 +22,24 @@
 
 use similar::{ChangeTag, TextDiff};
 
+/// A concurrent-edit conflict surfaced by [`merge_local_onto_remote`].
+///
+/// Records a contested ancestor char range that BOTH the local and remote sides
+/// edited (their edits touch overlapping ancestor content — e.g. both replaced
+/// the same region). This is a pure SIGNAL: the merge result is unchanged (the
+/// lossless OT union stays authoritative), the conflict just describes where the
+/// two sides collided so a caller can surface it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Conflict {
+    /// Start (inclusive) of the contested range in ancestor char coordinates.
+    pub ancestor_start: usize,
+    /// End (exclusive) of the contested range in ancestor char coordinates.
+    pub ancestor_end: usize,
+    /// The ancestor text in `[ancestor_start, ancestor_end)` — the content both
+    /// sides changed.
+    pub ancestor_text: String,
+}
+
 /// A local edit expressed in **clean ancestor (`A`) char coordinates**.
 ///
 /// Unlike [`crate::textdiff::diff_to_ops`] (whose positions are relative to the
@@ -69,8 +87,20 @@ enum LocalEdit {
 /// - **Co-located inserts at the same boundary** → the local insert lands
 ///   AFTER the remote insert, a deterministic tie-break. `A = "abc"`,
 ///   `L = "LOCabc"`, `R = "REMabc"` → `"REMLOCabc"`.
-pub fn merge_local_onto_remote(a: &str, l: &str, r: &str) -> String {
+///
+/// # Conflict signal
+///
+/// Alongside the merged string this returns a `Vec<Conflict>` describing genuine
+/// 3-way overlaps: ancestor ranges that BOTH sides edited (a local edit and a
+/// remote edit whose ancestor footprints overlap by at least one char — i.e.
+/// both replaced/removed the same region). Non-overlapping concurrent edits
+/// (each side changed a DIFFERENT region) produce NO conflict. The merged string
+/// is IDENTICAL to what a conflict-unaware merge would produce; the conflicts are
+/// purely additive information.
+pub fn merge_local_onto_remote(a: &str, l: &str, r: &str) -> (String, Vec<Conflict>) {
     let local_edits = local_edits(a, l);
+    let remote_edits = self::local_edits(a, r);
+    let conflicts = detect_conflicts(a, &local_edits, &remote_edits);
     let (a_to_r, present) = position_map(a, r);
 
     // Mutate a char model of `r`. Local edits are ordered front-to-back in
@@ -102,7 +132,62 @@ pub fn merge_local_onto_remote(a: &str, l: &str, r: &str) -> String {
         }
     }
 
-    chars.into_iter().collect()
+    (chars.into_iter().collect(), conflicts)
+}
+
+/// Detect genuine 3-way conflicts: ancestor ranges edited by BOTH sides.
+///
+/// Each edit has an **ancestor footprint**: a delete occupies its `[start, end)`
+/// range; an insert is a zero-width point `[a_pos, a_pos)` (it adds content
+/// without removing any ancestor char). Two footprints CONFLICT when they
+/// overlap by a positive-width span (`ls < re && rs < le`). Because inserts are
+/// zero-width, this fires only when both sides removed/replaced at least one
+/// shared ancestor char — the "both replaced the same region" case — and never
+/// for co-located inserts or edits to disjoint regions.
+///
+/// Ancestor char indices map to byte ranges once (via `char_indices`) so the
+/// contested substring is sliced without re-walking per pair.
+fn detect_conflicts(a: &str, local: &[LocalEdit], remote: &[LocalEdit]) -> Vec<Conflict> {
+    let mut conflicts: Vec<Conflict> = Vec::new();
+    for le in local {
+        let (ls, lend) = footprint(le);
+        if ls == lend {
+            continue; // zero-width local insert can never positive-overlap.
+        }
+        for re in remote {
+            let (rs, rend) = footprint(re);
+            // Positive-width overlap of the two half-open ancestor ranges.
+            if ls < rend && rs < lend {
+                let start = ls.max(rs);
+                let end = lend.min(rend);
+                let conflict = Conflict {
+                    ancestor_start: start,
+                    ancestor_end: end,
+                    ancestor_text: char_slice(a, start, end),
+                };
+                // Coalesce duplicates (one local delete can overlap several
+                // remote edits producing the same contested span).
+                if !conflicts.contains(&conflict) {
+                    conflicts.push(conflict);
+                }
+            }
+        }
+    }
+    conflicts
+}
+
+/// The ancestor footprint `[start, end)` of an edit: a delete's range, or a
+/// zero-width point at an insert's boundary.
+fn footprint(edit: &LocalEdit) -> (usize, usize) {
+    match edit {
+        LocalEdit::Delete { start, end } => (*start, *end),
+        LocalEdit::Insert { a_pos, .. } => (*a_pos, *a_pos),
+    }
+}
+
+/// The substring of `a` covering ancestor chars `[start, end)`.
+fn char_slice(a: &str, start: usize, end: usize) -> String {
+    a.chars().skip(start).take(end - start).collect()
 }
 
 /// Walk the `A -> L` diff into clean ancestor-coordinate edits.
@@ -233,7 +318,7 @@ mod tests {
     /// reproduce the merged text `merge_local_onto_remote` computes — the exact
     /// invariant `import_file` relies on.
     fn assert_store_ops_reach_merge(a: &str, l: &str, r: &str, expected: &str) {
-        let merged = merge_local_onto_remote(a, l, r);
+        let (merged, _conflicts) = merge_local_onto_remote(a, l, r);
         assert_eq!(merged, expected, "merge {a:?}+{l:?} onto {r:?}");
         let ops = diff_to_ops(r, &merged);
         assert_eq!(
@@ -301,8 +386,45 @@ mod tests {
         // Co-located inserts: local lands AFTER the remote insert at the same
         // boundary — a deterministic tie-break. Pin the EXACT ordered result so
         // a future change to that tie-break is caught.
-        let merged = merge_local_onto_remote("abc", "LOCabc", "REMabc");
+        let (merged, conflicts) = merge_local_onto_remote("abc", "LOCabc", "REMabc");
         assert_eq!(merged, "REMLOCabc");
+        // Co-located inserts (no ancestor char removed) are NOT a conflict.
+        assert!(conflicts.is_empty(), "co-located inserts must not conflict: {conflicts:?}");
+    }
+
+    #[test]
+    fn overlapping_replacements_report_a_conflict_without_changing_merge() {
+        // E3: both sides REPLACE the same region (A="abc", L="aYc", R="aZc").
+        // The merged string is byte-identical to the documented union
+        // ("aZYc") AND a conflict over the shared "b" region is reported.
+        let (merged, conflicts) = merge_local_onto_remote("abc", "aYc", "aZc");
+        assert_eq!(merged, "aZYc", "merge output must be unchanged");
+        assert_eq!(conflicts.len(), 1, "one overlapping region: {conflicts:?}");
+        assert_eq!(
+            conflicts[0],
+            Conflict {
+                ancestor_start: 1,
+                ancestor_end: 2,
+                ancestor_text: "b".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn non_overlapping_concurrent_edits_report_no_conflict() {
+        // E3: local changes the START, remote changes the END — disjoint
+        // ancestor regions. Both survive AND no conflict is flagged.
+        let (merged, conflicts) = merge_local_onto_remote("abcd", "Xbcd", "abcY");
+        assert_eq!(merged, "XbcY");
+        assert!(conflicts.is_empty(), "disjoint edits must not conflict: {conflicts:?}");
+    }
+
+    #[test]
+    fn no_remote_edit_reports_no_conflict() {
+        // R == A: only the local side edited, so there is nothing to conflict
+        // with even though the local edit replaces a region.
+        let (_merged, conflicts) = merge_local_onto_remote("abc", "aYc", "abc");
+        assert!(conflicts.is_empty(), "single-sided edit is never a conflict: {conflicts:?}");
     }
 
     // --- Independent-oracle losslessness proptest -------------------------
@@ -384,7 +506,7 @@ mod tests {
         let (l, local_runs) = apply_edit_plan(a, keep_l, ins_l);
         let (r, remote_runs) = apply_edit_plan(a, keep_r, ins_r);
         let a_str: String = a.iter().collect();
-        let merged = merge_local_onto_remote(&a_str, &l, &r);
+        let (merged, _conflicts) = merge_local_onto_remote(&a_str, &l, &r);
 
         // (a) every LOCAL-inserted run survives, in order.
         assert!(
@@ -407,12 +529,12 @@ mod tests {
         // (c) determinism: pure function, identical output on a second call.
         assert_eq!(
             merged,
-            merge_local_onto_remote(&a_str, &l, &r),
+            merge_local_onto_remote(&a_str, &l, &r).0,
             "merge is not deterministic"
         );
         // (d) degenerate boundaries: no-remote → local-applied; no-local → remote.
-        assert_eq!(merge_local_onto_remote(&a_str, &l, &a_str), l, "no-remote boundary");
-        assert_eq!(merge_local_onto_remote(&a_str, &a_str, &r), r, "no-local boundary");
+        assert_eq!(merge_local_onto_remote(&a_str, &l, &a_str).0, l, "no-remote boundary");
+        assert_eq!(merge_local_onto_remote(&a_str, &a_str, &r).0, r, "no-local boundary");
     }
 
     proptest! {
@@ -494,14 +616,14 @@ mod tests {
         /// exactly — the fast path's result.
         #[test]
         fn prop_no_remote_edit_equals_local(a in "[a-d]{0,10}", l in "[a-d]{0,10}") {
-            prop_assert_eq!(merge_local_onto_remote(&a, &l, &a), l);
+            prop_assert_eq!(merge_local_onto_remote(&a, &l, &a).0, l);
         }
 
         /// When there are no local edits (L == A) the merge must equal R
         /// exactly — remote edits are preserved untouched.
         #[test]
         fn prop_no_local_edit_equals_remote(a in "[a-d]{0,10}", r in "[a-d]{0,10}") {
-            prop_assert_eq!(merge_local_onto_remote(&a, &a, &r), r);
+            prop_assert_eq!(merge_local_onto_remote(&a, &a, &r).0, r);
         }
     }
 }

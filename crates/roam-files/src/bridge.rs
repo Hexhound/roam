@@ -52,7 +52,7 @@ use roam_storage::Store;
 use crate::error::FilesError;
 use crate::fileset::{EntryKind, EntryStatus, FileEntry, FILESET_MAP_ID};
 use crate::path::{container_id, key_to_path};
-use crate::rebase::merge_local_onto_remote;
+use crate::rebase::{merge_local_onto_remote, Conflict};
 use crate::sidecar::{sidecar_path, text_hash, Sidecar};
 use crate::textdiff::{diff_to_ops, TextOp};
 
@@ -60,12 +60,42 @@ use crate::textdiff::{diff_to_ops, TextOp};
 const SIDECAR_VERSION: u32 = 1;
 
 /// The result of reconciling a single file into the CRDT store.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// No longer `Copy`: `conflicts` owns a `Vec`. It is cheap to `Clone` and, in
+/// the overwhelmingly common no-conflict case, the `Vec` is empty (no
+/// allocation).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncOutcome {
     /// Number of edit ops applied to the container.
     pub ops_applied: usize,
     /// Whether anything changed (ops applied + sidecar rewritten).
     pub changed: bool,
+    /// Concurrent-edit conflicts surfaced by the 3-way merge during this import
+    /// (both sides changed overlapping ancestor content). Empty when there was
+    /// no merge or the concurrent edits were disjoint. Purely informational —
+    /// the merge result (and thus the store text) is unaffected by conflicts.
+    pub conflicts: Vec<Conflict>,
+}
+
+impl SyncOutcome {
+    /// A no-op outcome: nothing changed, no ops, no conflicts.
+    fn unchanged() -> Self {
+        Self {
+            ops_applied: 0,
+            changed: false,
+            conflicts: Vec::new(),
+        }
+    }
+
+    /// A changed outcome that applied no edit ops (a projection/deletion/entry
+    /// flip) and carries no conflicts.
+    fn changed_no_ops() -> Self {
+        Self {
+            ops_applied: 0,
+            changed: true,
+            conflicts: Vec::new(),
+        }
+    }
 }
 
 /// Bridges a vault folder of text files into a CRDT [`Store`].
@@ -147,8 +177,8 @@ impl FolderBridge {
         // - Rebase path (`R != A`): re-express the local delta (`A -> L`) in the
         //   store's `R`-coordinates via OT rebase and layer it on top of the
         //   remote edits — LOSSLESS, keeping both sides.
-        let expected = if remote_text == baseline {
-            file_text.clone()
+        let (expected, conflicts) = if remote_text == baseline {
+            (file_text.clone(), Vec::new())
         } else {
             merge_local_onto_remote(&baseline, &file_text, &remote_text)
         };
@@ -158,10 +188,7 @@ impl FolderBridge {
         // offsets) is what makes the offsets correct regardless of remote merges.
         let ops = diff_to_ops(&remote_text, &expected);
         if ops.is_empty() {
-            return Ok(SyncOutcome {
-                ops_applied: 0,
-                changed: false,
-            });
+            return Ok(SyncOutcome::unchanged());
         }
 
         // Apply ops in order, but DON'T early-return on a storage error:
@@ -187,7 +214,7 @@ impl FolderBridge {
         // error and `actual == expected`); every error/desync/DirtyFile path
         // returns `Err` and short-circuits the `?` below, so the file-set entry
         // upsert runs on success only.
-        let outcome = reconcile_sidecar(
+        let mut outcome = reconcile_sidecar(
             file,
             &container,
             &file_text,
@@ -196,6 +223,11 @@ impl FolderBridge {
             ops.len(),
             apply_err,
         )?;
+        // Surface any concurrent-edit conflicts the 3-way merge detected. This
+        // is reached only on the success path (reconcile_sidecar returns `Err`
+        // on any error/desync), so the store already holds the merged text; the
+        // conflicts describe overlaps WITHOUT altering that result.
+        outcome.conflicts = conflicts;
 
         // Upsert the Live file-set entry. The hash is over the disk text `L`
         // (`file_text`), which is exactly the sidecar baseline recorded on
@@ -207,6 +239,7 @@ impl FolderBridge {
                 kind: EntryKind::Text,
                 status: EntryStatus::Live,
                 content_hash: text_hash(&file_text),
+                renamed_from: None,
             }
             .to_value(),
         )?;
@@ -243,6 +276,7 @@ impl FolderBridge {
                 kind: EntryKind::Text,
                 status: EntryStatus::Tombstoned,
                 content_hash: hash,
+                renamed_from: None,
             }
             .to_value(),
         )?;
@@ -252,10 +286,7 @@ impl FolderBridge {
         // Drop the sidecar too so a later remote re-create reads as remote-new.
         remove_if_present(&sidecar_path(file))?;
 
-        Ok(SyncOutcome {
-            ops_applied: 0,
-            changed: true,
-        })
+        Ok(SyncOutcome::changed_no_ops())
     }
 
     /// Project the container's current CRDT text onto disk (CRDT → disk).
@@ -288,10 +319,7 @@ impl FolderBridge {
         if on_disk.as_deref() == Some(text.as_str()) {
             if let Some(sidecar) = &sidecar {
                 if sidecar.last_synced_text == text {
-                    return Ok(SyncOutcome {
-                        ops_applied: 0,
-                        changed: false,
-                    });
+                    return Ok(SyncOutcome::unchanged());
                 }
             }
         }
@@ -330,10 +358,7 @@ impl FolderBridge {
         }
         .store(file)?;
 
-        Ok(SyncOutcome {
-            ops_applied: 0,
-            changed: true,
-        })
+        Ok(SyncOutcome::changed_no_ops())
     }
 
     /// Reconcile the whole vault against the file-set map (disk ↔ CRDT).
@@ -445,6 +470,7 @@ impl FolderBridge {
                     kind: EntryKind::Text,
                     status: EntryStatus::Live,
                     content_hash: text_hash(&store.text(key)),
+                    renamed_from: None,
                 }
                 .to_value(),
             )?;
@@ -488,17 +514,12 @@ impl FolderBridge {
                     kind: entry.kind,
                     status: EntryStatus::Tombstoned,
                     content_hash,
+                    renamed_from: None,
                 }
                 .to_value(),
             )?;
             remove_if_present(&sidecar)?;
-            outcomes.push((
-                file,
-                SyncOutcome {
-                    ops_applied: 0,
-                    changed: true,
-                },
-            ));
+            outcomes.push((file, SyncOutcome::changed_no_ops()));
         }
 
         // --- Step 3: apply remote state onto disk. ---
@@ -572,13 +593,7 @@ impl FolderBridge {
                         // test, which pins this behavior.
                         remove_if_present(&file)?;
                         remove_if_present(&sidecar_path(&file))?;
-                        outcomes.push((
-                            file,
-                            SyncOutcome {
-                                ops_applied: 0,
-                                changed: true,
-                            },
-                        ));
+                        outcomes.push((file, SyncOutcome::changed_no_ops()));
                     } else {
                         // Edit wins / resurrection: the container diverged from
                         // the tombstone hash, so a concurrent edit merged in
@@ -593,6 +608,7 @@ impl FolderBridge {
                                 kind: entry.kind,
                                 status: EntryStatus::Live,
                                 content_hash: current_hash,
+                                renamed_from: None,
                             }
                             .to_value(),
                         )?;
@@ -602,13 +618,9 @@ impl FolderBridge {
                             // which ARE the edits the resurrection preserves. Keep
                             // the file as-is (do not clobber) and still report a
                             // change; the entry is already Live.
-                            Err(FilesError::DirtyFile(_)) => outcomes.push((
-                                file,
-                                SyncOutcome {
-                                    ops_applied: 0,
-                                    changed: true,
-                                },
-                            )),
+                            Err(FilesError::DirtyFile(_)) => {
+                                outcomes.push((file, SyncOutcome::changed_no_ops()))
+                            }
                             Err(err) => return Err(err),
                         }
                     }
@@ -623,12 +635,26 @@ impl FolderBridge {
     /// container, mark the new path Live and the old path Tombstoned in the
     /// file-set map, and move the file + sidecar on disk.
     ///
-    /// Modeled as tombstone-old + a new-entry-carrying-content (Loro has no
-    /// re-key-with-content op), so the rename does NOT preserve the old
-    /// container's edit history — the new container starts from the old
-    /// container's CURRENT text. `from == to` is a no-op (returns
-    /// `changed: false`), never touching disk or the store. This handles a
-    /// single file only; directory renames are out of scope.
+    /// Modeled as tombstone-old + a new-entry-carrying-content, so the rename
+    /// does NOT preserve the old container's edit history — the new container
+    /// starts from the old container's CURRENT text.
+    ///
+    /// WHY history can't move (verified against loro 1.13.9): the crate exposes
+    /// no container move/re-key/transplant op. `LoroDoc` offers only
+    /// `get_text`/`get_map`/… (attach-or-create by id), `delete_root_container`
+    /// (delete only), and `has_container`; container ids are fixed at creation.
+    /// The only `mov*` ops are `LoroTree::mov*` (reparent a tree NODE by TreeID)
+    /// and `LoroMovableList::mov(from, to)` (reorder a list ELEMENT by index) —
+    /// both intra-container element/node moves, neither re-keys a container nor
+    /// transplants a text container's op-history to a new id. So a new container
+    /// is unavoidable.
+    ///
+    /// To keep the old history LINKABLE despite that, the new entry records
+    /// [`FileEntry::renamed_from`] = the old `container_id` (rename provenance).
+    ///
+    /// `from == to` is a no-op (returns `changed: false`), never touching disk
+    /// or the store. This handles a single file only; directory renames are out
+    /// of scope.
     ///
     /// Ordering is data-loss-safe: flush `from`'s pending disk edits → seed the
     /// `to` container → set the map entries → project `to` to disk → only THEN
@@ -645,10 +671,7 @@ impl FolderBridge {
 
         // No-op: same path/container. Nothing to move; leave all data untouched.
         if from_container == to_container {
-            return Ok(SyncOutcome {
-                ops_applied: 0,
-                changed: false,
-            });
+            return Ok(SyncOutcome::unchanged());
         }
 
         // Flush any pending local disk edits on `from` first, so the container
@@ -678,6 +701,9 @@ impl FolderBridge {
                 kind: EntryKind::Text,
                 status: EntryStatus::Live,
                 content_hash: hash.clone(),
+                // Rename provenance: link the new container back to the old one,
+                // since Loro can't carry the edit history across (see the fn doc).
+                renamed_from: Some(from_container.clone()),
             }
             .to_value(),
         )?;
@@ -688,6 +714,7 @@ impl FolderBridge {
                 kind: EntryKind::Text,
                 status: EntryStatus::Tombstoned,
                 content_hash: hash,
+                renamed_from: None,
             }
             .to_value(),
         )?;
@@ -699,10 +726,7 @@ impl FolderBridge {
         remove_if_present(from)?;
         remove_if_present(&sidecar_path(from))?;
 
-        Ok(SyncOutcome {
-            ops_applied: 0,
-            changed: true,
-        })
+        Ok(SyncOutcome::changed_no_ops())
     }
 }
 
@@ -853,9 +877,12 @@ fn reconcile_sidecar(
             last_synced_text: file_text.to_string(),
         }
         .store(file)?;
+        // Conflicts (if any) are attached by the caller (`import_file`); this
+        // helper only knows ops/changed, so it leaves the list empty.
         return Ok(SyncOutcome {
             ops_applied,
             changed: true,
+            conflicts: Vec::new(),
         });
     }
 
@@ -1353,7 +1380,8 @@ mod tests {
             outcome,
             SyncOutcome {
                 ops_applied: 2,
-                changed: true
+                changed: true,
+                conflicts: Vec::new(),
             }
         );
         assert_eq!(
@@ -1607,6 +1635,7 @@ mod tests {
                 kind: EntryKind::Text,
                 status: EntryStatus::Live,
                 content_hash: text_hash("hello\n"),
+                renamed_from: None,
             }
         );
     }
@@ -1732,6 +1761,7 @@ mod tests {
             kind: EntryKind::Text,
             status: EntryStatus::Live,
             content_hash: hash,
+            renamed_from: None,
         }
         .to_value()
     }
@@ -1741,6 +1771,7 @@ mod tests {
             kind: EntryKind::Text,
             status: EntryStatus::Tombstoned,
             content_hash: hash,
+            renamed_from: None,
         }
         .to_value()
     }
@@ -2300,5 +2331,103 @@ mod tests {
             fileset_entry(&store, &container).unwrap().status,
             EntryStatus::Live
         );
+    }
+
+    #[test]
+    fn rename_records_provenance_on_new_entry() {
+        // E2: after a rename, the NEW entry links back to the OLD container id
+        // via `renamed_from`, so the (unpreservable) history stays discoverable.
+        let dir = tempdir().unwrap();
+        let (b, mut store) = bridge(dir.path());
+        let vault = dir.path().join("vault");
+        let old = vault.join("old.md");
+        let new = vault.join("new.md");
+        std::fs::write(&old, "content\n").unwrap();
+        b.import_file(&mut store, &old).unwrap();
+        let old_container = container_id(&vault, &old).unwrap();
+        let new_container = container_id(&vault, &new).unwrap();
+
+        b.rename_file(&mut store, &old, &new).unwrap();
+
+        let new_entry = fileset_entry(&store, &new_container).unwrap();
+        assert_eq!(new_entry.renamed_from, Some(old_container.clone()));
+        // Sanity: the container id is the vault-relative key.
+        assert_eq!(new_entry.renamed_from, Some("old.md".to_string()));
+        // The tombstoned old entry carries no provenance of its own.
+        let old_entry = fileset_entry(&store, &old_container).unwrap();
+        assert_eq!(old_entry.renamed_from, None);
+    }
+
+    #[test]
+    fn normal_import_writes_no_rename_provenance() {
+        // E2: a plain import (not a rename) records `renamed_from: None`.
+        let dir = tempdir().unwrap();
+        let (b, mut store) = bridge(dir.path());
+        let vault = dir.path().join("vault");
+        let file = vault.join("note.md");
+        std::fs::write(&file, "hello\n").unwrap();
+        b.import_file(&mut store, &file).unwrap();
+
+        let container = container_id(&vault, &file).unwrap();
+        assert_eq!(fileset_entry(&store, &container).unwrap().renamed_from, None);
+    }
+
+    #[test]
+    fn import_surfaces_overlapping_concurrent_edit_conflict() {
+        // E3: a remote edit merged into the container AND a local disk edit both
+        // change the SAME region → the merge still converges (both edits kept)
+        // AND the import outcome carries a conflict describing the overlap.
+        let dir = tempdir().unwrap();
+        let (b, mut store) = bridge(dir.path());
+        let vault = dir.path().join("vault");
+        let file = vault.join("note.md");
+        std::fs::write(&file, "abc\n").unwrap();
+        b.import_file(&mut store, &file).unwrap();
+        let container = container_id(&vault, &file).unwrap();
+
+        // Remote replaces "b" with "Z" (container: "aZc\n").
+        store.delete_text(&container, 1, 1).unwrap();
+        store.edit_text(&container, 1, "Z").unwrap();
+        assert_eq!(store.text(&container), "aZc\n");
+
+        // Local (on disk) replaces "b" with "Y": overlapping the SAME "b".
+        std::fs::write(&file, "aYc\n").unwrap();
+        let outcome = b.import_file(&mut store, &file).unwrap();
+
+        assert!(outcome.changed);
+        assert!(
+            !outcome.conflicts.is_empty(),
+            "overlapping concurrent edits must surface a conflict: {outcome:?}"
+        );
+        // Merge output unchanged by the conflict signal: both sides survive.
+        assert_eq!(store.text(&container), "aZYc\n");
+    }
+
+    #[test]
+    fn import_does_not_flag_non_overlapping_concurrent_edits() {
+        // E3: remote changes the START, local changes the END — disjoint
+        // regions. Both merge in and NO conflict is reported.
+        let dir = tempdir().unwrap();
+        let (b, mut store) = bridge(dir.path());
+        let vault = dir.path().join("vault");
+        let file = vault.join("note.md");
+        std::fs::write(&file, "hello world\n").unwrap();
+        b.import_file(&mut store, &file).unwrap();
+        let container = container_id(&vault, &file).unwrap();
+
+        // Remote inserts a prefix (touches the start region only).
+        store.edit_text(&container, 0, "XYZ ").unwrap();
+        assert_eq!(store.text(&container), "XYZ hello world\n");
+
+        // Local appends a suffix (touches the end region only).
+        std::fs::write(&file, "hello world END\n").unwrap();
+        let outcome = b.import_file(&mut store, &file).unwrap();
+
+        assert!(outcome.changed);
+        assert!(
+            outcome.conflicts.is_empty(),
+            "disjoint concurrent edits must NOT be flagged: {outcome:?}"
+        );
+        assert_eq!(store.text(&container), "XYZ hello world END\n");
     }
 }

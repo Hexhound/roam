@@ -55,6 +55,19 @@ pub struct FileEntry {
     /// blake3 hex digest (see [`text_hash`](crate::text_hash)) of the
     /// last-synced content.
     pub content_hash: String,
+    /// When this entry was created by a rename, the `container_id` of the file
+    /// it was renamed FROM (rename provenance). Loro cannot transplant a
+    /// container's edit history to a new id (see
+    /// [`FolderBridge::rename_file`](crate::FolderBridge::rename_file)), so the
+    /// history is not preserved; this field makes the old container LINKABLE
+    /// from the new one. `None` for a normally-imported (non-renamed) entry.
+    ///
+    /// On-wire: `#[serde(default, skip_serializing_if = "Option::is_none")]`
+    /// keeps the JSON forward/backward compatible — an old value with no
+    /// `renamed_from` key parses to `None`, and a `None` field is omitted so
+    /// old readers still see exactly the old shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renamed_from: Option<String>,
 }
 
 impl FileEntry {
@@ -83,6 +96,7 @@ mod tests {
             kind: EntryKind::Text,
             status,
             content_hash: "abc123".to_string(),
+            renamed_from: None,
         }
     }
 
@@ -123,8 +137,43 @@ mod tests {
                 kind: EntryKind::Text,
                 status: EntryStatus::Live,
                 content_hash: "deadbeef".to_string(),
+                renamed_from: None,
             }
         );
+    }
+
+    #[test]
+    fn old_shape_without_renamed_from_still_deserializes() {
+        // Forward/backward compat (E2): an OLD-shape value written before the
+        // `renamed_from` field existed (no such key) must still parse, defaulting
+        // the field to `None`.
+        let json = r#"{"kind":"text","status":"live","content_hash":"cafe"}"#;
+        let entry = FileEntry::from_value(json).unwrap();
+        assert_eq!(entry.renamed_from, None);
+        assert_eq!(entry.kind, EntryKind::Text);
+        assert_eq!(entry.status, EntryStatus::Live);
+    }
+
+    #[test]
+    fn renamed_from_omitted_from_wire_when_none() {
+        // When `renamed_from` is `None` it must be OMITTED from the JSON so old
+        // readers see exactly the old shape (no new key at all).
+        let value = sample(EntryStatus::Live).to_value();
+        assert!(!value.contains("renamed_from"), "None must not serialize a key: {value}");
+    }
+
+    #[test]
+    fn renamed_from_round_trips_when_set() {
+        let entry = FileEntry {
+            kind: EntryKind::Text,
+            status: EntryStatus::Live,
+            content_hash: "abc123".to_string(),
+            renamed_from: Some("old.md".to_string()),
+        };
+        let value = entry.to_value();
+        assert!(value.contains("renamed_from"));
+        assert!(value.contains("old.md"));
+        assert_eq!(FileEntry::from_value(&value).unwrap(), entry);
     }
 
     #[test]

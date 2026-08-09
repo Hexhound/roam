@@ -418,12 +418,39 @@ async fn scan_and_maybe_flush(
 }
 
 /// Print a concise, legible line per changed file so the demo shows what moved.
+/// A file that also carried concurrent-edit conflicts gets an extra `conflict:`
+/// line (non-fatal — the merge already kept both sides; this just informs).
 fn report_scan(outcomes: &[(PathBuf, SyncOutcome)]) {
     for (path, outcome) in outcomes {
         if let Some(line) = describe_outcome(path, outcome, path.exists()) {
             println!("{line}");
         }
+        if let Some(line) = conflict_line(path, outcome) {
+            println!("{line}");
+        }
     }
+}
+
+/// A `conflict:` line for an outcome that surfaced concurrent-edit conflicts, or
+/// `None` when there were none. Pure (no IO) so it is unit-testable.
+///
+/// The merge is authoritative and lossless (both sides survive); this line only
+/// tells the user that two peers changed overlapping regions of the same file.
+fn conflict_line(path: &Path, outcome: &SyncOutcome) -> Option<String> {
+    if outcome.conflicts.is_empty() {
+        return None;
+    }
+    let n = outcome.conflicts.len();
+    let regions = outcome
+        .conflicts
+        .iter()
+        .map(|c| format!("{}..{}", c.ancestor_start, c.ancestor_end))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "  conflict: {} — {n} overlapping edit region(s) [{regions}] (both kept)",
+        path.display()
+    ))
 }
 
 /// A human-readable action for a single scan outcome, or `None` when nothing
@@ -554,10 +581,10 @@ async fn status(vault: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        append_position, coalesce_paths, describe_outcome, is_benign_scan_error,
+        append_position, coalesce_paths, conflict_line, describe_outcome, is_benign_scan_error,
         spawn_vault_watcher,
     };
-    use roam_files::{FilesError, SyncOutcome};
+    use roam_files::{Conflict, FilesError, SyncOutcome};
     use std::path::{Path, PathBuf};
     use tokio::sync::mpsc;
 
@@ -601,6 +628,7 @@ mod tests {
         let imported = SyncOutcome {
             ops_applied: 3,
             changed: true,
+            conflicts: Vec::new(),
         };
         let line = describe_outcome(p, &imported, true).unwrap();
         assert!(line.contains("imported (3 op(s))"));
@@ -610,6 +638,7 @@ mod tests {
         let projected = SyncOutcome {
             ops_applied: 0,
             changed: true,
+            conflicts: Vec::new(),
         };
         assert!(describe_outcome(p, &projected, true)
             .unwrap()
@@ -624,8 +653,37 @@ mod tests {
         let unchanged = SyncOutcome {
             ops_applied: 0,
             changed: false,
+            conflicts: Vec::new(),
         };
         assert!(describe_outcome(p, &unchanged, true).is_none());
+    }
+
+    #[test]
+    fn conflict_line_reports_conflicts_and_is_none_when_empty() {
+        let p = Path::new("note.md");
+
+        // An outcome carrying a conflict yields a `conflict:` line naming the path.
+        let with_conflict = SyncOutcome {
+            ops_applied: 2,
+            changed: true,
+            conflicts: vec![Conflict {
+                ancestor_start: 1,
+                ancestor_end: 2,
+                ancestor_text: "b".to_string(),
+            }],
+        };
+        let line = conflict_line(p, &with_conflict).unwrap();
+        assert!(line.contains("conflict:"), "line was: {line}");
+        assert!(line.contains("note.md"));
+        assert!(line.contains("1..2"));
+
+        // No conflicts -> no line.
+        let clean = SyncOutcome {
+            ops_applied: 2,
+            changed: true,
+            conflicts: Vec::new(),
+        };
+        assert!(conflict_line(p, &clean).is_none());
     }
 
     #[test]
