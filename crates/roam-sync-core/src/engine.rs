@@ -1,10 +1,29 @@
 use crate::frame::Frame;
 use crate::transport::Transport;
 use futures::StreamExt;
-use roam_storage::{Identity, PeerStatus, Store, VaultId, VerifyingKey};
+use roam_files::{EntryKind, EntryStatus, FileEntry, FILESET_MAP_ID};
+use roam_storage::{BlobStore, Identity, PeerStatus, Store, VaultId, VerifyingKey};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::Mutex;
+
+/// Upper bound on the blob-bytes payload this slice transfers in ONE
+/// [`Frame::BlobData`]. The iroh transport caps a whole encoded frame at 64 MiB
+/// (`MAX_FRAME_LEN`); we stay a comfortable margin below it so the hash string +
+/// postcard framing overhead still fit. A blob larger than this is NOT served
+/// (the server skips it with a log line) — chunked transfer is deferred.
+///
+/// TODO(blob-chunking): lift this cap by splitting an oversized blob into
+/// offset-tagged `BlobData` chunks reassembled + full-hash-verified by the
+/// receiver. Until then a >`MAX_BLOB_BYTES` blob simply does not transfer.
+pub const MAX_BLOB_BYTES: usize = 60 * 1024 * 1024;
+
+/// Whether a blob of `byte_len` bytes fits in a single [`Frame::BlobData`] under
+/// [`MAX_BLOB_BYTES`]. Pulled out as a pure predicate so the size boundary is
+/// unit-testable without allocating tens of MiB.
+fn blob_fits_frame(byte_len: usize) -> bool {
+    byte_len <= MAX_BLOB_BYTES
+}
 
 /// Drives sync for one device over a [`Transport`]. Owns the [`Store`]; local
 /// edits go through the engine so it can live-push.
@@ -160,6 +179,85 @@ impl<T: Transport + 'static> Engine<T> {
             )
             .await;
         }
+    }
+
+    /// Pull every blob the synced file-set map references but whose bytes we
+    /// lack: send a [`Frame::BlobWant`] for each missing hash to every connected,
+    /// trusted-Active peer.
+    ///
+    /// A peer learns a `Blob` entry-ref through the ordinary map sync (the ref
+    /// rides the op-log); the BYTES live outside the CRDT, so this pull fetches
+    /// them. Enumeration reads `store.entries(FILESET_MAP_ID)`, keeps only
+    /// `kind == Blob, status == Live` entries whose `content_hash` is absent from
+    /// our local [`BlobStore`], and de-duplicates hashes referenced by several
+    /// entries.
+    ///
+    /// Lock discipline: gather the missing-hash list AND the target peer set
+    /// under their locks, DROP every guard, THEN await the transport sends (never
+    /// a lock held across an await).
+    ///
+    /// Idempotent, so a caller may drive it on a cadence (e.g. after each inbound
+    /// `changed()` in the D5 reconcile loop, or a CLI timer): re-requesting an
+    /// in-flight hash is harmless — the server just re-serves and the receiver
+    /// drops the duplicate (it already has, or already stored, the bytes). A
+    /// dedicated in-flight set is deferred; presence-based idempotence suffices.
+    pub async fn request_missing_blobs(&self) {
+        // 1. Missing hashes + the trusted-Active roster, under the store lock.
+        let (wanted, active): (Vec<String>, HashSet<u64>) = {
+            let store = self.store.lock().await;
+            let wanted = Self::missing_blob_hashes(&store);
+            let active = store
+                .roster()
+                .into_iter()
+                .filter(|p| p.status == PeerStatus::Active && p.peer_id != self.peer_id())
+                .map(|p| p.peer_id)
+                .collect();
+            (wanted, active)
+        };
+        if wanted.is_empty() {
+            return;
+        }
+        // 2. Connected ∩ Active, under the connected lock (store guard dropped).
+        let peers: Vec<u64> = {
+            let connected = self.connected.lock().await;
+            connected.iter().copied().filter(|p| active.contains(p)).collect()
+        };
+        // 3. Sends happen lock-free.
+        for peer in peers {
+            for hash in &wanted {
+                self.send(peer, Frame::BlobWant { hash: hash.clone() }).await;
+            }
+        }
+    }
+
+    /// De-duplicated blob hashes referenced by a `Live` `Blob` file-set entry
+    /// whose bytes are NOT present in the local [`BlobStore`].
+    fn missing_blob_hashes(store: &Store) -> Vec<String> {
+        let mut seen = HashSet::new();
+        store
+            .entries(FILESET_MAP_ID)
+            .into_iter()
+            .filter_map(|(_key, value)| FileEntry::from_value(&value).ok())
+            .filter(|entry| entry.kind == EntryKind::Blob && entry.status == EntryStatus::Live)
+            .map(|entry| entry.content_hash)
+            .filter(|hash| !store.blobs().has(hash))
+            .filter(|hash| seen.insert(hash.clone()))
+            .collect()
+    }
+
+    /// Whether the file-set map has a `Live` `Blob` entry referencing `hash` —
+    /// i.e. whether inbound bytes for `hash` are SOLICITED. Guards the receive
+    /// path against an active peer spamming unsolicited blobs onto our disk.
+    fn fileset_wants(store: &Store, hash: &str) -> bool {
+        store
+            .entries(FILESET_MAP_ID)
+            .into_iter()
+            .filter_map(|(_key, value)| FileEntry::from_value(&value).ok())
+            .any(|entry| {
+                entry.kind == EntryKind::Blob
+                    && entry.status == EntryStatus::Live
+                    && entry.content_hash == hash
+            })
     }
 
     /// Vouch for `peer` (holding `key`) locally, then gossip the updated roster
@@ -384,6 +482,55 @@ impl<T: Transport + 'static> Engine<T> {
                 )
                 .await;
             }
+            Frame::BlobWant { hash } => {
+                // Read-side revoke gate: only ever serve a blob to a peer we
+                // currently vouch for as Active — identical to the Have/RosterHave
+                // serving paths (spec §9.6). A revoked/untrusted peer gets nothing.
+                if !self.is_active(peer).await {
+                    return Ok(());
+                }
+                // Look the bytes up under the store lock, DROP the guard, then
+                // send. Absent blob → send nothing, no error.
+                let bytes = {
+                    let store = self.store.lock().await;
+                    // `get` verifies on-disk integrity; a corrupt/missing blob
+                    // yields None here and we simply do not serve it.
+                    store.blobs().get(&hash).ok().flatten()
+                };
+                if let Some(bytes) = bytes {
+                    if blob_fits_frame(bytes.len()) {
+                        self.send(peer, Frame::BlobData { hash, bytes }).await;
+                    }
+                    // else: oversized for a single frame this slice — skip
+                    // serving it (chunking deferred; see `MAX_BLOB_BYTES`).
+                }
+            }
+            Frame::BlobData { hash, bytes } => {
+                // Poison guard (critical): the bytes MUST hash to the claimed
+                // hash, or a peer could store wrong bytes under a good hash and
+                // corrupt our content-addressed store. Reject the mismatch.
+                if BlobStore::hash(&bytes) != hash {
+                    return Ok(());
+                }
+                // Store under the lock only if we (a) don't already hold it
+                // (idempotent) and (b) actually solicited it — a `Live` `Blob`
+                // file-set entry references this hash (anti-spam). Drop the guard
+                // before firing the change signal.
+                let stored = {
+                    let store = self.store.lock().await;
+                    if store.blobs().has(&hash) || !Self::fileset_wants(&store, &hash) {
+                        false
+                    } else {
+                        store.blobs().put(&bytes).is_ok()
+                    }
+                };
+                // Signal the reconcile/projection (D5) that new blob bytes
+                // landed, so it can project them to disk. Only fire on a real
+                // store (not on a dropped duplicate/unsolicited/failed put).
+                if stored {
+                    self.changed.notify_waiters();
+                }
+            }
             Frame::Ping => {}
         }
         Ok(())
@@ -526,5 +673,20 @@ impl<T: Transport + 'static> Engine<T> {
             .into_iter()
             .find(|p| p.peer_id == peer)
             .and_then(|p| VerifyingKey::from_bytes(&p.verifying_key).ok())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{blob_fits_frame, MAX_BLOB_BYTES};
+
+    #[test]
+    fn blob_fits_frame_decides_at_the_cap_boundary() {
+        // Boundary is exercised via the pure predicate, WITHOUT allocating a
+        // 60 MiB blob: exactly at the cap fits; one byte over does not.
+        assert!(blob_fits_frame(0));
+        assert!(blob_fits_frame(MAX_BLOB_BYTES - 1));
+        assert!(blob_fits_frame(MAX_BLOB_BYTES));
+        assert!(!blob_fits_frame(MAX_BLOB_BYTES + 1));
     }
 }

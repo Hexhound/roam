@@ -16,6 +16,17 @@ pub enum Frame {
     RosterOps { author: u64, jsonl: Vec<u8> },
     /// Keepalive.
     Ping,
+    // ---- Blob transfer (WS-D4). APPENDED at the END of the enum so existing
+    // postcard variant indices (Hello=0 … Ping=5) are unchanged on the wire; a
+    // peer built before D4 keeps decoding all older frames byte-for-byte. ----
+    /// Pull request: "please send me the bytes for this content hash." Driven
+    /// off the synced file-set map — a peer that learned a `Blob` entry-ref but
+    /// lacks the bytes asks a peer that has them.
+    BlobWant { hash: String },
+    /// The bytes for `hash`, served in response to a [`Frame::BlobWant`].
+    /// Whole-blob, single frame; the receiver re-hashes `bytes` and rejects any
+    /// mismatch (a peer must not be able to poison a hash with wrong bytes).
+    BlobData { hash: String, bytes: Vec<u8> },
 }
 
 impl Frame {
@@ -41,6 +52,8 @@ mod tests {
             Frame::RosterHave { authors: vec![(1, 3), (2, 0)] },
             Frame::RosterOps { author: 1, jsonl: vec![9, 9] },
             Frame::Ping,
+            Frame::BlobWant { hash: "ab".repeat(32) },
+            Frame::BlobData { hash: "cd".repeat(32), bytes: vec![0, 1, 2, 255] },
         ];
         for f in frames {
             let bytes = f.encode();

@@ -8,6 +8,7 @@ repository.workspace = true
 [dependencies]
 roam-crdt = { path = "../roam-crdt" }
 roam-storage = { path = "../roam-storage" }
+roam-files = { path = "../roam-files" }
 tokio.workspace = true
 async-trait.workspace = true
 futures.workspace = true
