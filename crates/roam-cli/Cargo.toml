@@ -13,6 +13,7 @@ path = "src/main.rs"
 roam-storage = { path = "../roam-storage" }
 roam-sync-core = { path = "../roam-sync-core" }
 roam-transport-iroh = { path = "../roam-transport-iroh" }
+roam-files = { path = "../roam-files" }
 iroh.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "io-std", "signal"] }
 clap.workspace = true

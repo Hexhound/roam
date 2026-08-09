@@ -74,6 +74,11 @@ pub struct SyncOutcome {
 /// takes the [`Store`] explicitly on every operation. This lets the caller (the
 /// sync engine) own a single `Store` instance and share it with the bridge,
 /// instead of the bridge owning a second, separate store handle.
+///
+/// `Clone` is cheap (a single `PathBuf`) and lets a caller hand an owned copy to
+/// a `spawn_blocking` closure — the CLI folder-sync loop does exactly this so the
+/// blocking disk+store work runs off the async runtime workers.
+#[derive(Clone)]
 pub struct FolderBridge {
     vault_root: PathBuf,
 }

@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use roam_files::{FilesError, FolderBridge, SyncOutcome};
 use roam_storage::{Identity, PeerStatus, Store, VaultId};
 use roam_sync_core::engine::Engine;
 use roam_transport_iroh::{host_pairing, join_pairing, IrohTransport, PairingToken};
@@ -59,6 +60,11 @@ enum Command {
         vault: PathBuf,
         #[arg(long)]
         identity: PathBuf,
+        /// Sync a real folder of `*.md`/`*.org` files instead of the interactive
+        /// "note" REPL: import local edits, project remote edits, both directions
+        /// live. When absent, the legacy REPL runs (backward compatible).
+        #[arg(long)]
+        folder: Option<PathBuf>,
     },
     /// Print roster + document status for a vault (read-only).
     Status {
@@ -77,7 +83,11 @@ async fn main() -> Result<()> {
             identity,
             token,
         } => pair(&vault, &identity, token).await,
-        Command::Sync { vault, identity } => sync(&vault, &identity).await,
+        Command::Sync {
+            vault,
+            identity,
+            folder,
+        } => sync(&vault, &identity, folder).await,
         Command::Status { vault } => status(&vault).await,
     }
 }
@@ -165,7 +175,20 @@ async fn pair(vault: &Path, identity_path: &Path, token: String) -> Result<()> {
     Ok(())
 }
 
-async fn sync(vault: &Path, identity_path: &Path) -> Result<()> {
+/// Dispatch `sync`: `--folder` runs the real-folder sync loop; without it the
+/// legacy interactive "note" REPL runs (backward compatible). Both share the
+/// transport/engine setup via [`setup_engine`].
+async fn sync(vault: &Path, identity_path: &Path, folder: Option<PathBuf>) -> Result<()> {
+    let engine = setup_engine(vault, identity_path).await?;
+    match folder {
+        Some(folder) => sync_folder(engine, folder).await,
+        None => sync_repl(engine).await,
+    }
+}
+
+/// Build the transport + engine, spawn its receive loop, and connect to every
+/// active roster peer. Shared by both the REPL and the folder-sync paths.
+async fn setup_engine(vault: &Path, identity_path: &Path) -> Result<Arc<Engine<IrohTransport>>> {
     let identity = Identity::load(identity_path).context("load identity")?;
     let vault_id = load_vault_id(vault)?;
     let store = Store::open(vault, identity.clone()).context("open vault store")?;
@@ -196,6 +219,159 @@ async fn sync(vault: &Path, identity_path: &Path) -> Result<()> {
             Err(e) => println!("connect to peer {peer} failed: {e}"),
         }
     }
+    Ok(engine)
+}
+
+/// Reconcile the whole vault folder against the store on a blocking thread.
+///
+/// Lock discipline (CRITICAL): the store mutex is acquired with `blocking_lock()`
+/// INSIDE `spawn_blocking`, so it never runs on a runtime worker and the guard is
+/// released on the blocking thread before this async task resumes — the guard
+/// never crosses a transport `.await`. `scan` performs synchronous disk IO with
+/// the store locked and returns before any gossip happens.
+///
+/// A `spawn_blocking` panic surfaces as a `JoinError` → `anyhow` via `?`; a
+/// `scan` failure surfaces as `FilesError` → `anyhow` via `map_err`. The caller
+/// treats BOTH as non-fatal (log + continue), so one bad file never kills the
+/// daemon.
+async fn run_scan(
+    engine: &Arc<Engine<IrohTransport>>,
+    bridge: &FolderBridge,
+) -> anyhow::Result<Vec<(PathBuf, SyncOutcome)>> {
+    let store = engine.store(); // Arc<Mutex<Store>>
+    let bridge = bridge.clone(); // FolderBridge is just a PathBuf (derives Clone).
+    tokio::task::spawn_blocking(move || {
+        let mut guard = store.blocking_lock(); // OK on a blocking thread.
+        bridge.scan(&mut guard) // sync disk IO with the store locked.
+    })
+    .await? // JoinError (panic) -> anyhow.
+    .map_err(Into::into) // FilesError -> anyhow.
+}
+
+/// The real-folder sync loop (Tasks c + d). Imports local disk edits and projects
+/// remote edits, in both directions, until Ctrl-C.
+async fn sync_folder(engine: Arc<Engine<IrohTransport>>, folder: PathBuf) -> Result<()> {
+    let bridge = FolderBridge::new(&folder);
+
+    // Initial publish: import the current vault contents into the store, then
+    // gossip to peers. A failing initial scan is logged, not fatal — the poll
+    // below retries.
+    scan_and_maybe_flush(&engine, &bridge).await;
+    // Always flush once at startup even if the scan changed nothing locally, so a
+    // freshly-connected peer receives whatever the store already held.
+    engine.flush_local().await;
+
+    println!(
+        "watching {} for changes; Ctrl-C to stop.",
+        folder.display()
+    );
+    let mut interval = tokio::time::interval(Duration::from_millis(500));
+
+    loop {
+        // Re-acquire the Notify handle and build a FRESH `Notified` future each
+        // iteration: `notify_waiters` only wakes CURRENTLY-registered waiters and
+        // stores no permit, so a future from a prior iteration is useless here.
+        //
+        // Registration ordering: `Notified` registers as a waiter on first poll,
+        // not at creation, which would leave a gap between building it and the
+        // `select!`'s first poll. `enable()` registers the waiter eagerly, right
+        // now, closing that gap for the duration of this iteration's await.
+        //
+        // A residual gap remains WHILE a branch body is awaiting (e.g. inside
+        // `run_scan`'s `spawn_blocking`): a `notify_waiters` firing then is not
+        // caught by this future. That is acceptable — the 500ms poll is the
+        // GUARANTEED fallback that reconciles remote state regardless, so the
+        // notify is purely a latency optimization for the common idle case.
+        let changed = engine.changed();
+        let notified = changed.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                println!("\nstopping.");
+                return Ok(());
+            }
+            // Local-change poll: guaranteed fallback for both directions.
+            _ = interval.tick() => {
+                scan_and_maybe_flush(&engine, &bridge).await;
+            }
+            // Inbound remote change: project remote state to disk promptly.
+            _ = &mut notified => {
+                scan_and_maybe_flush(&engine, &bridge).await;
+            }
+        }
+    }
+}
+
+/// Run one reconcile scan and, if anything changed, gossip local ops to peers.
+///
+/// Task (d) error handling lives here: a `run_scan` error NEVER propagates — it is
+/// logged and the loop continues. `NotText`/`DirtyFile` are classified as benign
+/// per-file conditions (quieter note); anything else (including a `spawn_blocking`
+/// panic surfaced as a non-`FilesError` `anyhow`) gets a louder warning. Either
+/// way the daemon keeps running.
+async fn scan_and_maybe_flush(engine: &Arc<Engine<IrohTransport>>, bridge: &FolderBridge) {
+    match run_scan(engine, bridge).await {
+        Ok(outcomes) => {
+            report_scan(&outcomes);
+            if outcomes.iter().any(|(_, outcome)| outcome.changed) {
+                // A remote-driven scan that only projected to disk still calls
+                // this; `flush_local` is idempotent (no unsent suffix -> no-op),
+                // so the harmless extra flush is fine.
+                engine.flush_local().await;
+            }
+        }
+        Err(err) => match err.downcast_ref::<FilesError>() {
+            Some(files_err) if is_benign_scan_error(files_err) => {
+                eprintln!("note: skipping file: {files_err}");
+            }
+            Some(files_err) => eprintln!("warning: scan failed, continuing: {files_err}"),
+            None => eprintln!("warning: scan task failed, continuing: {err}"),
+        },
+    }
+}
+
+/// Print a concise, legible line per changed file so the demo shows what moved.
+fn report_scan(outcomes: &[(PathBuf, SyncOutcome)]) {
+    for (path, outcome) in outcomes {
+        if let Some(line) = describe_outcome(path, outcome, path.exists()) {
+            println!("{line}");
+        }
+    }
+}
+
+/// A human-readable action for a single scan outcome, or `None` when nothing
+/// changed. `exists` = whether the path is present on disk after the scan, which
+/// distinguishes a projection/creation (`exists`) from a deletion (`!exists`) when
+/// no edit ops were applied (both report `ops_applied == 0, changed == true`).
+///
+/// Pure (no IO): the caller supplies `exists`, so this is unit-testable.
+fn describe_outcome(path: &Path, outcome: &SyncOutcome, exists: bool) -> Option<String> {
+    if !outcome.changed {
+        return None;
+    }
+    let action = if outcome.ops_applied > 0 {
+        format!("imported ({} op(s))", outcome.ops_applied)
+    } else if exists {
+        "projected".to_string()
+    } else {
+        "deleted".to_string()
+    };
+    Some(format!("  {action}: {}", path.display()))
+}
+
+/// Whether a scan error is a known-benign, per-file condition. Both benign and
+/// non-benign scan errors are non-fatal to the loop; this only picks the log
+/// verbosity. `NotText`/`DirtyFile` are expected during normal use (a binary file
+/// dropped in the folder, or a file with un-imported local edits mid-project).
+fn is_benign_scan_error(err: &FilesError) -> bool {
+    matches!(err, FilesError::NotText(_) | FilesError::DirtyFile(_))
+}
+
+/// The legacy interactive "note" REPL (backward compatible). Type lines to append
+/// to the shared "note" container and watch the peer's edits land.
+async fn sync_repl(engine: Arc<Engine<IrohTransport>>) -> Result<()> {
     println!("running; type a line to append, Ctrl-C to stop.");
 
     // Interactive REPL: type lines to append to the shared "note" container and
@@ -292,7 +468,56 @@ async fn status(vault: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::append_position;
+    use super::{append_position, describe_outcome, is_benign_scan_error};
+    use roam_files::{FilesError, SyncOutcome};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn describe_outcome_classifies_import_project_delete() {
+        let p = Path::new("note.md");
+
+        // ops_applied > 0 -> imported (regardless of existence).
+        let imported = SyncOutcome {
+            ops_applied: 3,
+            changed: true,
+        };
+        let line = describe_outcome(p, &imported, true).unwrap();
+        assert!(line.contains("imported (3 op(s))"));
+        assert!(line.contains("note.md"));
+
+        // 0 ops + present -> projected.
+        let projected = SyncOutcome {
+            ops_applied: 0,
+            changed: true,
+        };
+        assert!(describe_outcome(p, &projected, true)
+            .unwrap()
+            .contains("projected"));
+
+        // 0 ops + absent -> deleted.
+        assert!(describe_outcome(p, &projected, false)
+            .unwrap()
+            .contains("deleted"));
+
+        // Nothing changed -> None (no noise printed).
+        let unchanged = SyncOutcome {
+            ops_applied: 0,
+            changed: false,
+        };
+        assert!(describe_outcome(p, &unchanged, true).is_none());
+    }
+
+    #[test]
+    fn benign_scan_errors_are_not_text_or_dirty_file() {
+        assert!(is_benign_scan_error(&FilesError::NotText(PathBuf::from(
+            "x.md"
+        ))));
+        assert!(is_benign_scan_error(&FilesError::DirtyFile(PathBuf::from(
+            "x.md"
+        ))));
+        // A desync is unexpected and must NOT be treated as benign.
+        assert!(!is_benign_scan_error(&FilesError::Desync("boom".into())));
+    }
 
     #[test]
     fn append_position_counts_codepoints_not_bytes() {
