@@ -77,40 +77,79 @@ impl FolderBridge {
             });
         }
 
+        // Apply ops in order, but DON'T early-return on a storage error:
+        // `Store::edit_text`/`delete_text` mutate the in-memory doc before
+        // persisting, so a mid-sequence failure can leave the container
+        // half-mutated. We capture the first error, stop, and then heal the
+        // sidecar to the store's ACTUAL state so a retry diffs against reality
+        // (converging) instead of re-applying the same diff (escalating).
+        let mut apply_err: Option<FilesError> = None;
         for op in &ops {
-            match op {
-                TextOp::Insert { pos, s } => self.store.edit_text(&container, *pos, s)?,
-                TextOp::Delete { pos, len } => self.store.delete_text(&container, *pos, *len)?,
+            let result = match op {
+                TextOp::Insert { pos, s } => self.store.edit_text(&container, *pos, s),
+                TextOp::Delete { pos, len } => self.store.delete_text(&container, *pos, *len),
+            };
+            if let Err(err) = result {
+                apply_err = Some(err.into());
+                break;
             }
         }
 
-        // Sanity: the applied ops must reproduce the file text exactly. A
-        // mismatch signals an offset/diff bug and must fail loudly.
-        let stored = self.store.text(&container);
-        if stored != file_text {
-            return Err(FilesError::Desync(format!(
-                "container {container}: store text diverged from file text after import"
-            )));
-        }
-
-        Sidecar {
-            version: SIDECAR_VERSION,
-            doc_id: container.clone(),
-            last_synced_hash: text_hash(&file_text),
-            last_synced_text: file_text.clone(),
-        }
-        .store(file)?;
-
-        Ok(SyncOutcome {
-            ops_applied: ops.len(),
-            changed: true,
-        })
+        let actual = self.store.text(&container);
+        reconcile_sidecar(file, &container, &file_text, &actual, ops.len(), apply_err)
     }
 
     /// Borrow the underlying [`Store`] (escape hatch for tests / engine wiring).
     pub fn store(&self) -> &Store {
         &self.store
     }
+}
+
+/// Reconcile the sidecar to the store's ACTUAL post-apply state, then decide
+/// the result.
+///
+/// This runs on every apply path — success, partial-apply failure, and desync.
+/// The sidecar is ALWAYS written with `last_synced_text = actual` (the store's
+/// real text), never the intended `file_text`. That guarantees the next
+/// `import_file` diffs `actual -> file_text` (only the remaining delta) so a
+/// retry converges instead of re-applying an already-partially-applied diff and
+/// escalating corruption.
+///
+/// - On success (`actual == file_text`, no apply error) `actual` equals
+///   `file_text`, so the sidecar records the file text exactly as before.
+/// - If an op failed mid-sequence, its storage error is propagated AFTER the
+///   sidecar is healed.
+/// - Otherwise a mismatch is reported as [`FilesError::Desync`].
+fn reconcile_sidecar(
+    file: &Path,
+    container: &str,
+    file_text: &str,
+    actual: &str,
+    ops_applied: usize,
+    apply_err: Option<FilesError>,
+) -> Result<SyncOutcome, FilesError> {
+    // Heal FIRST so the store's real state is recorded even when we're about to
+    // return an error — convergence-to-disk beats preserving a rare remote edit.
+    Sidecar {
+        version: SIDECAR_VERSION,
+        doc_id: container.to_string(),
+        last_synced_hash: text_hash(actual),
+        last_synced_text: actual.to_string(),
+    }
+    .store(file)?;
+
+    if let Some(err) = apply_err {
+        return Err(err);
+    }
+    if actual != file_text {
+        return Err(FilesError::Desync(format!(
+            "container {container}: store text diverged from file text after import"
+        )));
+    }
+    Ok(SyncOutcome {
+        ops_applied,
+        changed: true,
+    })
 }
 
 #[cfg(test)]
@@ -210,6 +249,57 @@ mod tests {
             b.import_file(&file),
             Err(FilesError::NotText(_))
         ));
+    }
+
+    #[test]
+    fn reconcile_heals_sidecar_to_actual_on_desync() {
+        // Fabricate a mismatch: the store actually holds "partial" but the file
+        // wanted "hello world". The sidecar must record the ACTUAL store text so
+        // the next import diffs "partial" -> "hello world" (the remaining delta),
+        // never re-applying the stale baseline diff.
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("note.md");
+
+        let result = reconcile_sidecar(&file, "note.md", "hello world", "partial", 1, None);
+        assert!(matches!(result, Err(FilesError::Desync(_))));
+
+        let sidecar = Sidecar::load(&file).unwrap().unwrap();
+        assert_eq!(sidecar.last_synced_text, "partial");
+        assert_eq!(sidecar.last_synced_hash, text_hash("partial"));
+    }
+
+    #[test]
+    fn reconcile_heals_sidecar_then_propagates_apply_error() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("note.md");
+
+        // A simulated storage failure captured mid-sequence must still heal the
+        // sidecar to the store's actual state before propagating.
+        let err = FilesError::Sidecar("simulated storage failure".into());
+        let result = reconcile_sidecar(&file, "note.md", "hello world", "partial", 1, Some(err));
+        assert!(result.is_err());
+
+        let sidecar = Sidecar::load(&file).unwrap().unwrap();
+        assert_eq!(sidecar.last_synced_text, "partial");
+    }
+
+    #[test]
+    fn reconcile_success_records_file_text_and_reports_change() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("note.md");
+
+        let outcome = reconcile_sidecar(&file, "note.md", "same", "same", 2, None).unwrap();
+        assert_eq!(
+            outcome,
+            SyncOutcome {
+                ops_applied: 2,
+                changed: true
+            }
+        );
+        assert_eq!(
+            Sidecar::load(&file).unwrap().unwrap().last_synced_text,
+            "same"
+        );
     }
 
     #[test]
