@@ -10,7 +10,9 @@
 mod error;
 mod path;
 mod sidecar;
+mod textdiff;
 
 pub use error::FilesError;
 pub use path::container_id;
 pub use sidecar::{sidecar_path, text_hash, Sidecar};
+pub use textdiff::{diff_to_ops, TextOp};
