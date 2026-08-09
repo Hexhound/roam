@@ -16,8 +16,18 @@ pub enum CryptoError {
 }
 
 impl VaultKey {
+    /// Independent subkey for opaque id derivation (keyed BLAKE3).
+    fn id_subkey(&self) -> [u8; 32] {
+        blake3::derive_key("roam-backend-client id-derivation v1", &self.0)
+    }
+
+    /// Independent subkey for AEAD seal/open (XChaCha20-Poly1305).
+    fn aead_subkey(&self) -> [u8; 32] {
+        blake3::derive_key("roam-backend-client aead v1", &self.0)
+    }
+
     fn keyed(&self, label_and_input: &[u8]) -> String {
-        let hash = blake3::keyed_hash(&self.0, label_and_input);
+        let hash = blake3::keyed_hash(&self.id_subkey(), label_and_input);
         B64URL.encode(hash.as_bytes())
     }
 
@@ -48,7 +58,8 @@ impl VaultKey {
 
     /// AEAD seal: returns `nonce(24) || ciphertext`.
     pub fn seal(&self, plaintext: &[u8]) -> Vec<u8> {
-        let cipher = XChaCha20Poly1305::new((&self.0).into());
+        let aead_key = self.aead_subkey();
+        let cipher = XChaCha20Poly1305::new((&aead_key).into());
         let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
         let mut out = nonce.to_vec();
         let ct = cipher.encrypt(&nonce, plaintext).expect("aead encrypt");
@@ -62,7 +73,8 @@ impl VaultKey {
             return Err(CryptoError::Short);
         }
         let (nonce_bytes, ct) = payload.split_at(24);
-        let cipher = XChaCha20Poly1305::new((&self.0).into());
+        let aead_key = self.aead_subkey();
+        let cipher = XChaCha20Poly1305::new((&aead_key).into());
         let nonce = XNonce::from_slice(nonce_bytes);
         cipher.decrypt(nonce, ct).map_err(|_| CryptoError::Open)
     }
