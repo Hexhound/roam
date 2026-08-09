@@ -3,8 +3,13 @@
 **/*.rs.bk
 Cargo.lock
 
+# nix / devenv / direnv
+.direnv/
+.devenv/
+.devenv.flake.nix
+devenv.local.nix
+.env
+
 # editor / os
 *~
 .DS_Store
-.direnv/
-.devenv/
