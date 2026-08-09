@@ -24,7 +24,10 @@ defmodule Roam.Backend.Store do
     if File.exists?(path) do
       :exists
     else
-      tmp = path <> ".tmp"
+      # Unique temp name per writer so two concurrent first-writers for the same
+      # id never share (and corrupt) one `.tmp` file. rename is atomic; the last
+      # rename wins and both writers wrote identical ciphertext bytes anyway.
+      tmp = path <> ".tmp." <> Integer.to_string(:erlang.unique_integer([:positive]))
       File.write!(tmp, body)
       File.rename!(tmp, path)
       :created
@@ -44,7 +47,7 @@ defmodule Roam.Backend.Store do
   @doc "List ids present for a bucket/kind."
   def list(bucket, kind) do
     case File.ls(dir(bucket, kind)) do
-      {:ok, names} -> Enum.reject(names, &String.ends_with?(&1, ".tmp"))
+      {:ok, names} -> Enum.reject(names, &String.contains?(&1, ".tmp"))
       {:error, :enoent} -> []
     end
   end
