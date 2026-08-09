@@ -51,6 +51,24 @@ enum LocalEdit {
 ///
 /// When `r == a` this returns exactly `l`; when there are no local edits it
 /// returns exactly `r`.
+///
+/// # Conflict semantics
+///
+/// The merge is a **lossless union**: it never drops a side's edit and never
+/// emits a conflict marker. On genuine conflicts that produces defined but
+/// sometimes surprising artifacts:
+///
+/// - **Local delete over a remote insert inside the deleted range** → the
+///   remote-inserted text survives "orphaned". `A = "abc"`, `L = ""` (local
+///   deleted everything), `R = "aXbc"` (remote inserted `X`) → `"X"`. The local
+///   delete only removes ancestor chars still present in `R`; the remote insert
+///   was never part of the ancestor range, so it is not deleted.
+/// - **Both sides replace the same region** → both replacements are
+///   concatenated, no marker. `A = "abc"`, `L = "aYc"`, `R = "aZc"` → `"aZYc"`
+///   (the remote replacement, then the local one).
+/// - **Co-located inserts at the same boundary** → the local insert lands
+///   AFTER the remote insert, a deterministic tie-break. `A = "abc"`,
+///   `L = "LOCabc"`, `R = "REMabc"` → `"REMLOCabc"`.
 pub fn merge_local_onto_remote(a: &str, l: &str, r: &str) -> String {
     let local_edits = local_edits(a, l);
     let (a_to_r, present) = position_map(a, r);
@@ -280,39 +298,196 @@ mod tests {
 
     #[test]
     fn overlapping_local_and_remote_insert_at_same_boundary() {
-        // Both sides inserted at the front; the merge keeps both.
+        // Co-located inserts: local lands AFTER the remote insert at the same
+        // boundary — a deterministic tie-break. Pin the EXACT ordered result so
+        // a future change to that tie-break is caught.
         let merged = merge_local_onto_remote("abc", "LOCabc", "REMabc");
-        assert!(merged.contains("LOC"));
-        assert!(merged.contains("REM"));
-        assert!(merged.ends_with("abc"));
+        assert_eq!(merged, "REMLOCabc");
+    }
+
+    // --- Independent-oracle losslessness proptest -------------------------
+    //
+    // The properties below verify the merge with an oracle that does NOT reuse
+    // `merge_local_onto_remote` (nor `diff_to_ops(R, merged)`), so a
+    // wrong-but-self-consistent merge (dropped insert, mis-anchored delete,
+    // lost survivor) FAILS. The trick is three DISJOINT alphabets: the ancestor
+    // uses one set, each side's insertions use a set unique to that side. That
+    // lets us read the merged output back apart: filter to the ancestor
+    // alphabet to recover exactly the surviving ancestor chars, and search each
+    // side's alphabet-tagged runs independently.
+
+    /// Apply an edit plan (`keep[i]` per ancestor char, `inserts[i]` at each of
+    /// the `a.len()+1` boundaries) to `a`, returning the produced string and the
+    /// non-empty inserted runs in order. This is the oracle's independent model
+    /// of "an edit script against the ancestor".
+    fn apply_edit_plan(a: &[char], keep: &[bool], inserts: &[String]) -> (String, Vec<String>) {
+        let mut out = String::new();
+        let mut runs: Vec<String> = Vec::new();
+        for i in 0..a.len() {
+            if !inserts[i].is_empty() {
+                out.push_str(&inserts[i]);
+                runs.push(inserts[i].clone());
+            }
+            if keep[i] {
+                out.push(a[i]);
+            }
+        }
+        if !inserts[a.len()].is_empty() {
+            out.push_str(&inserts[a.len()]);
+            runs.push(inserts[a.len()].clone());
+        }
+        (out, runs)
+    }
+
+    /// Whether every run in `runs` occurs in `haystack` in order (each run found
+    /// at or after the end of the previous match). A lossless merge that never
+    /// reorders a side's insertions must satisfy this greedy left-to-right match.
+    fn contains_runs_in_order(haystack: &str, runs: &[String]) -> bool {
+        let mut cursor = 0usize;
+        for run in runs {
+            match haystack[cursor..].find(run.as_str()) {
+                Some(idx) => cursor += idx + run.len(),
+                None => return false,
+            }
+        }
+        true
+    }
+
+    /// The ancestor chars kept by BOTH sides, in ancestor order — the exact set
+    /// that must survive into the merge (either side deleting a char removes it).
+    fn survivors(a: &[char], keep_l: &[bool], keep_r: &[bool]) -> String {
+        a.iter()
+            .enumerate()
+            .filter(|(i, _)| keep_l[*i] && keep_r[*i])
+            .map(|(_, c)| *c)
+            .collect()
+    }
+
+    /// Keep only chars from `alphabet` (used to read the ancestor-alphabet
+    /// subsequence back out of the merged output).
+    fn filter_alphabet(s: &str, alphabet: &[char]) -> String {
+        s.chars().filter(|c| alphabet.contains(c)).collect()
+    }
+
+    /// Assert the losslessness invariants for one concrete `(A, plans)` triple,
+    /// given the disjoint ancestor alphabet. Returns nothing; panics via
+    /// `prop_assert!` semantics are inlined by the caller, so this uses plain
+    /// `assert!` and is called from within `proptest!` bodies.
+    fn check_lossless_union(
+        a: &[char],
+        keep_l: &[bool],
+        ins_l: &[String],
+        keep_r: &[bool],
+        ins_r: &[String],
+        ancestor_alpha: &[char],
+    ) {
+        let (l, local_runs) = apply_edit_plan(a, keep_l, ins_l);
+        let (r, remote_runs) = apply_edit_plan(a, keep_r, ins_r);
+        let a_str: String = a.iter().collect();
+        let merged = merge_local_onto_remote(&a_str, &l, &r);
+
+        // (a) every LOCAL-inserted run survives, in order.
+        assert!(
+            contains_runs_in_order(&merged, &local_runs),
+            "lost/reordered a local insert: A={a_str:?} L={l:?} R={r:?} merged={merged:?} runs={local_runs:?}"
+        );
+        // (b) every REMOTE-inserted run survives, in order.
+        assert!(
+            contains_runs_in_order(&merged, &remote_runs),
+            "lost/reordered a remote insert: A={a_str:?} L={l:?} R={r:?} merged={merged:?} runs={remote_runs:?}"
+        );
+        // (e) exactly the both-kept ancestor chars survive, in ancestor order —
+        // read back via the disjoint ancestor alphabet (insert runs can't leak
+        // into this filter).
+        assert_eq!(
+            filter_alphabet(&merged, ancestor_alpha),
+            survivors(a, keep_l, keep_r),
+            "ancestor survivors wrong: A={a_str:?} L={l:?} R={r:?} merged={merged:?}"
+        );
+        // (c) determinism: pure function, identical output on a second call.
+        assert_eq!(
+            merged,
+            merge_local_onto_remote(&a_str, &l, &r),
+            "merge is not deterministic"
+        );
+        // (d) degenerate boundaries: no-remote → local-applied; no-local → remote.
+        assert_eq!(merge_local_onto_remote(&a_str, &l, &a_str), l, "no-remote boundary");
+        assert_eq!(merge_local_onto_remote(&a_str, &a_str, &r), r, "no-local boundary");
     }
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(512))]
 
-        /// For any ancestor/local/remote triple, the store op sequence derived
-        /// from the merge must roundtrip R -> merged (never out-of-bounds, and
-        /// the pure merge model agrees with the applied ops).
+        /// Losslessness over ASCII. The ancestor is a DISTINCT-char subsequence
+        /// of an 8-char pool [a-h] (a mask picks which pool chars appear), so the
+        /// `A -> L`/`A -> R` diffs attribute each keep/delete unambiguously and
+        /// the generated plan is authoritative. Local inserts draw from [X-Z],
+        /// remote inserts from [P-R] — three disjoint alphabets.
         #[test]
-        fn prop_store_ops_roundtrip_to_merge(
-            a in "[a-d]{0,10}",
-            l in "[a-d]{0,10}",
-            r in "[a-d]{0,10}",
+        fn prop_lossless_union_ascii(
+            (a, keep_l, ins_l, keep_r, ins_r) in
+                prop::collection::vec(any::<bool>(), 8).prop_flat_map(|mask| {
+                    const POOL: [char; 8] = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'];
+                    let a: Vec<char> = POOL
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| mask[*i])
+                        .map(|(_, c)| *c)
+                        .collect();
+                    let n = a.len();
+                    (
+                        Just(a),
+                        prop::collection::vec(any::<bool>(), n),
+                        prop::collection::vec("[X-Z]{0,3}", n + 1),
+                        prop::collection::vec(any::<bool>(), n),
+                        prop::collection::vec("[P-R]{0,3}", n + 1),
+                    )
+                }),
         ) {
-            let merged = merge_local_onto_remote(&a, &l, &r);
-            let ops = diff_to_ops(&r, &merged);
-            prop_assert_eq!(apply_ops(&r, &ops), merged);
+            check_lossless_union(
+                &a,
+                &keep_l,
+                &ins_l,
+                &keep_r,
+                &ins_r,
+                &['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'],
+            );
         }
 
+        /// Losslessness over unicode. The ancestor is a DISTINCT-char subsequence
+        /// of a 6-char multi-byte pool {a, b, é, 世, ć, ñ}; local inserts draw from
+        /// {🚀, α}, remote inserts from {β, γ} — three disjoint alphabets that
+        /// exercise multi-byte scalars (incl. the astral 🚀) through the rebase.
         #[test]
-        fn prop_store_ops_roundtrip_unicode(
-            a in "[a-b\u{00e9}\u{1F680}\u{4e16}]{0,8}",
-            l in "[a-b\u{00e9}\u{1F680}\u{4e16}]{0,8}",
-            r in "[a-b\u{00e9}\u{1F680}\u{4e16}]{0,8}",
+        fn prop_lossless_union_unicode(
+            (a, keep_l, ins_l, keep_r, ins_r) in
+                prop::collection::vec(any::<bool>(), 6).prop_flat_map(|mask| {
+                    const POOL: [char; 6] =
+                        ['a', 'b', '\u{00e9}', '\u{4e16}', '\u{0107}', '\u{00f1}'];
+                    let a: Vec<char> = POOL
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| mask[*i])
+                        .map(|(_, c)| *c)
+                        .collect();
+                    let n = a.len();
+                    (
+                        Just(a),
+                        prop::collection::vec(any::<bool>(), n),
+                        prop::collection::vec("[\u{1F680}\u{03B1}]{0,3}", n + 1),
+                        prop::collection::vec(any::<bool>(), n),
+                        prop::collection::vec("[\u{03B2}\u{03B3}]{0,3}", n + 1),
+                    )
+                }),
         ) {
-            let merged = merge_local_onto_remote(&a, &l, &r);
-            let ops = diff_to_ops(&r, &merged);
-            prop_assert_eq!(apply_ops(&r, &ops), merged);
+            check_lossless_union(
+                &a,
+                &keep_l,
+                &ins_l,
+                &keep_r,
+                &ins_r,
+                &['a', 'b', '\u{00e9}', '\u{4e16}', '\u{0107}', '\u{00f1}'],
+            );
         }
 
         /// When there are no remote edits (R == A) the merge must equal L
