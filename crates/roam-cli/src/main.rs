@@ -436,6 +436,14 @@ async fn scan_and_maybe_flush(
             None => eprintln!("warning: scan task failed, continuing: {err}"),
         },
     }
+
+    // Pull-based blobs: gossip carries only the Blob file-set entry (the
+    // blob-ref), never the bytes. After every reconcile, ask connected peers for
+    // the bytes of any Live Blob entry we still lack (BlobWant → BlobData). When
+    // the reply lands the engine fires `changed()`, waking the loop so the NEXT
+    // scan projects the now-local bytes to disk (D5). Idempotent + cheap: sends
+    // nothing when no blob is missing, and only to connected active peers.
+    engine.request_missing_blobs().await;
 }
 
 /// Print a concise, legible line per changed file so the demo shows what moved.
