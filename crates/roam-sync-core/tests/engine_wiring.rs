@@ -114,6 +114,56 @@ async fn flush_local_is_a_safe_noop_when_nothing_new() {
     );
 }
 
+/// `reconnect_active` heals a peer that was never connected: A mutates while no
+/// peer is connected (so nothing is pushed), then a reconnect re-offers the full
+/// log and B catches up. Models the daemon's periodic self-healing reconnect.
+#[tokio::test]
+async fn reconnect_active_catches_up_an_unconnected_peer() {
+    let board = MemorySwitchboard::new();
+    let vault = VaultId::generate();
+    let (da, db) = (tempdir().unwrap(), tempdir().unwrap());
+    let (ia, ib) = (Identity::generate(), Identity::generate());
+
+    let mut sa = Store::open(da.path(), ia.clone()).unwrap();
+    let mut sb = Store::open(db.path(), ib.clone()).unwrap();
+    seed(&mut sa, &ib);
+    seed(&mut sb, &ia);
+
+    let ea = Arc::new(Engine::new(
+        ia.clone(),
+        vault,
+        sa,
+        Arc::new(board.endpoint(ia.peer_id())),
+    ));
+    let eb = Arc::new(Engine::new(
+        ib.clone(),
+        vault,
+        sb,
+        Arc::new(board.endpoint(ib.peer_id())),
+    ));
+    tokio::spawn(ea.clone().run());
+    tokio::spawn(eb.clone().run());
+
+    // A mutates with NO peer connected — flush finds no peers and pushes nothing.
+    ea.store().lock().await.edit_text("note", 0, "hi").unwrap();
+    ea.flush_local().await;
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert_eq!(
+        eb.store().lock().await.text("note"),
+        "",
+        "B must have nothing before any connection"
+    );
+
+    // Self-heal: reconnect dials B and re-offers the full log; B catches up.
+    ea.reconnect_active().await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        eb.store().lock().await.text("note"),
+        "hi",
+        "reconnect_active did not catch the peer up"
+    );
+}
+
 /// `changed()` resolves after an inbound apply, and is pending before one.
 #[tokio::test]
 async fn changed_fires_on_inbound_ops() {

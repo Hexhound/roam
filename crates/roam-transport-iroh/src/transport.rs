@@ -144,9 +144,19 @@ impl Transport for IrohTransport {
         .ok_or(TransportError::Unreachable(peer))?;
 
         let mut send = stream.lock().await;
-        write_frame(&mut send, &frame)
-            .await
-            .map_err(|e| TransportError::Io(e.to_string()))
+        match write_frame(&mut send, &frame).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // The cached stream is dead (idle timeout, reset, peer restart).
+                // Evict it so the NEXT `dial` opens a fresh connection instead of
+                // reusing this corpse forever — otherwise a long-running daemon
+                // silently stops syncing after any transient drop. Drop the send
+                // guard before taking the map lock to avoid a lock-order inversion.
+                drop(send);
+                self.conns.lock().await.remove(&peer);
+                Err(TransportError::Io(e.to_string()))
+            }
+        }
     }
 
     async fn dial(&self, peer: u64) -> Result<(), TransportError> {

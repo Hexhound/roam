@@ -360,6 +360,13 @@ async fn sync_folder(engine: Arc<Engine<IrohTransport>>, folder: PathBuf) -> Res
         folder.display()
     );
     let mut interval = tokio::time::interval(Duration::from_millis(500));
+    // Self-healing reconnect: a peer unreachable at startup (discovery lag, the
+    // other side not up yet) or a connection that later drops is retried here.
+    // `reconnect_active` re-dials + re-offers every active peer; it is a cheap
+    // no-op for a live connection and reconnects an evicted/dead one.
+    let mut reconnect = tokio::time::interval(Duration::from_secs(5));
+    // Skip the immediate first tick: setup_engine already connected once.
+    reconnect.reset();
 
     loop {
         // Re-acquire the Notify handle and build a FRESH `Notified` future each
@@ -391,6 +398,10 @@ async fn sync_folder(engine: Arc<Engine<IrohTransport>>, folder: PathBuf) -> Res
             // (editor atomic-rename quirks, inotify overflow) is always caught.
             _ = interval.tick() => {
                 scan_and_maybe_flush(&engine, &bridge, None).await;
+            }
+            // Periodic self-healing reconnect to any active peer (see above).
+            _ = reconnect.tick() => {
+                engine.reconnect_active().await;
             }
             // Inbound remote change: project remote state to disk promptly.
             _ = &mut notified => {

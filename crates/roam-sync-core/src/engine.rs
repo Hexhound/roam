@@ -117,6 +117,32 @@ impl<T: Transport + 'static> Engine<T> {
         Ok(())
     }
 
+    /// Re-dial + re-offer every active, non-self roster peer. Idempotent and
+    /// self-healing: a live connection's `dial` is a cheap no-op reused stream,
+    /// and `send_bundle` re-ships the full log (loro dedups on import), so a peer
+    /// that was unreachable at startup — or whose connection dropped and was
+    /// evicted by a failed send — is reconnected and caught up on the next call.
+    /// Meant to be driven periodically by a long-running daemon.
+    pub async fn reconnect_active(&self) {
+        let peers: Vec<u64> = {
+            let store = self.store.lock().await;
+            let me = self.peer_id();
+            store
+                .roster()
+                .into_iter()
+                .filter(|p| p.status == PeerStatus::Active && p.peer_id != me)
+                .map(|p| p.peer_id)
+                .collect()
+        };
+        for peer in peers {
+            // Only re-offer if the (re)dial succeeds; a still-unreachable peer is
+            // skipped silently and retried on the next tick.
+            if self.transport.dial(peer).await.is_ok() {
+                self.send_bundle(peer).await;
+            }
+        }
+    }
+
     /// Apply a local text edit and live-push it to all connected peers.
     ///
     /// The push is delegated to [`flush_local`](Self::flush_local): apply the
