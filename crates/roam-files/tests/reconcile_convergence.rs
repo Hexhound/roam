@@ -125,6 +125,9 @@ struct FileState {
     disk: Option<Vec<u8>>,
     sidecar_exists: bool,
     status: Option<EntryStatus>,
+    /// The container's CRDT text — included so a container/disk divergence is
+    /// caught by the convergence equality, not just disk + status.
+    text: String,
 }
 
 fn state(device: &Device, rel: &str, container: &str) -> FileState {
@@ -133,6 +136,7 @@ fn state(device: &Device, rel: &str, container: &str) -> FileState {
         disk: std::fs::read(&file).ok(),
         sidecar_exists: sidecar_path(&file).exists(),
         status: device.entry(container).map(|e| e.status),
+        text: device.store_text(container),
     }
 }
 
@@ -213,7 +217,15 @@ fn rename_propagates_a_to_b() {
 }
 
 // ---------------------------------------------------------------------------
-// 3. Concurrent edit-vs-delete -> EDIT WINS, converges (the critical one).
+// 3. Concurrent edit-vs-delete -> EDIT WINS (Lamport-favors-edit case).
+//
+// Here A's delete is a SINGLE op, so B's edit + Live `set_entry` carry the
+// HIGHER Lamport and the file-set map's LWW picks Live outright — convergence
+// is reached in the first round with NO resurrection flip required. The harder
+// case, where A's tombstone out-Lamports the edit so the map first resolves to
+// Tombstoned and the editing device must flip-to-Live + re-broadcast before the
+// deleter re-projects, is driven end-to-end by
+// `forced_tombstone_wins_resurrection_converges_end_to_end` below.
 // ---------------------------------------------------------------------------
 #[test]
 fn concurrent_edit_vs_delete_edit_wins_and_converges() {
@@ -234,9 +246,10 @@ fn concurrent_edit_vs_delete_edit_wins_and_converges() {
     //  - B edits its disk x.md and imports (container diverges; entry stays Live).
     import(&b, rel, "hello world\n");
 
-    // Drive both directions + reconcile until settled. Edit-wins needs the
-    // resurrecting device to re-broadcast its Live flip, so run several rounds.
-    for _ in 0..4 {
+    // Drive both directions + reconcile. This case converges in the first
+    // round (B's Live out-Lamports A's single-op tombstone), but run a couple
+    // to be robust; stability is asserted per-round below.
+    for _ in 0..3 {
         round(&a, &b);
     }
 
@@ -255,12 +268,131 @@ fn concurrent_edit_vs_delete_edit_wins_and_converges() {
     assert_eq!(a.store_text(&container), "hello world\n");
     assert_eq!(b.store_text(&container), "hello world\n");
 
-    // STABILITY: further sync+scan rounds are idempotent (no flip-flop).
-    let before = (state(&a, rel, &container), state(&b, rel, &container));
+    // STABILITY: assert after EACH single round (comparing after two rounds
+    // could alias a period-2 oscillation).
+    let snapshot = |a: &Device, b: &Device| (state(a, rel, &container), state(b, rel, &container));
+    let baseline = snapshot(&a, &b);
     round(&a, &b);
+    assert_eq!(snapshot(&a, &b), baseline, "state must be stable after one round");
     round(&a, &b);
-    let after = (state(&a, rel, &container), state(&b, rel, &container));
-    assert_eq!(before, after, "converged state must be stable across more rounds");
+    assert_eq!(snapshot(&a, &b), baseline, "state must be stable after a second round");
+}
+
+// ---------------------------------------------------------------------------
+// 3b. Forced TOMBSTONE-WINS-LWW edit-vs-delete: drives the resurrection
+//     flip + re-broadcast path end-to-end (the real edit-wins guarantee under
+//     realistic Lamport ordering).
+//
+// Loro's file-set map is an LWW register keyed by (Lamport, peer_id): the write
+// with the HIGHER Lamport wins. Here we deliberately make A's DELETE op carry a
+// higher Lamport than B's concurrent edit by having A perform several unrelated
+// ops first (import + edit `z.md`), so when the two devices merge, the map for
+// `x` resolves to Tombstoned FIRST — NOT Live. Convergence to edit-wins then
+// REQUIRES: the editing device (B) sees Tombstoned-but-container-diverged,
+// flips the entry back to Live at a fresh (now-highest) Lamport, and
+// re-broadcasts it; only after that reaches the deleter (A) — which has no disk
+// copy — does A re-project `x.md` via the remote-new branch. This is the path
+// test #3 never exercises (there Lamport favors the edit outright).
+// ---------------------------------------------------------------------------
+#[test]
+fn forced_tombstone_wins_resurrection_converges_end_to_end() {
+    let a = Device::new();
+    let b = Device::new();
+    let rel = "x.md";
+    let container = cid(&a, rel);
+
+    // Both devices start synced with x.md = "hello\n".
+    import(&a, rel, "hello\n");
+    sync(&a, &b);
+    b.open().scan().unwrap();
+    assert_eq!(a.entry(&container).map(|e| e.status), Some(EntryStatus::Live));
+    assert_eq!(b.entry(&container).map(|e| e.status), Some(EntryStatus::Live));
+
+    // CONCURRENTLY (no sync between):
+    //  - On A: raise A's Lamport clock ABOVE B's coming edit with unrelated ops
+    //    (import + two edits of z.md), THEN delete x.md. A's tombstone-for-x now
+    //    carries a higher Lamport than B's Live-for-x.
+    import(&a, "z.md", "one\n");
+    import(&a, "z.md", "one\ntwo\n");
+    import(&a, "z.md", "one\ntwo\nthree\n");
+    a.open().delete_file(&a.vault_file(rel)).unwrap();
+    //  - On B: edit x.md and import (Live at a LOWER Lamport).
+    import(&b, rel, "hello world\n");
+
+    // First merge BOTH directions but do NOT scan yet: prove the map's LWW
+    // actually picked Tombstoned (higher-Lamport delete beats the edit). This is
+    // the pre-condition that makes the resurrection path mandatory.
+    sync(&a, &b);
+    sync(&b, &a);
+    assert_eq!(
+        a.entry(&container).map(|e| e.status),
+        Some(EntryStatus::Tombstoned),
+        "forced construction: A's delete must out-Lamport B's edit (Tombstoned wins LWW)"
+    );
+    assert_eq!(
+        b.entry(&container).map(|e| e.status),
+        Some(EntryStatus::Tombstoned),
+        "both devices agree the map resolved to Tombstoned before any resurrection"
+    );
+
+    // Round 1 reconcile (no further sync): B sees Tombstoned + container diverged
+    // → resurrection flip to Live locally; A has no disk copy so it does nothing
+    // yet. The flip has NOT reached A.
+    a.open().scan().unwrap();
+    b.open().scan().unwrap();
+    assert_eq!(
+        b.entry(&container).map(|e| e.status),
+        Some(EntryStatus::Live),
+        "editing device must flip the tombstone back to Live (resurrection)"
+    );
+    assert!(
+        !a.vault_file(rel).exists(),
+        "deleter must NOT have re-projected yet — the Live flip hasn't propagated"
+    );
+    assert_eq!(
+        a.entry(&container).map(|e| e.status),
+        Some(EntryStatus::Tombstoned),
+        "deleter still holds the tombstone until B's flip is re-broadcast"
+    );
+
+    // Round 2: re-broadcast B's fresh Live to A; A then re-projects x.md via the
+    // remote-new branch (Live + absent + no sidecar).
+    sync(&a, &b);
+    sync(&b, &a);
+    assert_eq!(
+        a.entry(&container).map(|e| e.status),
+        Some(EntryStatus::Live),
+        "B's resurrection flip must propagate to the deleter"
+    );
+    a.open().scan().unwrap();
+    b.open().scan().unwrap();
+    assert!(
+        a.vault_file(rel).exists(),
+        "deleter must RE-PROJECT x.md to disk after receiving B's fresh Live"
+    );
+
+    // A couple of bounded settle rounds, then assert full convergence.
+    for _ in 0..2 {
+        round(&a, &b);
+    }
+    let final_a = state(&a, rel, &container);
+    let final_b = state(&b, rel, &container);
+    assert_eq!(final_a, final_b, "both devices must converge to the same state");
+    assert_eq!(
+        final_a.disk.as_deref(),
+        Some(&b"hello world\n"[..]),
+        "edit must win end-to-end: file present with the edited content"
+    );
+    assert_eq!(final_a.status, Some(EntryStatus::Live));
+    assert_eq!(final_a.text, "hello world\n");
+
+    // STABILITY: idempotent after each single round.
+    let snapshot = |a: &Device, b: &Device| (state(a, rel, &container), state(b, rel, &container));
+    let baseline = snapshot(&a, &b);
+    round(&a, &b);
+    assert_eq!(snapshot(&a, &b), baseline, "converged state stable after one round");
+    round(&a, &b);
+    assert_eq!(snapshot(&a, &b), baseline, "converged state stable after a second round");
 }
 
 // ---------------------------------------------------------------------------
@@ -292,12 +424,14 @@ fn delete_without_concurrent_edit_delete_wins_and_converges() {
     assert_eq!(final_a.disk, None, "delete must win: file absent");
     assert!(!final_a.sidecar_exists);
     assert_eq!(final_a.status, Some(EntryStatus::Tombstoned));
+    // The text container is retained on both (tombstone keeps history); the
+    // `FileState` equality above already proves A and B agree on it.
 
-    // Stable across another round.
-    let before = (state(&a, rel, &container), state(&b, rel, &container));
+    // Stable after a single round (avoids aliasing a period-2 oscillation).
+    let baseline = (state(&a, rel, &container), state(&b, rel, &container));
     round(&a, &b);
     let after = (state(&a, rel, &container), state(&b, rel, &container));
-    assert_eq!(before, after, "converged delete state must be stable");
+    assert_eq!(baseline, after, "converged delete state must be stable");
 }
 
 // ---------------------------------------------------------------------------
@@ -307,8 +441,10 @@ fn delete_without_concurrent_edit_delete_wins_and_converges() {
 #[test]
 fn edit_vs_delete_converges_regardless_of_sync_order() {
     // Helper: run the edit-vs-delete scenario applying the two directions in a
-    // caller-chosen order for the FIRST reconciling round, then settle.
-    fn run(b_first: bool) -> (Vec<u8>, EntryStatus) {
+    // caller-chosen order for the FIRST reconciling round, then settle. Returns
+    // (disk bytes, entry status, container text) so a container/disk divergence
+    // is caught by the order-independence comparison.
+    fn run(b_first: bool) -> (Vec<u8>, EntryStatus, String) {
         let a = Device::new();
         let b = Device::new();
         let rel = "z.md";
@@ -340,7 +476,7 @@ fn edit_vs_delete_converges_regardless_of_sync_order() {
         let sa = state(&a, rel, &container);
         let sb = state(&b, rel, &container);
         assert_eq!(sa, sb, "devices must converge (b_first={b_first})");
-        (sa.disk.unwrap(), sa.status.unwrap())
+        (sa.disk.unwrap(), sa.status.unwrap(), sa.text)
     }
 
     let ab = run(false);
@@ -348,4 +484,5 @@ fn edit_vs_delete_converges_regardless_of_sync_order() {
     assert_eq!(ab, ba, "edit-wins convergence must be sync-order independent");
     assert_eq!(ab.0, b"hello world\n");
     assert_eq!(ab.1, EntryStatus::Live);
+    assert_eq!(ab.2, "hello world\n");
 }
