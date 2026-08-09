@@ -66,12 +66,15 @@ enum Command {
         vault: PathBuf,
         #[arg(long)]
         identity: PathBuf,
-        /// Sync a real folder instead of the interactive "note" REPL: `*.md`/
-        /// `*.org` text notes AND binary assets (png/jpg/gif/webp/pdf/mp3/mp4/
-        /// mov/webm/wav/ogg/zip/bin) are imported, projected, created, edited,
-        /// deleted, and renamed live in both directions. Binaries transfer
-        /// pull-based (blob bytes fetched on demand). When absent, the legacy
-        /// REPL runs (backward compatible).
+        /// Sync a real folder instead of the interactive "note" REPL. Files are
+        /// classified by CONTENT, not extension: any UTF-8 text file (any
+        /// extension, or none) syncs as a mergeable text note; any non-UTF-8
+        /// file syncs as a whole-file binary blob (bytes transfer pull-based,
+        /// fetched on demand). Dotfiles/dot-dirs and our own internal metadata
+        /// are ignored. Files are imported, projected, created, edited, deleted,
+        /// and renamed live in both directions. Internal sidecars/blob markers
+        /// are kept OUTSIDE this folder, under the `--vault` store dir. When
+        /// absent, the legacy REPL runs (backward compatible).
         #[arg(long)]
         folder: Option<PathBuf>,
     },
@@ -190,7 +193,7 @@ async fn pair(vault: &Path, identity_path: &Path, token: String) -> Result<()> {
 async fn sync(vault: &Path, identity_path: &Path, folder: Option<PathBuf>) -> Result<()> {
     let engine = setup_engine(vault, identity_path).await?;
     match folder {
-        Some(folder) => sync_folder(engine, folder).await,
+        Some(folder) => sync_folder(engine, vault, folder).await,
         None => sync_repl(engine).await,
     }
 }
@@ -313,7 +316,11 @@ fn spawn_vault_watcher(
 
 /// The real-folder sync loop (Tasks c + d). Imports local disk edits and projects
 /// remote edits, in both directions, until Ctrl-C.
-async fn sync_folder(engine: Arc<Engine<IrohTransport>>, folder: PathBuf) -> Result<()> {
+async fn sync_folder(
+    engine: Arc<Engine<IrohTransport>>,
+    store_dir: &Path,
+    folder: PathBuf,
+) -> Result<()> {
     // Ensure the vault folder exists before anything reads or watches it: a
     // fresh `--folder` path is created on first run (matching the note REPL,
     // which needs no pre-existing files). Without this the fs watcher fails to
@@ -321,7 +328,12 @@ async fn sync_folder(engine: Arc<Engine<IrohTransport>>, folder: PathBuf) -> Res
     std::fs::create_dir_all(&folder)
         .with_context(|| format!("create vault folder {}", folder.display()))?;
 
-    let bridge = FolderBridge::new(&folder);
+    // Internal sidecars/blob-markers live under the STORE dir (the `--vault`
+    // arg), NOT in the user's `--folder`, so they never pollute the notes dir.
+    // `Sidecar::store` / `write_blob_marker` create the nested parents lazily,
+    // so simply pointing the bridge at `<store>/filemeta` is enough.
+    let meta_dir = store_dir.join("filemeta");
+    let bridge = FolderBridge::new(&folder, &meta_dir);
 
     // Initial publish: import the current vault contents into the store, then
     // gossip to peers. A failing initial scan is logged, not fatal — the poll

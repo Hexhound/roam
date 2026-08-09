@@ -44,7 +44,7 @@ impl Fixture {
     /// (persisted) vault + store_root. The caller threads the `Store` into each
     /// bridge operation.
     fn open(&self) -> (FolderBridge, Store) {
-        let bridge = FolderBridge::new(&self.vault);
+        let bridge = FolderBridge::new(&self.vault, &self.store.join("filemeta"));
         let store = Store::open(&self.store, self.identity.clone()).unwrap();
         (bridge, store)
     }

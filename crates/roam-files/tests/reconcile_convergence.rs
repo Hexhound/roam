@@ -69,7 +69,7 @@ impl Device {
     /// Open a fresh caller-owned store plus a stateless bridge over this
     /// device's (persisted) vault + store.
     fn open(&self) -> (FolderBridge, Store) {
-        let bridge = FolderBridge::new(&self.vault);
+        let bridge = FolderBridge::new(&self.vault, &self.store.join("filemeta"));
         let store = Store::open(&self.store, self.identity.clone()).unwrap();
         (bridge, store)
     }
@@ -161,7 +161,7 @@ fn state(device: &Device, rel: &str, container: &str) -> FileState {
     let file = device.vault_file(rel);
     FileState {
         disk: std::fs::read(&file).ok(),
-        sidecar_exists: sidecar_path(&file).exists(),
+        sidecar_exists: sidecar_path(&device.store.join("filemeta"), container).exists(),
         status: device.entry(container).map(|e| e.status),
         text: device.store_text(container),
     }
@@ -179,6 +179,12 @@ fn cid(device: &Device, rel: &str) -> String {
     container_id(&device.vault, &device.vault_file(rel)).unwrap()
 }
 
+/// The sidecar path for `rel` on `device`, under the store-owned metadata dir
+/// (`<store>/filemeta`), OUTSIDE the user vault.
+fn scpath(device: &Device, rel: &str) -> PathBuf {
+    sidecar_path(&device.store.join("filemeta"), &cid(device, rel))
+}
+
 // ---------------------------------------------------------------------------
 // 1. Delete propagates A -> B.
 // ---------------------------------------------------------------------------
@@ -194,7 +200,7 @@ fn delete_propagates_a_to_b() {
     sync(&a, &b);
     b.scan();
     assert_eq!(std::fs::read(b.vault_file(rel)).unwrap(), b"hello\n");
-    assert!(sidecar_path(&b.vault_file(rel)).exists());
+    assert!(scpath(&b, rel).exists());
 
     // A deletes the file; sync to B; B applies the tombstone.
     a.delete_file(&a.vault_file(rel));
@@ -206,7 +212,7 @@ fn delete_propagates_a_to_b() {
         !b.vault_file(rel).exists(),
         "delete on A must remove the file on B"
     );
-    assert!(!sidecar_path(&b.vault_file(rel)).exists());
+    assert!(!scpath(&b, rel).exists());
     assert_eq!(
         b.entry(&container).map(|e| e.status),
         Some(EntryStatus::Tombstoned)
@@ -911,7 +917,7 @@ fn create_relayed_a_to_c_via_b() {
         b"relay hello\n",
         "C must receive A's file via B's relay without a direct A↔C link"
     );
-    assert!(sidecar_path(&c.vault_file(rel)).exists());
+    assert!(scpath(&c, rel).exists());
     assert_eq!(
         c.entry(&container).map(|e| e.status),
         Some(EntryStatus::Live)
@@ -953,7 +959,7 @@ fn delete_relayed_a_to_c_via_b() {
         !c.vault_file(rel).exists(),
         "C must remove the file from A's relayed delete, without a direct A↔C link"
     );
-    assert!(!sidecar_path(&c.vault_file(rel)).exists());
+    assert!(!scpath(&c, rel).exists());
     assert_eq!(
         c.entry(&container).map(|e| e.status),
         Some(EntryStatus::Tombstoned)
@@ -1089,7 +1095,7 @@ fn tombstone_gcd_once_all_acked_and_stays_deleted() {
     // No resurrection: the file is absent on ALL three and no entry lingers.
     for d in [&a, &b, &c] {
         assert!(!d.vault_file(rel).exists(), "file must stay deleted after GC");
-        assert!(!sidecar_path(&d.vault_file(rel)).exists());
+        assert!(!scpath(d, rel).exists());
         assert_eq!(d.entry(&container), None, "the GC'd entry must be gone everywhere");
     }
 

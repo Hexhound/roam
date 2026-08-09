@@ -194,18 +194,22 @@ async fn real_folder_create_delete_rename_syncs_over_iroh() {
     engine_a.connect(identity_b.peer_id()).await.unwrap();
     engine_b.connect(identity_a.peer_id()).await.unwrap();
 
+    // Metadata dirs live under each device's STORE dir (outside the vault),
+    // mirroring the CLI's `<vault>/filemeta`.
+    let meta_a = store_dir_a.path().join("filemeta");
+    let meta_b = store_dir_b.path().join("filemeta");
     let a = Endpoint {
         _vault_dir: vault_dir_a,
         _store_dir: store_dir_a,
         vault: vault_a.clone(),
-        bridge: FolderBridge::new(&vault_a),
+        bridge: FolderBridge::new(&vault_a, &meta_a),
         engine: engine_a,
     };
     let b = Endpoint {
         _vault_dir: vault_dir_b,
         _store_dir: store_dir_b,
         vault: vault_b.clone(),
-        bridge: FolderBridge::new(&vault_b),
+        bridge: FolderBridge::new(&vault_b, &meta_b),
         engine: engine_b,
     };
 

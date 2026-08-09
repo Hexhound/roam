@@ -1,11 +1,13 @@
 //! Sidecar metadata (`.roammeta`) that records the last-synced state of a
 //! vault file.
 //!
-//! A sidecar lives beside the file it describes (`foo.md` →
-//! `foo.md.roammeta`) and stores, as JSON, the container id together with
-//! the exact text and hash that were last reconciled with the CRDT layer.
-//! This lets a later sync compute what changed on disk without re-reading
-//! the entire history.
+//! A sidecar is INTERNAL metadata that lives OUTSIDE the user's vault folder,
+//! under a store-owned metadata directory, keyed by the file's `container_id`
+//! (`notes/foo.md` → `<meta_dir>/sidecars/notes/foo.md.roammeta`). It stores,
+//! as JSON, the container id together with the exact text and hash that were
+//! last reconciled with the CRDT layer. This lets a later sync compute what
+//! changed on disk without re-reading the entire history — and keeps our
+//! bookkeeping out of the user's notes directory.
 //!
 //! On-disk JSON is intentionally forward-compatible: unknown fields are
 //! ignored on load, so newer writers can add fields without breaking older
@@ -32,13 +34,13 @@ pub struct Sidecar {
 }
 
 impl Sidecar {
-    /// Load the sidecar that describes `file`, if one exists.
+    /// Load the sidecar for `container_id` under `meta_dir`, if one exists.
     ///
     /// Returns `Ok(None)` when no sidecar is present. A sidecar that exists
     /// but cannot be parsed as JSON yields [`FilesError::Sidecar`]; other IO
     /// failures propagate as [`FilesError::Io`].
-    pub fn load(file: &Path) -> Result<Option<Sidecar>, FilesError> {
-        let path = sidecar_path(file);
+    pub fn load(meta_dir: &Path, container_id: &str) -> Result<Option<Sidecar>, FilesError> {
+        let path = sidecar_path(meta_dir, container_id);
         let contents = match std::fs::read_to_string(&path) {
             Ok(contents) => contents,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -51,13 +53,19 @@ impl Sidecar {
         Ok(Some(sidecar))
     }
 
-    /// Atomically write this sidecar beside `file`.
+    /// Atomically write this sidecar for `container_id` under `meta_dir`.
     ///
-    /// The JSON is written to a temporary file in the same directory and
-    /// then renamed over the final `.roammeta` path, so readers never see a
-    /// partially written sidecar.
-    pub fn store(&self, file: &Path) -> Result<(), FilesError> {
-        let path = sidecar_path(file);
+    /// The nested parent directory (mirroring the container id path) is
+    /// created if missing. The JSON is written to a temporary file in the
+    /// same directory and then renamed over the final `.roammeta` path, so
+    /// readers never see a partially written sidecar.
+    pub fn store(&self, meta_dir: &Path, container_id: &str) -> Result<(), FilesError> {
+        let path = sidecar_path(meta_dir, container_id);
+        // Create the nested parent (e.g. `<meta_dir>/sidecars/notes/`) so a
+        // deeply-nested container id round-trips.
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         let json = serde_json::to_vec_pretty(self)
             .map_err(|err| FilesError::Sidecar(format!("failed to serialize sidecar: {err}")))?;
 
@@ -79,13 +87,20 @@ impl Sidecar {
     }
 }
 
-/// The sidecar path for `file`: the full filename plus `.roammeta`.
+/// The sidecar path for `container_id` under `meta_dir`:
+/// `<meta_dir>/sidecars/<container_id>.roammeta`.
 ///
-/// `notes/foo.md` → `notes/foo.md.roammeta`. The suffix is appended to the
-/// whole filename (not swapped for the extension) so files that differ only
-/// by extension get distinct sidecars.
-pub fn sidecar_path(file: &Path) -> PathBuf {
-    let mut name: OsString = file.as_os_str().to_os_string();
+/// The container-id path is mirrored (its `/`-separated components are pushed
+/// as native path components) so nested notes never collide, and the
+/// `.roammeta` suffix is appended to the whole thing (not swapped for the
+/// extension) so files that differ only by extension get distinct sidecars.
+/// `notes/foo.md` → `<meta_dir>/sidecars/notes/foo.md.roammeta`.
+pub fn sidecar_path(meta_dir: &Path, container_id: &str) -> PathBuf {
+    let mut path = meta_dir.join("sidecars");
+    for component in container_id.split('/') {
+        path.push(component);
+    }
+    let mut name: OsString = path.into_os_string();
     name.push(".roammeta");
     PathBuf::from(name)
 }
@@ -112,37 +127,50 @@ mod tests {
     #[test]
     fn round_trip() {
         let dir = tempdir().unwrap();
-        let file = dir.path().join("foo.md");
+        let meta = dir.path();
         let sidecar = sample("hello world");
 
-        sidecar.store(&file).unwrap();
-        let loaded = Sidecar::load(&file).unwrap();
+        sidecar.store(meta, "foo.md").unwrap();
+        let loaded = Sidecar::load(meta, "foo.md").unwrap();
         assert_eq!(loaded, Some(sidecar));
     }
 
     #[test]
-    fn sidecar_path_appends_suffix() {
+    fn nested_container_id_round_trips() {
+        // A nested container id must create its parent dirs on store and load
+        // back byte-identically.
+        let dir = tempdir().unwrap();
+        let meta = dir.path();
+        let sidecar = sample("nested body");
+
+        sidecar.store(meta, "a/b/c.md").unwrap();
+        assert!(meta.join("sidecars/a/b/c.md.roammeta").exists());
+        assert_eq!(Sidecar::load(meta, "a/b/c.md").unwrap(), Some(sidecar));
+    }
+
+    #[test]
+    fn sidecar_path_appends_suffix_under_meta_dir() {
+        let meta = Path::new("/meta");
         assert_eq!(
-            sidecar_path(Path::new("foo.md")),
-            PathBuf::from("foo.md.roammeta")
+            sidecar_path(meta, "foo.md"),
+            PathBuf::from("/meta/sidecars/foo.md.roammeta")
         );
         assert_eq!(
-            sidecar_path(Path::new("notes/foo.md")),
-            PathBuf::from("notes/foo.md.roammeta")
+            sidecar_path(meta, "notes/foo.md"),
+            PathBuf::from("/meta/sidecars/notes/foo.md.roammeta")
         );
     }
 
     #[test]
     fn absent_sidecar_loads_none() {
         let dir = tempdir().unwrap();
-        let file = dir.path().join("missing.md");
-        assert_eq!(Sidecar::load(&file).unwrap(), None);
+        assert_eq!(Sidecar::load(dir.path(), "missing.md").unwrap(), None);
     }
 
     #[test]
     fn forward_compatible_unknown_fields_ignored() {
         let dir = tempdir().unwrap();
-        let file = dir.path().join("foo.md");
+        let meta = dir.path();
         let json = r#"{
             "version": 1,
             "doc_id": "notes/foo.md",
@@ -150,9 +178,11 @@ mod tests {
             "last_synced_text": "body",
             "future_field": 42
         }"#;
-        std::fs::write(sidecar_path(&file), json).unwrap();
+        let path = sidecar_path(meta, "foo.md");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, json).unwrap();
 
-        let loaded = Sidecar::load(&file).unwrap().unwrap();
+        let loaded = Sidecar::load(meta, "foo.md").unwrap().unwrap();
         assert_eq!(loaded.version, 1);
         assert_eq!(loaded.doc_id, "notes/foo.md");
         assert_eq!(loaded.last_synced_hash, "deadbeef");
@@ -162,11 +192,13 @@ mod tests {
     #[test]
     fn malformed_json_is_sidecar_error() {
         let dir = tempdir().unwrap();
-        let file = dir.path().join("foo.md");
-        std::fs::write(sidecar_path(&file), "{not json").unwrap();
+        let meta = dir.path();
+        let path = sidecar_path(meta, "foo.md");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "{not json").unwrap();
 
         assert!(matches!(
-            Sidecar::load(&file),
+            Sidecar::load(meta, "foo.md"),
             Err(FilesError::Sidecar(_))
         ));
     }
@@ -174,17 +206,17 @@ mod tests {
     #[test]
     fn store_leaves_no_temp_file() {
         let dir = tempdir().unwrap();
-        let file = dir.path().join("foo.md");
-        sample("content").store(&file).unwrap();
+        let meta = dir.path();
+        sample("content").store(meta, "foo.md").unwrap();
 
-        let entries: Vec<_> = std::fs::read_dir(dir.path())
+        let entries: Vec<_> = std::fs::read_dir(meta.join("sidecars"))
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
             .collect();
         assert_eq!(entries, vec![OsString::from("foo.md.roammeta")]);
 
         // The single artifact must be complete and parseable.
-        assert!(Sidecar::load(&file).unwrap().is_some());
+        assert!(Sidecar::load(meta, "foo.md").unwrap().is_some());
     }
 
     #[test]

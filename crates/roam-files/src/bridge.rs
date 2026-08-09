@@ -212,15 +212,23 @@ impl GcContext {
 #[derive(Clone)]
 pub struct FolderBridge {
     vault_root: PathBuf,
+    /// Store-owned metadata directory where sidecars and blob markers live,
+    /// OUTSIDE the user's vault folder. Sidecars go under `<meta_dir>/sidecars/`
+    /// and blob presence markers under `<meta_dir>/blobmarkers/`, each keyed by
+    /// the file's `container_id` so nested notes never collide.
+    meta_dir: PathBuf,
 }
 
 impl FolderBridge {
-    /// Create a bridge over a vault directory. Does NOT open a Store — the caller
-    /// owns the Store and passes it into each operation (so the engine and the
-    /// bridge can share one Store instance).
-    pub fn new(vault_root: &Path) -> Self {
+    /// Create a bridge over a vault directory plus a store-owned metadata
+    /// directory. Does NOT open a Store — the caller owns the Store and passes
+    /// it into each operation (so the engine and the bridge can share one Store
+    /// instance). `meta_dir` MUST live outside `vault_root` (it holds internal
+    /// sidecars/markers that must never pollute the user's notes folder).
+    pub fn new(vault_root: &Path, meta_dir: &Path) -> Self {
         Self {
             vault_root: vault_root.to_path_buf(),
+            meta_dir: meta_dir.to_path_buf(),
         }
     }
 
@@ -268,7 +276,7 @@ impl FolderBridge {
                 // present) can tell it was locally deleted. Written unconditionally
                 // (even on an idempotent no-op import) so the marker exists for a
                 // pre-existing untracked blob file too. Cheap + idempotent.
-                write_blob_marker(file)?;
+                write_blob_marker(&self.meta_dir, &container)?;
                 return Ok(outcome);
             }
         };
@@ -278,7 +286,7 @@ impl FolderBridge {
         // against "" when the container is already populated (cold-reopen oplog
         // replay, or a deleted/unsynced `.roammeta`) would make an unchanged
         // file diff as a full insert at pos 0 — DOUBLING the container.
-        let sidecar = Sidecar::load(file)?;
+        let sidecar = Sidecar::load(&self.meta_dir, &container)?;
         let baseline = match &sidecar {
             Some(s) => s.last_synced_text.clone(),
             None => store.text(&container),
@@ -335,7 +343,7 @@ impl FolderBridge {
         // returns `Err` and short-circuits the `?` below, so the file-set entry
         // upsert runs on success only.
         let mut outcome = reconcile_sidecar(
-            file,
+            &self.meta_dir,
             &container,
             &file_text,
             &expected,
@@ -443,7 +451,7 @@ impl FolderBridge {
         // silently delete the peer's concurrent edit. Fall back to the current
         // store text only when no sidecar exists (file already gone / never
         // synced), a degraded best-effort.
-        let hash = match Sidecar::load(file)? {
+        let hash = match Sidecar::load(&self.meta_dir, &container)? {
             Some(sidecar) => sidecar.last_synced_hash,
             None => text_hash(&store.text(&container)),
         };
@@ -453,7 +461,7 @@ impl FolderBridge {
         // Remove the disk file; already-gone is fine, other IO errors propagate.
         remove_if_present(file)?;
         // Drop the sidecar too so a later remote re-create reads as remote-new.
-        remove_if_present(&sidecar_path(file))?;
+        remove_if_present(&sidecar_path(&self.meta_dir, &container))?;
 
         Ok(SyncOutcome::changed_no_ops())
     }
@@ -483,7 +491,7 @@ impl FolderBridge {
 
         // A sidecar parse error is intentionally surfaced rather than treated
         // as "unsynced" — a corrupt sidecar is worth reporting.
-        let sidecar = Sidecar::load(file)?;
+        let sidecar = Sidecar::load(&self.meta_dir, &container)?;
 
         if on_disk.as_deref() == Some(text.as_str()) {
             if let Some(sidecar) = &sidecar {
@@ -521,11 +529,11 @@ impl FolderBridge {
 
         Sidecar {
             version: SIDECAR_VERSION,
-            doc_id: container,
+            doc_id: container.clone(),
             last_synced_hash: text_hash(&text),
             last_synced_text: text,
         }
-        .store(file)?;
+        .store(&self.meta_dir, &container)?;
 
         Ok(SyncOutcome::changed_no_ops())
     }
@@ -577,7 +585,8 @@ impl FolderBridge {
         // Record device-local presence: this device now HAS the blob on disk, so
         // a later scan that finds the file gone (marker present) can tell the
         // blob was locally deleted rather than never-projected (Step 2).
-        write_blob_marker(file)?;
+        let container = container_id(&self.vault_root, file)?;
+        write_blob_marker(&self.meta_dir, &container)?;
         Ok(SyncOutcome::changed_no_ops())
     }
 
@@ -711,7 +720,7 @@ impl FolderBridge {
             if store.get_entry(FILESET_MAP_ID, key).is_some() {
                 continue;
             }
-            if !sidecar_path(&key_to_path(&self.vault_root, key)).exists() {
+            if !sidecar_path(&self.meta_dir, key).exists() {
                 continue;
             }
             store.set_entry(
@@ -757,15 +766,15 @@ impl FolderBridge {
             //     never projected here (bytes may or may not have transferred
             //     yet) — leave it for Step 3, do NOT tombstone (never had it).
             if entry.kind == EntryKind::Blob {
-                if blob_marker_path(&file).exists() {
+                if blob_marker_path(&self.meta_dir, &key).exists() {
                     write_tombstone(store, &key, EntryKind::Blob, entry.content_hash.clone())?;
-                    remove_if_present(&blob_marker_path(&file))?;
+                    remove_if_present(&blob_marker_path(&self.meta_dir, &key))?;
                     outcomes.push((file, SyncOutcome::changed_no_ops()));
                 }
                 continue;
             }
 
-            let sidecar = sidecar_path(&file);
+            let sidecar = sidecar_path(&self.meta_dir, &key);
             if !sidecar.exists() {
                 // Absent file with no sidecar: a remote-new entry this device
                 // never had — leave it for Step 3, do NOT tombstone.
@@ -778,7 +787,7 @@ impl FolderBridge {
             // the post-merge text would defeat the resurrection guard (the
             // concurrent edit would be silently deleted). Degrade to the current
             // store text only if the sidecar is unreadable.
-            let content_hash = match Sidecar::load(&file) {
+            let content_hash = match Sidecar::load(&self.meta_dir, &key) {
                 Ok(Some(sidecar)) => sidecar.last_synced_hash,
                 _ => text_hash(&store.text(&key)),
             };
@@ -810,7 +819,7 @@ impl FolderBridge {
                         }
                         continue;
                     }
-                    if !file_present && !sidecar_path(&file).exists() {
+                    if !file_present && !sidecar_path(&self.meta_dir, &key).exists() {
                         // Remote-new: Live entry with no local file and no
                         // sidecar (never seen here). Absent-with-sidecar became
                         // a tombstone in Step 2.
@@ -865,8 +874,8 @@ impl FolderBridge {
                         // blob on disk, so a future re-projection is treated as
                         // remote-new (not a local delete). Clean any stray sidecar
                         // defensively (a blob has none, so a no-op in practice).
-                        remove_if_present(&blob_marker_path(&file))?;
-                        remove_if_present(&sidecar_path(&file))?;
+                        remove_if_present(&blob_marker_path(&self.meta_dir, &key))?;
+                        remove_if_present(&sidecar_path(&self.meta_dir, &key))?;
                         continue;
                     }
                     if !file_present {
@@ -876,7 +885,7 @@ impl FolderBridge {
                         // lingers. That orphan sidecar makes the Step-3 remote-new
                         // gate (`Live + absent + !sidecar`) false forever, so the
                         // path could never be re-materialized. Clean it here.
-                        remove_if_present(&sidecar_path(&file))?;
+                        remove_if_present(&sidecar_path(&self.meta_dir, &key))?;
                         continue;
                     }
                     let current_hash = text_hash(&store.text(&key));
@@ -896,7 +905,7 @@ impl FolderBridge {
                         // below. See the `resurrection_guard_hash_collision_*`
                         // test, which pins this behavior.
                         remove_if_present(&file)?;
-                        remove_if_present(&sidecar_path(&file))?;
+                        remove_if_present(&sidecar_path(&self.meta_dir, &key))?;
                         outcomes.push((file, SyncOutcome::changed_no_ops()));
                     } else {
                         // Edit wins / resurrection: the container diverged from
@@ -1072,7 +1081,7 @@ impl FolderBridge {
         // is on disk means a failure partway never loses the content.
         self.project_file(store, to)?;
         remove_if_present(from)?;
-        remove_if_present(&sidecar_path(from))?;
+        remove_if_present(&sidecar_path(&self.meta_dir, &from_container))?;
 
         Ok(SyncOutcome::changed_no_ops())
     }
@@ -1205,8 +1214,11 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
-/// The device-local PRESENCE MARKER path for a blob file: the full filename
-/// plus `.roamblob` (`notes/pic.png` → `notes/pic.png.roamblob`).
+/// The device-local PRESENCE MARKER path for a blob, keyed by `container_id`
+/// under `meta_dir`: `<meta_dir>/blobmarkers/<container_id>.roamblob`
+/// (`notes/pic.png` → `<meta_dir>/blobmarkers/notes/pic.png.roamblob`). Lives
+/// OUTSIDE the user's vault folder, mirroring the container-id path so nested
+/// blobs never collide.
 ///
 /// A blob carries NO content sidecar (it is content-addressed; reproject
 /// change-detection is by hash — see [`FolderBridge::project_blob`]). This marker
@@ -1220,19 +1232,25 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
 /// remote blob would be spuriously tombstoned — propagating a delete that wipes
 /// the file from the peer that authored it. The marker is device-local (never
 /// gossiped) and holds no bytes.
-fn blob_marker_path(file: &Path) -> PathBuf {
-    let mut name = file.as_os_str().to_os_string();
+fn blob_marker_path(meta_dir: &Path, container_id: &str) -> PathBuf {
+    let mut path = meta_dir.join("blobmarkers");
+    for component in container_id.split('/') {
+        path.push(component);
+    }
+    let mut name = path.into_os_string();
     name.push(".roamblob");
     PathBuf::from(name)
 }
 
-/// Write (touch) the blob presence marker for `file`. Idempotent: an existing
-/// marker is simply rewritten empty. Records only presence, never content.
-fn write_blob_marker(file: &Path) -> Result<(), FilesError> {
-    if let Some(parent) = file.parent() {
+/// Write (touch) the blob presence marker for `container_id` under `meta_dir`.
+/// Creates the nested parent dir if missing. Idempotent: an existing marker is
+/// simply rewritten empty. Records only presence, never content.
+fn write_blob_marker(meta_dir: &Path, container_id: &str) -> Result<(), FilesError> {
+    let path = blob_marker_path(meta_dir, container_id);
+    if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(blob_marker_path(file), [])?;
+    std::fs::write(path, [])?;
     Ok(())
 }
 
@@ -1343,7 +1361,7 @@ fn is_internal_sidecar(path: &Path) -> bool {
 /// carries remote edits, so `actual == L` no longer holds).
 #[allow(clippy::too_many_arguments)]
 fn reconcile_sidecar(
-    file: &Path,
+    meta_dir: &Path,
     container: &str,
     file_text: &str,
     expected: &str,
@@ -1360,7 +1378,7 @@ fn reconcile_sidecar(
             last_synced_hash: text_hash(file_text),
             last_synced_text: file_text.to_string(),
         }
-        .store(file)?;
+        .store(meta_dir, container)?;
         // Conflicts (if any) are attached by the caller (`import_file`); this
         // helper only knows ops/changed, so it leaves the list empty.
         return Ok(SyncOutcome {
@@ -1379,7 +1397,7 @@ fn reconcile_sidecar(
         last_synced_hash: text_hash(actual),
         last_synced_text: actual.to_string(),
     }
-    .store(file)?;
+    .store(meta_dir, container)?;
 
     if let Some(err) = apply_err {
         return Err(err);
@@ -1447,16 +1465,36 @@ mod tests {
         let vault = root.join("vault");
         let store_root = root.join("store");
         std::fs::create_dir_all(&vault).unwrap();
-        let bridge = FolderBridge::new(&vault);
+        let bridge = FolderBridge::new(&vault, &tmeta(root));
         let store = Store::open(&store_root, Identity::generate()).unwrap();
         (bridge, store)
+    }
+
+    /// The metadata dir a `bridge(root)` is built with (mirrors the CLI's
+    /// `<vault>/filemeta`, but rooted at the test's `root`, OUTSIDE the vault).
+    fn tmeta(root: &Path) -> PathBuf {
+        root.join("filemeta")
+    }
+
+    /// Load the sidecar for `file` (under `root`'s vault) from `root`'s meta dir.
+    fn tload_sidecar(root: &Path, file: &Path) -> Option<Sidecar> {
+        let container = container_id(&root.join("vault"), file).unwrap();
+        Sidecar::load(&tmeta(root), &container).unwrap()
+    }
+
+    /// The sidecar path for `file` (under `root`'s vault) in `root`'s meta dir.
+    fn tsidecar_path(root: &Path, file: &Path) -> PathBuf {
+        let container = container_id(&root.join("vault"), file).unwrap();
+        sidecar_path(&tmeta(root), &container)
     }
 
     #[test]
     fn new_file_import_seeds_container_and_sidecar() {
         let dir = tempdir().unwrap();
         let (b, mut store) = bridge(dir.path());
-        let file = dir.path().join("vault").join("note.md");
+        // A NESTED note, to also prove the sidecar's parent dirs are created.
+        let file = dir.path().join("vault").join("notes").join("foo.md");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         std::fs::write(&file, "hello\n").unwrap();
 
         let outcome = b.import_file(&mut store, &file).unwrap();
@@ -1466,10 +1504,22 @@ mod tests {
         let container = container_id(&dir.path().join("vault"), &file).unwrap();
         assert_eq!(store.text(&container), "hello\n");
 
-        let sidecar = Sidecar::load(&file).unwrap().unwrap();
+        let sidecar = tload_sidecar(dir.path(), &file).unwrap();
         assert_eq!(sidecar.last_synced_text, "hello\n");
         assert_eq!(sidecar.last_synced_hash, text_hash("hello\n"));
         assert_eq!(sidecar.doc_id, container);
+
+        // The sidecar must NOT pollute the user's vault folder...
+        let mut beside = file.clone().into_os_string();
+        beside.push(".roammeta");
+        assert!(
+            !PathBuf::from(beside).exists(),
+            "no .roammeta may sit beside the user's note"
+        );
+        // ...and MUST live under the store-owned meta dir, mirroring the id path.
+        assert!(tmeta(dir.path())
+            .join("sidecars/notes/foo.md.roammeta")
+            .exists());
     }
 
     #[test]
@@ -1480,13 +1530,13 @@ mod tests {
         std::fs::write(&file, "hello\n").unwrap();
 
         b.import_file(&mut store, &file).unwrap();
-        let sidecar_before = Sidecar::load(&file).unwrap().unwrap();
+        let sidecar_before = tload_sidecar(dir.path(), &file).unwrap();
 
         let outcome = b.import_file(&mut store, &file).unwrap();
         assert_eq!(outcome.ops_applied, 0);
         assert!(!outcome.changed);
 
-        let sidecar_after = Sidecar::load(&file).unwrap().unwrap();
+        let sidecar_after = tload_sidecar(dir.path(), &file).unwrap();
         assert_eq!(sidecar_before, sidecar_after);
     }
 
@@ -1539,7 +1589,7 @@ mod tests {
 
         // Delete the sidecar off disk (simulates a deleted/unsynced
         // `.roammeta` or a cold-reopen oplog replay with no sidecar yet).
-        std::fs::remove_file(crate::sidecar::sidecar_path(&file)).unwrap();
+        std::fs::remove_file(tsidecar_path(dir.path(), &file)).unwrap();
 
         // Re-import the SAME unchanged file: must be a no-op, not a double.
         let outcome = b.import_file(&mut store, &file).unwrap();
@@ -1562,7 +1612,7 @@ mod tests {
         std::fs::write(&file, "hello\n").unwrap();
         b.import_file(&mut store, &file).unwrap();
 
-        std::fs::remove_file(crate::sidecar::sidecar_path(&file)).unwrap();
+        std::fs::remove_file(tsidecar_path(dir.path(), &file)).unwrap();
         std::fs::write(&file, "hello world\n").unwrap();
 
         let outcome = b.import_file(&mut store, &file).unwrap();
@@ -1651,7 +1701,7 @@ mod tests {
         assert_eq!(store.text(&container), "XYZ hello world END\n");
 
         // Sidecar baseline tracks the DISK text (L), not the merged store text.
-        let sidecar = Sidecar::load(&file).unwrap().unwrap();
+        let sidecar = tload_sidecar(dir.path(), &file).unwrap();
         assert_eq!(sidecar.last_synced_text, "hello world END\n");
     }
 
@@ -1746,14 +1796,14 @@ mod tests {
         assert_eq!(store.text(&container), "XYZ hello world END\n");
 
         // After import the baseline tracks disk (L), not the merged store text.
-        let sidecar = Sidecar::load(&file).unwrap().unwrap();
+        let sidecar = tload_sidecar(dir.path(), &file).unwrap();
         assert_eq!(sidecar.last_synced_text, "hello world END\n");
 
         // Project the merged store text to disk: now disk == store == baseline.
         let projected = b.project_file(&mut store, &file).unwrap();
         assert!(projected.changed);
         assert_eq!(std::fs::read(&file).unwrap(), b"XYZ hello world END\n");
-        let sidecar = Sidecar::load(&file).unwrap().unwrap();
+        let sidecar = tload_sidecar(dir.path(), &file).unwrap();
         assert_eq!(sidecar.last_synced_text, "XYZ hello world END\n");
 
         // A second import now hits the fast path (R == A): a stable no-op.
@@ -1785,14 +1835,14 @@ mod tests {
         b.import_file(&mut store, &file).unwrap();
 
         // Baseline == disk text L, NOT the merged store text.
-        let sidecar = Sidecar::load(&file).unwrap().unwrap();
+        let sidecar = tload_sidecar(dir.path(), &file).unwrap();
         assert_eq!(sidecar.last_synced_text, "hello world END\n");
         assert_ne!(sidecar.last_synced_text, store.text(&container));
 
         // Dirty-check still works: disk == baseline, so projection is allowed
         // (not treated as dirty) and advances the baseline to the store text.
         b.project_file(&mut store, &file).unwrap();
-        let sidecar = Sidecar::load(&file).unwrap().unwrap();
+        let sidecar = tload_sidecar(dir.path(), &file).unwrap();
         assert_eq!(sidecar.last_synced_text, store.text(&container));
         assert_eq!(sidecar.last_synced_text, "XYZ hello world END\n");
     }
@@ -1861,12 +1911,12 @@ mod tests {
         // the next import diffs "partial" -> "hello world" (the remaining delta),
         // never re-applying the stale baseline diff.
         let dir = tempdir().unwrap();
-        let file = dir.path().join("note.md");
+        let meta = dir.path();
 
         // expected == file_text here (a non-rebase desync): the store diverged
         // from what we intended, so it heals to the actual "partial".
         let result = reconcile_sidecar(
-            &file,
+            meta,
             "note.md",
             "hello world",
             "hello world",
@@ -1876,7 +1926,7 @@ mod tests {
         );
         assert!(matches!(result, Err(FilesError::Desync(_))));
 
-        let sidecar = Sidecar::load(&file).unwrap().unwrap();
+        let sidecar = Sidecar::load(meta, "note.md").unwrap().unwrap();
         assert_eq!(sidecar.last_synced_text, "partial");
         assert_eq!(sidecar.last_synced_hash, text_hash("partial"));
     }
@@ -1884,13 +1934,13 @@ mod tests {
     #[test]
     fn reconcile_heals_sidecar_then_propagates_apply_error() {
         let dir = tempdir().unwrap();
-        let file = dir.path().join("note.md");
+        let meta = dir.path();
 
         // A simulated storage failure captured mid-sequence must still heal the
         // sidecar to the store's actual state before propagating.
         let err = FilesError::Sidecar("simulated storage failure".into());
         let result = reconcile_sidecar(
-            &file,
+            meta,
             "note.md",
             "hello world",
             "hello world",
@@ -1900,16 +1950,16 @@ mod tests {
         );
         assert!(result.is_err());
 
-        let sidecar = Sidecar::load(&file).unwrap().unwrap();
+        let sidecar = Sidecar::load(meta, "note.md").unwrap().unwrap();
         assert_eq!(sidecar.last_synced_text, "partial");
     }
 
     #[test]
     fn reconcile_success_records_file_text_and_reports_change() {
         let dir = tempdir().unwrap();
-        let file = dir.path().join("note.md");
+        let meta = dir.path();
 
-        let outcome = reconcile_sidecar(&file, "note.md", "same", "same", "same", 2, None).unwrap();
+        let outcome = reconcile_sidecar(meta, "note.md", "same", "same", "same", 2, None).unwrap();
         assert_eq!(
             outcome,
             SyncOutcome {
@@ -1919,7 +1969,7 @@ mod tests {
             }
         );
         assert_eq!(
-            Sidecar::load(&file).unwrap().unwrap().last_synced_text,
+            Sidecar::load(meta, "note.md").unwrap().unwrap().last_synced_text,
             "same"
         );
     }
@@ -2165,16 +2215,12 @@ mod tests {
         std::fs::write(&one, "one body").unwrap();
         std::fs::write(&two, "two body").unwrap();
         std::fs::write(&three, "three body").unwrap();
-        // A stray but valid sidecar sitting beside one.md — scan must not treat
-        // it as an importable file.
-        Sidecar {
-            version: SIDECAR_VERSION,
-            doc_id: "one.md".to_string(),
-            last_synced_hash: text_hash(""),
-            last_synced_text: String::new(),
-        }
-        .store(&one)
-        .unwrap();
+        // A STALE leftover metadata file sitting IN the user folder (e.g. from an
+        // old version that wrote sidecars/markers beside notes). The walk must
+        // still defensively exclude `.roammeta`/`.roamblob` so it is never
+        // imported as a note.
+        std::fs::write(vault.join("one.md.roammeta"), "stale").unwrap();
+        std::fs::write(vault.join("one.md.roamblob"), []).unwrap();
 
         let outcomes = b.scan(&mut store).unwrap();
         assert_eq!(outcomes.len(), 3);
@@ -2207,6 +2253,18 @@ mod tests {
 
         let bad_c = container_id(&vault, &bad).unwrap();
         assert_eq!(fileset_entry(&store, &bad_c).unwrap().kind, EntryKind::Blob);
+
+        // The blob's presence marker must NOT sit beside the user's file...
+        let mut beside = bad.clone().into_os_string();
+        beside.push(".roamblob");
+        assert!(
+            !PathBuf::from(beside).exists(),
+            "no .roamblob may sit beside the user's blob file"
+        );
+        // ...and MUST live under the store-owned meta dir's blobmarkers tree.
+        assert!(tmeta(dir.path())
+            .join("blobmarkers/bad.md.roamblob")
+            .exists());
     }
 
     #[cfg(unix)]
@@ -2319,7 +2377,7 @@ mod tests {
 
         // Disk file and sidecar are gone.
         assert!(!file.exists());
-        assert!(!crate::sidecar::sidecar_path(&file).exists());
+        assert!(!tsidecar_path(dir.path(), &file).exists());
 
         // Container text is intact (history / resurrection).
         assert_eq!(store.text(&container), store_text_before);
@@ -2338,7 +2396,7 @@ mod tests {
 
         // Remove disk file + sidecar out from under delete_file.
         std::fs::remove_file(&file).unwrap();
-        std::fs::remove_file(crate::sidecar::sidecar_path(&file)).unwrap();
+        std::fs::remove_file(tsidecar_path(dir.path(), &file)).unwrap();
 
         let outcome = b.delete_file(&mut store, &file).unwrap();
         assert!(outcome.changed);
@@ -2410,7 +2468,7 @@ mod tests {
         // Delete the disk file directly (NOT via delete_file); the sidecar is
         // left behind, which is what proves this device once had the file.
         std::fs::remove_file(&file).unwrap();
-        assert!(sidecar_path(&file).exists());
+        assert!(tsidecar_path(dir.path(), &file).exists());
 
         b.scan(&mut store).unwrap();
 
@@ -2418,7 +2476,7 @@ mod tests {
         assert_eq!(entry.status, EntryStatus::Tombstoned);
         assert_eq!(entry.content_hash, text_hash("hello\n"));
         // The stale sidecar is dropped so a later remote re-create reads as new.
-        assert!(!sidecar_path(&file).exists());
+        assert!(!tsidecar_path(dir.path(), &file).exists());
 
         // Idempotent: a second scan with no external change mutates nothing.
         let before = fileset_snapshot(&store);
@@ -2441,13 +2499,13 @@ mod tests {
             .unwrap();
         store.edit_text("b.md", 0, "remote\n").unwrap();
         assert!(!file.exists());
-        assert!(!sidecar_path(&file).exists());
+        assert!(!tsidecar_path(dir.path(), &file).exists());
 
         b.scan(&mut store).unwrap();
 
         // The file is created on disk with the remote content and a sidecar.
         assert_eq!(std::fs::read(&file).unwrap(), b"remote\n");
-        assert!(sidecar_path(&file).exists());
+        assert!(tsidecar_path(dir.path(), &file).exists());
         assert_eq!(
             fileset_entry(&store, "b.md").unwrap().status,
             EntryStatus::Live
@@ -2486,7 +2544,7 @@ mod tests {
 
         // Disk now reflects the remote edit; baseline advanced; entry Live.
         assert_eq!(std::fs::read(&file).unwrap(), b"hello world\n");
-        let sidecar = Sidecar::load(&file).unwrap().unwrap();
+        let sidecar = tload_sidecar(dir.path(), &file).unwrap();
         assert_eq!(sidecar.last_synced_text, "hello world\n");
         assert_eq!(
             fileset_entry(&store, &container).unwrap().status,
@@ -2529,7 +2587,7 @@ mod tests {
         assert_eq!(disk, "LOCAL hello world\n");
         // Converged: disk == container == baseline.
         assert_eq!(store.text(&container), disk);
-        let sidecar = Sidecar::load(&file).unwrap().unwrap();
+        let sidecar = tload_sidecar(dir.path(), &file).unwrap();
         assert_eq!(sidecar.last_synced_text, disk);
     }
 
@@ -2557,7 +2615,7 @@ mod tests {
 
         // Delete wins: the disk file and its sidecar are removed.
         assert!(!file.exists());
-        assert!(!sidecar_path(&file).exists());
+        assert!(!tsidecar_path(dir.path(), &file).exists());
         assert_eq!(
             fileset_entry(&store, &container).unwrap().status,
             EntryStatus::Tombstoned
@@ -2640,9 +2698,9 @@ mod tests {
             last_synced_hash: text_hash("old\n"),
             last_synced_text: "old\n".to_string(),
         }
-        .store(&file)
+        .store(&tmeta(dir.path()), "y.md")
         .unwrap();
-        assert!(sidecar_path(&file).exists());
+        assert!(tsidecar_path(dir.path(), &file).exists());
         assert!(!file.exists());
         store
             .set_entry(FILESET_MAP_ID, "y.md", &tombstoned(text_hash("old\n")))
@@ -2650,7 +2708,7 @@ mod tests {
 
         b.scan(&mut store).unwrap();
         // The orphan sidecar is cleaned.
-        assert!(!sidecar_path(&file).exists());
+        assert!(!tsidecar_path(dir.path(), &file).exists());
 
         // Now a remote re-create at the same path must materialize again.
         store
@@ -2691,7 +2749,7 @@ mod tests {
             last_synced_hash: text_hash("hello\n"),
             last_synced_text: "hello\n".to_string(),
         }
-        .store(&file)
+        .store(&tmeta(dir.path()), "m.md")
         .unwrap();
         assert!(fileset_entry(&store, "m.md").is_none());
 
@@ -2822,7 +2880,7 @@ mod tests {
             "delete wins: the hash-collision revert edit is dropped"
         );
         assert!(
-            !sidecar_path(&file).exists(),
+            !tsidecar_path(dir.path(), &file).exists(),
             "sidecar removed alongside the file"
         );
         let entry = fileset_entry(&store, &container).unwrap();
@@ -2854,11 +2912,11 @@ mod tests {
 
         // The new file exists on disk with the content and a sidecar.
         assert_eq!(std::fs::read(&new).unwrap(), b"content\n");
-        assert!(sidecar_path(&new).exists());
+        assert!(tsidecar_path(dir.path(), &new).exists());
 
         // The old file and its sidecar are gone.
         assert!(!old.exists());
-        assert!(!sidecar_path(&old).exists());
+        assert!(!tsidecar_path(dir.path(), &old).exists());
 
         // Entries: new → Live, old → Tombstoned, both hashing the moved content.
         let new_entry = fileset_entry(&store, &new_container).unwrap();
@@ -2946,7 +3004,7 @@ mod tests {
 
         // No data lost: file, sidecar, container, and the Live entry all survive.
         assert_eq!(std::fs::read(&file).unwrap(), b"content\n");
-        assert!(sidecar_path(&file).exists());
+        assert!(tsidecar_path(dir.path(), &file).exists());
         assert_eq!(store.text(&container), "content\n");
         assert_eq!(
             fileset_entry(&store, &container).unwrap().status,
