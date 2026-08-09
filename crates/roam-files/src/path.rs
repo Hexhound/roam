@@ -11,20 +11,24 @@ use crate::error::FilesError;
 /// escape the vault (via `..`) or point outside it entirely are rejected
 /// with [`FilesError::PathEscapesVault`].
 pub fn container_id(vault_root: &Path, file: &Path) -> Result<String, FilesError> {
-    // Resolve `file` against the vault root when it is relative, so a
-    // `./a/b.md` form and an absolute `<vault>/a/b.md` form agree.
-    let combined = if file.is_absolute() {
-        file.to_path_buf()
-    } else {
-        vault_root.join(file)
-    };
+    // If `file` already carries the vault prefix (absolute or relative),
+    // strip it so we don't double up when resolving; otherwise treat the
+    // whole `file` as relative to the vault root.
+    let remainder = file.strip_prefix(vault_root).unwrap_or(file);
+    let combined = vault_root.join(remainder);
 
     let root_parts = lexical_normalize(vault_root);
     let file_parts = lexical_normalize(&combined);
 
+    // A leading `..` survives normalization only when a relative path walked
+    // above its own root — that is always an escape, regardless of whether
+    // the vault root was absolute, relative, `.`, or empty.
+    if file_parts.iter().any(|part| part == "..") {
+        return Err(FilesError::PathEscapesVault(file.to_path_buf()));
+    }
+
     // The normalized file path must begin with the normalized vault path;
-    // otherwise a `..` component walked above the vault, or the path was
-    // absolute and outside the vault.
+    // otherwise the path resolves outside the vault.
     if file_parts.len() < root_parts.len() || file_parts[..root_parts.len()] != root_parts[..] {
         return Err(FilesError::PathEscapesVault(file.to_path_buf()));
     }
@@ -39,17 +43,24 @@ pub fn container_id(vault_root: &Path, file: &Path) -> Result<String, FilesError
 /// Lexically normalize `path` into its `/`-oriented "normal" components,
 /// resolving `.` and `..` without touching the filesystem.
 ///
-/// A `..` pops the previous component; at the root it is a no-op (a path
-/// cannot escape above its own root). The returned strings are the plain
-/// path segments, with any leading root/prefix dropped.
+/// A `..` pops the previous normal component. For an absolute path a `..`
+/// at the root is a no-op (it cannot escape above the root). For a relative
+/// path a `..` that cannot pop is preserved as a leading `".."` segment,
+/// which signals that the path escaped its own root. The returned strings
+/// are the plain path segments, with any leading root/prefix dropped.
 fn lexical_normalize(path: &Path) -> Vec<String> {
+    let absolute = path.is_absolute();
     let mut parts: Vec<String> = Vec::new();
     for component in path.components() {
         match component {
             Component::Normal(part) => parts.push(part.to_string_lossy().into_owned()),
-            Component::ParentDir => {
-                parts.pop();
-            }
+            Component::ParentDir => match parts.last() {
+                Some(last) if last != ".." => {
+                    parts.pop();
+                }
+                _ if !absolute => parts.push("..".to_string()),
+                _ => {}
+            },
             Component::CurDir | Component::RootDir | Component::Prefix(_) => {}
         }
     }
@@ -93,6 +104,33 @@ mod tests {
             container_id(&vault, &file),
             Err(FilesError::PathEscapesVault(_))
         ));
+    }
+
+    #[test]
+    fn relative_vault_dot_escape_is_rejected() {
+        let vault = PathBuf::from(".");
+        let file = PathBuf::from("a/../../b");
+        assert!(matches!(
+            container_id(&vault, &file),
+            Err(FilesError::PathEscapesVault(_))
+        ));
+    }
+
+    #[test]
+    fn relative_vault_escape_chain_is_rejected() {
+        let vault = PathBuf::from("vault/sub");
+        let file = PathBuf::from("vault/sub/../../x");
+        assert!(matches!(
+            container_id(&vault, &file),
+            Err(FilesError::PathEscapesVault(_))
+        ));
+    }
+
+    #[test]
+    fn relative_vault_normal_file() {
+        let vault = PathBuf::from("vault");
+        let file = PathBuf::from("vault/a/b.md");
+        assert_eq!(container_id(&vault, &file).unwrap(), "a/b.md");
     }
 
     #[test]
