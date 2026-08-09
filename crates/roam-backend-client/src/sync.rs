@@ -1,8 +1,8 @@
 use crate::crypto::VaultKey;
 use crate::entries::{local_blobs, local_entries, reassemble_log, split_log_lines};
 use crate::transport::Backend;
-use roam_storage::{Store, VerifyingKey};
-use std::collections::BTreeMap;
+use roam_storage::{PeerStatus, Store, VerifyingKey};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -20,6 +20,11 @@ pub async fn reconcile_once<B: Backend>(
 ) -> anyhow::Result<()> {
     let bucket = key.bucket_id();
 
+    // `local_entries_vec` is ordered by (peer, ascending index); keep it ordered
+    // for the upload loop so any mid-loop `put_entry` failure leaves a clean
+    // contiguous prefix per peer (never a hole that would strand later entries
+    // behind the reader's GET-until-404 walk). `local_entry_ids` is only for the
+    // set-membership `has_missing` check.
     let (local_entries_vec, local_blobs_vec, self_peer) = {
         let guard = store.lock().await;
         (
@@ -28,28 +33,36 @@ pub async fn reconcile_once<B: Backend>(
             guard.peer_id(),
         )
     };
-    let local_entry_ids: BTreeMap<String, Vec<u8>> = local_entries_vec.into_iter().collect();
+    let local_entry_ids: BTreeSet<String> =
+        local_entries_vec.iter().map(|(id, _)| id.clone()).collect();
     let local_blob_ids: BTreeMap<String, String> = local_blobs_vec.into_iter().collect();
 
     let manifest = backend.manifest(&bucket).await?;
-    let remote_entry_ids: std::collections::BTreeSet<String> =
-        manifest.entry_ids.into_iter().collect();
-    let remote_blob_ids: std::collections::BTreeSet<String> =
-        manifest.blob_ids.into_iter().collect();
+    let remote_entry_ids: BTreeSet<String> = manifest.entry_ids.into_iter().collect();
+    let remote_blob_ids: BTreeSet<String> = manifest.blob_ids.into_iter().collect();
 
-    // Upload entries the backend lacks (encrypt the line bytes).
-    for (id, line) in &local_entry_ids {
+    // Upload entries the backend lacks, in strict (peer, index) order (encrypt
+    // the line bytes). Ascending order also self-heals any pre-existing gap by
+    // filling it from the bottom.
+    for (id, line) in &local_entries_vec {
         if !remote_entry_ids.contains(id) {
             let ct = key.seal(line);
             backend.put_entry(&bucket, id, ct).await?;
         }
     }
-    // Upload blobs the backend lacks (encrypt the plaintext bytes).
+    // Upload blobs the backend lacks (encrypt the plaintext bytes). Order is
+    // irrelevant — blobs are independent, self-identifying by content hash.
     for (id, content_hash) in &local_blob_ids {
         if !remote_blob_ids.contains(id) {
+            // The blob may have been removed between the initial listing and this
+            // re-lock; if so, skip it — sealing an empty payload under the real
+            // blob_id would corrupt it for every peer.
             let bytes = {
                 let guard = store.lock().await;
-                guard.blobs().get(content_hash)?.unwrap_or_default()
+                guard.blobs().get(content_hash)?
+            };
+            let Some(bytes) = bytes else {
+                continue;
             };
             let ct = key.seal(&bytes);
             backend.put_blob(&bucket, id, ct).await?;
@@ -71,7 +84,7 @@ pub async fn reconcile_once<B: Backend>(
     // Fetch entries we lack, per peer, in strict index order, then import.
     let has_missing = remote_entry_ids
         .iter()
-        .any(|id| !local_entry_ids.contains_key(id));
+        .any(|id| !local_entry_ids.contains(id));
     if has_missing {
         import_missing_entries(store, backend, key, &bucket, self_peer).await?;
     }
@@ -94,6 +107,7 @@ async fn import_missing_entries<B: Backend>(
             .roster()
             .into_iter()
             .filter(|r| r.peer_id != self_peer)
+            .filter(|r| r.status == PeerStatus::Active)
             .filter_map(|r| {
                 VerifyingKey::from_bytes(&r.verifying_key)
                     .ok()
@@ -123,7 +137,11 @@ async fn import_missing_entries<B: Backend>(
         }
         let appended = reassemble_log(&fetched);
         let mut guard = store.lock().await;
-        let _ = guard.apply_peer_ops(peer_id, &vkey, &appended);
+        // A bad entry must not abort the whole pass (matching Engine behavior),
+        // but it must be observable rather than silently swallowed.
+        if let Err(err) = guard.apply_peer_ops(peer_id, &vkey, &appended) {
+            eprintln!("backend sync: apply_peer_ops for peer {peer_id} failed: {err}");
+        }
     }
     Ok(())
 }
@@ -183,5 +201,82 @@ mod tests {
         let v1 = s.lock().await.doc_version_bytes();
         reconcile_once(&s, &backend, &key).await.unwrap();
         assert_eq!(s.lock().await.doc_version_bytes(), v1);
+    }
+
+    /// A multi-line log, then a partial catch-up: B first pulls A's whole log,
+    /// then (after A appends more) pulls only the new suffix — exercising
+    /// multi-line reassembly and a walk that starts mid-log.
+    #[tokio::test]
+    async fn multiline_partial_catch_up_converges() {
+        let key = VaultKey([9u8; 32]);
+        let backend = Arc::new(MemoryBackend::default());
+        let a_dir = tempfile::tempdir().unwrap();
+        let b_dir = tempfile::tempdir().unwrap();
+        let a = store_at(a_dir.path()).await;
+        let b = store_at(b_dir.path()).await;
+
+        let (a_peer, a_key) = {
+            let g = a.lock().await;
+            (g.peer_id(), g.identity_verifying_bytes())
+        };
+        let (b_peer, b_key) = {
+            let g = b.lock().await;
+            (g.peer_id(), g.identity_verifying_bytes())
+        };
+        a.lock().await.add_peer(b_peer, b_key).unwrap();
+        b.lock().await.add_peer(a_peer, a_key).unwrap();
+
+        // Several edits so A's own log holds multiple lines.
+        a.lock().await.set_entry("files", "note", "one").unwrap();
+        a.lock().await.set_entry("files", "note", "two").unwrap();
+        a.lock().await.set_entry("files", "note", "three").unwrap();
+
+        reconcile_once(&a, &backend, &key).await.unwrap();
+        reconcile_once(&b, &backend, &key).await.unwrap();
+        assert_eq!(
+            b.lock().await.get_entry("files", "note"),
+            Some("three".to_string())
+        );
+
+        // A appends more; B must pick up only the new suffix (partial catch-up).
+        a.lock().await.set_entry("files", "note", "four").unwrap();
+        reconcile_once(&a, &backend, &key).await.unwrap();
+        reconcile_once(&b, &backend, &key).await.unwrap();
+        assert_eq!(
+            b.lock().await.get_entry("files", "note"),
+            Some("four".to_string())
+        );
+    }
+
+    /// A raw blob stored on A flows to B purely through the backend.
+    #[tokio::test]
+    async fn a_blob_flows_through_the_backend() {
+        let key = VaultKey([9u8; 32]);
+        let backend = Arc::new(MemoryBackend::default());
+        let a_dir = tempfile::tempdir().unwrap();
+        let b_dir = tempfile::tempdir().unwrap();
+        let a = store_at(a_dir.path()).await;
+        let b = store_at(b_dir.path()).await;
+
+        let (a_peer, a_key) = {
+            let g = a.lock().await;
+            (g.peer_id(), g.identity_verifying_bytes())
+        };
+        let (b_peer, b_key) = {
+            let g = b.lock().await;
+            (g.peer_id(), g.identity_verifying_bytes())
+        };
+        a.lock().await.add_peer(b_peer, b_key).unwrap();
+        b.lock().await.add_peer(a_peer, a_key).unwrap();
+
+        let hash = a.lock().await.blobs().put(b"blobdata").unwrap();
+
+        reconcile_once(&a, &backend, &key).await.unwrap();
+        reconcile_once(&b, &backend, &key).await.unwrap();
+
+        assert_eq!(
+            b.lock().await.blobs().get(&hash).unwrap(),
+            Some(b"blobdata".to_vec())
+        );
     }
 }
