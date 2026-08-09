@@ -105,6 +105,11 @@ fn load_vault_id(vault: &Path) -> Result<VaultId> {
 }
 
 async fn init(vault: &Path, identity_path: &Path) -> Result<()> {
+    // Refuse to re-init: overwriting `vault-id` would orphan already-paired
+    // peers (their roster + ops are keyed to the original vault).
+    if vault_id_path(vault).exists() {
+        anyhow::bail!("vault already initialized (vault-id exists); refusing to overwrite");
+    }
     let identity = Identity::generate();
     identity.save(identity_path).context("save identity")?;
     // Opening the store materializes the vault directory + peers/oplog files.
@@ -165,20 +170,15 @@ async fn sync(vault: &Path, identity_path: &Path) -> Result<()> {
     let vault_id = load_vault_id(vault)?;
     let store = Store::open(vault, identity.clone()).context("open vault store")?;
 
-    // Build iroh routes + the connect list from the active roster before the
-    // store is moved into the engine.
-    let active: Vec<u64> = store
-        .roster()
-        .into_iter()
-        .filter(|p| p.status == PeerStatus::Active)
-        .map(|p| p.peer_id)
-        .collect();
+    // Build iroh routes from the active roster in a single pass, then derive the
+    // connect list from its keys, before the store is moved into the engine.
     let routes: HashMap<u64, [u8; 32]> = store
         .roster()
         .into_iter()
         .filter(|p| p.status == PeerStatus::Active)
         .map(|p| (p.peer_id, p.verifying_key))
         .collect();
+    let active: Vec<u64> = routes.keys().copied().collect();
 
     let transport = IrohTransport::spawn(&identity, routes)
         .await
