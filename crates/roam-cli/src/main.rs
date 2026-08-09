@@ -66,9 +66,12 @@ enum Command {
         vault: PathBuf,
         #[arg(long)]
         identity: PathBuf,
-        /// Sync a real folder of `*.md`/`*.org` files instead of the interactive
-        /// "note" REPL: import local edits, project remote edits, both directions
-        /// live. When absent, the legacy REPL runs (backward compatible).
+        /// Sync a real folder instead of the interactive "note" REPL: `*.md`/
+        /// `*.org` text notes AND binary assets (png/jpg/gif/webp/pdf/mp3/mp4/
+        /// mov/webm/wav/ogg/zip/bin) are imported, projected, created, edited,
+        /// deleted, and renamed live in both directions. Binaries transfer
+        /// pull-based (blob bytes fetched on demand). When absent, the legacy
+        /// REPL runs (backward compatible).
         #[arg(long)]
         folder: Option<PathBuf>,
     },
