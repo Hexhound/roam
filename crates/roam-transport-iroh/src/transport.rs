@@ -228,8 +228,13 @@ impl Transport for IrohTransport {
 
     async fn remove_route(&self, peer: u64) {
         // Drop the route and any seeded direct address so a later `dial` cannot
-        // resolve the peer, then tear down the cached send stream so the revoked
-        // peer's live stream is closed.
+        // resolve the peer, and drop our cached send half so we stop pushing to
+        // it. This does NOT force-close the peer's inbound reader task (which
+        // holds its own `RecvStream` and lives until the peer disconnects):
+        // inbound frames from a revoked peer are refused at the app layer (the
+        // engine's read-side revoke gate drops Hello/Have/RosterHave, and the
+        // store refuses its Ops/RosterOps), not torn down at the transport. Full
+        // transport-level teardown is deferred (basic revoke).
         self.routes.lock().unwrap().remove(&peer);
         self.addrs.lock().unwrap().remove(&peer);
         self.conns.lock().await.remove(&peer);

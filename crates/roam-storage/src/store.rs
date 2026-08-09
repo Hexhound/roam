@@ -228,7 +228,9 @@ impl Store {
     /// - `appended` starts with ours → take `appended` (first time, since empty
     ///   is a prefix of everything, or a full/longer resend);
     /// - ours starts with `appended` → keep ours (stale/duplicate prefix);
-    /// - otherwise                   → `stored ++ appended` (genuine suffix).
+    /// - otherwise                   → `stored ++ appended` with any shared
+    ///   boundary trimmed (a genuine suffix that raced a full relayed copy can
+    ///   start mid-log; the overlap trim keeps it from duplicating an entry).
     ///
     /// The resulting whole log goes to [`Store::import_peer`], which verifies,
     /// refuses to shrink, and advances `persisted`. We never import our own ops
@@ -251,9 +253,16 @@ impl Store {
             // Stale/duplicate prefix: keep the longer bytes we already hold.
             stored
         } else {
-            // Genuine suffix continuation (live-push): append it.
+            // Genuine suffix continuation. Trim any overlap so a suffix learned
+            // from another source at a different byte offset can't duplicate a
+            // boundary entry (append-only logs can arrive interleaved: a
+            // live-push suffix may race a full relayed copy).
+            let overlap = (1..=stored.len().min(appended.len()))
+                .rev()
+                .find(|&k| stored.ends_with(&appended[..k]))
+                .unwrap_or(0);
             let mut whole = stored;
-            whole.extend_from_slice(appended);
+            whole.extend_from_slice(&appended[overlap..]);
             whole
         };
         self.import_peer(author, key, whole)
@@ -849,6 +858,49 @@ mod tests {
             "stale prefix resend altered the stored peer log length"
         );
         assert_eq!(a.text("note"), "onetwosix");
+    }
+
+    #[test]
+    fn apply_peer_ops_trims_a_partial_overlap_suffix() {
+        // Under mesh concurrency an author's log reaches a receiver from two
+        // sources at different offsets: a live-push suffix and a full relayed
+        // resend can interleave. Applying the full log `[l0,l1]` then an
+        // overlapping suffix `[l1,l2]` must trim the shared boundary entry, not
+        // duplicate `l1` on disk.
+        let dir_a = tempdir().unwrap();
+        let dir_b = tempdir().unwrap();
+        let id_a = Identity::generate();
+        let id_b = Identity::generate();
+
+        let mut a = Store::open(dir_a.path(), id_a).unwrap();
+        let mut b = Store::open(dir_b.path(), id_b.clone()).unwrap();
+        a.add_peer(id_b.peer_id(), id_b.verifying_key().to_bytes())
+            .unwrap();
+
+        // Build b's 1-, 2-, and 3-entry logs so we can slice at line boundaries.
+        b.edit_text("note", 0, "l0").unwrap();
+        let first = b.export_own_log().unwrap(); // [l0]
+        b.edit_text("note", 2, "l1").unwrap();
+        let full_two = b.export_own_log().unwrap(); // [l0,l1]
+        b.edit_text("note", 4, "l2").unwrap();
+        let full_three = b.export_own_log().unwrap(); // [l0,l1,l2]
+
+        // Receiver first learns the full 2-entry log.
+        a.apply_peer_ops(id_b.peer_id(), &id_b.verifying_key(), &full_two)
+            .unwrap();
+
+        // Then an OVERLAPPING suffix `[l1,l2]` (bytes from the end of l0 onward)
+        // races in from another source.
+        let overlapping = &full_three[first.len()..];
+        a.apply_peer_ops(id_b.peer_id(), &id_b.verifying_key(), overlapping)
+            .unwrap();
+
+        assert_eq!(
+            a.export_peer_log(id_b.peer_id()).unwrap(),
+            full_three,
+            "overlapping suffix duplicated a boundary entry on disk"
+        );
+        assert_eq!(a.text("note"), "l0l1l2");
     }
 
     #[test]

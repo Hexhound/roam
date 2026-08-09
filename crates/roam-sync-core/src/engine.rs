@@ -124,6 +124,11 @@ impl<T: Transport + 'static> Engine<T> {
         // Forget the route so we stop dialing (and tear down any cached
         // connection to) the revoked device.
         self.transport.remove_route(peer).await;
+        // Prune our per-peer bookkeeping so the revoked device no longer lingers
+        // in the broadcast set or the offset map. Each map is locked, mutated,
+        // and released on its own (no store lock held across it).
+        self.connected.lock().await.remove(&peer);
+        self.sent_offsets.lock().await.remove(&peer);
         self.broadcast_own_roster().await;
         Ok(())
     }
