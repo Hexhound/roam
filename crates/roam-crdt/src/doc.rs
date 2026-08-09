@@ -1,5 +1,7 @@
 use crate::error::CrdtError;
 use loro::LoroDoc;
+use loro::LoroValue;
+use loro::ValueOrContainer;
 use loro::VersionVector;
 
 /// A serializable snapshot of a document's version (which ops it has seen).
@@ -48,6 +50,35 @@ impl Document {
     /// Current string content of text container `id`.
     pub fn text(&self, id: &str) -> String {
         self.doc.get_text(id).to_string()
+    }
+
+    /// Insert/overwrite `value` under `key` in map container `map_id`
+    /// (last-writer-wins register semantics). Like [`Document::insert_text`],
+    /// this buffers the edit; call [`Document::commit`] before export/version.
+    pub fn set_entry(&self, map_id: &str, key: &str, value: &str) -> Result<(), CrdtError> {
+        self.doc.get_map(map_id).insert(key, value)?;
+        Ok(())
+    }
+
+    /// Current string value under `key` in map container `map_id`, if present.
+    /// Non-string values (only strings are ever stored here) yield `None`.
+    pub fn get_entry(&self, map_id: &str, key: &str) -> Option<String> {
+        match self.doc.get_map(map_id).get(key)? {
+            ValueOrContainer::Value(LoroValue::String(s)) => Some(s.to_string()),
+            _ => None,
+        }
+    }
+
+    /// All (key, value) string pairs currently in map container `map_id`
+    /// (order unspecified).
+    pub fn entries(&self, map_id: &str) -> Vec<(String, String)> {
+        let map = self.doc.get_map(map_id);
+        map.keys()
+            .filter_map(|key| {
+                let value = self.get_entry(map_id, key.as_str())?;
+                Some((key.to_string(), value))
+            })
+            .collect()
     }
 
     /// Flush pending edits into the oplog. Must be called before export/version
@@ -159,6 +190,101 @@ mod tests {
         assert!(a.text("note").starts_with("hello"));
         assert!(a.text("note").contains(" from A"), "lost A's edit: {}", a.text("note"));
         assert!(a.text("note").contains(" from B"), "lost B's edit: {}", a.text("note"));
+    }
+
+    #[test]
+    fn sets_and_gets_map_entry() {
+        let doc = Document::new(1).unwrap();
+        doc.set_entry("m", "k", "v").unwrap();
+        assert_eq!(doc.get_entry("m", "k"), Some("v".to_string()));
+
+        // Overwriting the same key yields the new value (LWW register).
+        doc.set_entry("m", "k", "v2").unwrap();
+        assert_eq!(doc.get_entry("m", "k"), Some("v2".to_string()));
+    }
+
+    #[test]
+    fn get_entry_for_absent_key_is_none() {
+        let doc = Document::new(1).unwrap();
+        assert_eq!(doc.get_entry("m", "missing"), None);
+        doc.set_entry("m", "k", "v").unwrap();
+        assert_eq!(doc.get_entry("m", "other"), None);
+    }
+
+    #[test]
+    fn entries_lists_all_set_pairs() {
+        let doc = Document::new(1).unwrap();
+        doc.set_entry("m", "a", "1").unwrap();
+        doc.set_entry("m", "b", "2").unwrap();
+        doc.set_entry("m", "c", "3").unwrap();
+
+        let mut pairs = doc.entries("m");
+        pairs.sort();
+        assert_eq!(
+            pairs,
+            vec![
+                ("a".to_string(), "1".to_string()),
+                ("b".to_string(), "2".to_string()),
+                ("c".to_string(), "3".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn map_entries_converge_to_single_lww_winner() {
+        let a = Document::new(1).unwrap();
+        let b = Document::new(2).unwrap();
+
+        // Concurrent conflicting writes to the SAME key.
+        a.set_entry("fs", "path", "from A").unwrap();
+        a.commit();
+        b.set_entry("fs", "path", "from B").unwrap();
+        b.commit();
+
+        // Exchange deltas both directions.
+        let a_delta = a.export_from(&b.version()).unwrap();
+        let b_delta = b.export_from(&a.version()).unwrap();
+        b.import(&a_delta).unwrap();
+        a.import(&b_delta).unwrap();
+
+        // LWW: both converge on the SAME single deterministic winner.
+        let winner = a.get_entry("fs", "path");
+        assert_eq!(winner, b.get_entry("fs", "path"));
+        assert!(
+            winner == Some("from A".to_string()) || winner == Some("from B".to_string()),
+            "winner must be one of the two writes: {winner:?}"
+        );
+    }
+
+    #[test]
+    fn text_and_map_coexist_in_one_document_and_sync_together() {
+        let a = Document::new(1).unwrap();
+        let b = Document::new(2).unwrap();
+
+        // Both a text container and a map entry live in the same doc.
+        a.insert_text("note", 0, "hello").unwrap();
+        a.set_entry("fs", "path", "live").unwrap();
+        a.commit();
+
+        // A single delta carries both containers to b.
+        let delta = a.export_from(&b.version()).unwrap();
+        b.import(&delta).unwrap();
+
+        assert_eq!(b.text("note"), "hello");
+        assert_eq!(b.get_entry("fs", "path"), Some("live".to_string()));
+    }
+
+    #[test]
+    fn map_entries_persist_through_snapshot() {
+        let a = Document::new(1).unwrap();
+        a.insert_text("note", 0, "persisted").unwrap();
+        a.set_entry("fs", "path", "kept").unwrap();
+        a.commit();
+        let snap = a.snapshot().unwrap();
+
+        let b = Document::from_snapshot(2, &snap).unwrap();
+        assert_eq!(b.text("note"), "persisted");
+        assert_eq!(b.get_entry("fs", "path"), Some("kept".to_string()));
     }
 
     #[test]
