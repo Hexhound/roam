@@ -626,6 +626,57 @@ fn create_propagates_a_to_b_and_c() {
 }
 
 // ---------------------------------------------------------------------------
+// F1.1b — edit on B reaches an ORIGINAL holder C's DISK (not a passive
+// newcomer). Regression for the core reproject bug: C already holds the synced
+// file on disk; a remote edit advances C's container via sync, but before the
+// fix C's Step-1 import was a no-op and Step-3 skipped Live+present, so C's DISK
+// stayed stale forever. With the fix scan reprojects the merged container.
+// ---------------------------------------------------------------------------
+#[test]
+fn edit_on_b_reaches_original_holder_c_disk() {
+    let a = Device::new();
+    let b = Device::new();
+    let c = Device::new();
+    let rel = "note.md";
+    let container = cid(&a, rel);
+
+    // A creates the file; all three converge holding "hello\n" ON DISK — C is a
+    // genuine original holder here, not a late joiner.
+    import(&a, rel, "hello\n");
+    for _ in 0..3 {
+        round3(&a, &b, &c);
+    }
+    assert_eq!(std::fs::read(c.vault_file(rel)).unwrap(), b"hello\n");
+    assert_eq!(std::fs::read(b.vault_file(rel)).unwrap(), b"hello\n");
+
+    // B edits the shared file.
+    import(&b, rel, "hello world\n");
+    for _ in 0..3 {
+        round3(&a, &b, &c);
+    }
+
+    // C (and A), original holders, now reflect B's edit ON DISK.
+    let final_state = converged3(&a, &b, &c, rel, &container);
+    assert_eq!(final_state.disk.as_deref(), Some(&b"hello world\n"[..]));
+    assert_eq!(final_state.text, "hello world\n");
+    assert_eq!(final_state.status, Some(EntryStatus::Live));
+    assert_eq!(
+        std::fs::read(c.vault_file(rel)).unwrap(),
+        b"hello world\n",
+        "B's edit must reach original holder C's disk"
+    );
+
+    // Stability across an extra round.
+    let baseline = converged3(&a, &b, &c, rel, &container);
+    round3(&a, &b, &c);
+    assert_eq!(
+        converged3(&a, &b, &c, rel, &container),
+        baseline,
+        "3-device edit must be stable across an extra round"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // F1.2 — delete on A (no concurrent edit) → gone on B and C, Tombstoned on all.
 // ---------------------------------------------------------------------------
 #[test]

@@ -463,12 +463,39 @@ impl FolderBridge {
             let file_present = present.contains(&key);
             match entry.status {
                 EntryStatus::Live => {
-                    // Remote-new: Live entry with no local file and no sidecar
-                    // (never seen here). Present files were handled in Step 1;
-                    // absent-with-sidecar became a tombstone in Step 2.
                     if !file_present && !sidecar_path(&file).exists() {
+                        // Remote-new: Live entry with no local file and no
+                        // sidecar (never seen here). Absent-with-sidecar became
+                        // a tombstone in Step 2.
                         let outcome = self.project_file(store, &file)?;
                         outcomes.push((file, outcome));
+                    } else if file_present {
+                        // Live + present: reconcile the CRDT -> disk direction.
+                        // Step 1 already imported (and OT-rebased) any local disk
+                        // edits, so for a present text file the disk equals the
+                        // sidecar baseline (clean) — meaning if a remote edit has
+                        // advanced the container past disk, `project_file` writes
+                        // the merged text and advances the baseline WITHOUT
+                        // tripping the dirty guard. Its internal no-op guard skips
+                        // unchanged files, keeping this idempotent (after a
+                        // projection disk == container == baseline, so a second
+                        // scan is a no-op and there is no project<->import
+                        // oscillation).
+                        match self.project_file(store, &file) {
+                            // Only report an ACTUAL reprojection; the steady-state
+                            // no-op (guard skips, `changed: false`) must not add a
+                            // duplicate outcome alongside Step 1's import.
+                            Ok(outcome) if outcome.changed => {
+                                outcomes.push((file, outcome))
+                            }
+                            Ok(_) => {}
+                            // Residual safety: if some path left disk dirty (e.g.
+                            // Step 1's import was skipped), the disk carries
+                            // un-imported local edits. Keep it as-is rather than
+                            // clobber — mirror the resurrection branch's handling.
+                            Err(FilesError::DirtyFile(_)) => {}
+                            Err(err) => return Err(err),
+                        }
                     }
                 }
                 EntryStatus::Tombstoned => {
@@ -1603,6 +1630,78 @@ mod tests {
         b.scan(&mut store).unwrap();
         assert_eq!(fileset_snapshot(&store), before);
         assert_eq!(std::fs::read(&file).unwrap(), disk_before);
+    }
+
+    #[test]
+    fn scan_reprojects_remotely_edited_present_file() {
+        // Core convergence bug: this device holds a synced file on disk (Live
+        // entry + sidecar). A remote peer edits it and the edit merges into the
+        // CONTAINER via sync, but this device's DISK stays stale. Step 1's
+        // import is a no-op (disk unchanged), so scan must reconcile the
+        // CRDT->disk direction for a Live+present entry and reproject.
+        let dir = tempdir().unwrap();
+        let (b, mut store) = bridge(dir.path());
+        let vault = dir.path().join("vault");
+        let file = vault.join("x.md");
+        std::fs::write(&file, "hello\n").unwrap();
+        b.import_file(&mut store, &file).unwrap();
+        let container = container_id(&vault, &file).unwrap();
+
+        // A remote edit merges into the container after the last local sync.
+        // Disk is untouched and still holds the old "hello\n".
+        store.edit_text(&container, 5, " world").unwrap();
+        assert_eq!(store.text(&container), "hello world\n");
+        assert_eq!(std::fs::read(&file).unwrap(), b"hello\n");
+
+        b.scan(&mut store).unwrap();
+
+        // Disk now reflects the remote edit; baseline advanced; entry Live.
+        assert_eq!(std::fs::read(&file).unwrap(), b"hello world\n");
+        let sidecar = Sidecar::load(&file).unwrap().unwrap();
+        assert_eq!(sidecar.last_synced_text, "hello world\n");
+        assert_eq!(
+            fileset_entry(&store, &container).unwrap().status,
+            EntryStatus::Live
+        );
+
+        // Idempotent: a second scan makes no further disk/entry mutation.
+        let before = fileset_snapshot(&store);
+        let disk_before = std::fs::read(&file).unwrap();
+        b.scan(&mut store).unwrap();
+        assert_eq!(fileset_snapshot(&store), before);
+        assert_eq!(std::fs::read(&file).unwrap(), disk_before);
+    }
+
+    #[test]
+    fn scan_merges_remote_and_uncommitted_local_edits_on_disk() {
+        // A dirty local disk edit (not yet imported) AND a remote edit merged
+        // into the container. Step 1 imports the local edit (OT rebase folds it
+        // into the container), then Step 3 reprojects the merged container to
+        // disk. BOTH edits must survive — no data loss, no clobber.
+        let dir = tempdir().unwrap();
+        let (b, mut store) = bridge(dir.path());
+        let vault = dir.path().join("vault");
+        let file = vault.join("x.md");
+        std::fs::write(&file, "hello\n").unwrap();
+        b.import_file(&mut store, &file).unwrap();
+        let container = container_id(&vault, &file).unwrap();
+
+        // Remote edit merges into the container: "hello\n" -> "hello world\n".
+        store.edit_text(&container, 5, " world").unwrap();
+        assert_eq!(store.text(&container), "hello world\n");
+
+        // Local un-imported disk edit: prepend "LOCAL " -> "LOCAL hello\n".
+        std::fs::write(&file, "LOCAL hello\n").unwrap();
+
+        b.scan(&mut store).unwrap();
+
+        // Both edits survive as the OT merge on disk.
+        let disk = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(disk, "LOCAL hello world\n");
+        // Converged: disk == container == baseline.
+        assert_eq!(store.text(&container), disk);
+        let sidecar = Sidecar::load(&file).unwrap().unwrap();
+        assert_eq!(sidecar.last_synced_text, disk);
     }
 
     #[test]
