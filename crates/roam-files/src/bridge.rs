@@ -123,6 +123,8 @@ impl FolderBridge {
         };
 
         if on_disk.as_deref() == Some(text.as_str()) {
+            // A sidecar parse error is intentionally surfaced rather than
+            // treated as "unsynced" — a corrupt sidecar is worth reporting.
             if let Some(sidecar) = Sidecar::load(file)? {
                 if sidecar.last_synced_text == text {
                     return Ok(SyncOutcome {
@@ -188,7 +190,11 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), FilesError> {
     temp.push(".tmp");
     let temp = PathBuf::from(temp);
 
-    std::fs::write(&temp, bytes)?;
+    if let Err(err) = std::fs::write(&temp, bytes) {
+        // Best-effort cleanup so a partial/failed write leaves no debris.
+        let _ = std::fs::remove_file(&temp);
+        return Err(FilesError::Io(err));
+    }
     match std::fs::rename(&temp, path) {
         Ok(()) => Ok(()),
         Err(err) => {
@@ -202,6 +208,12 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), FilesError> {
 /// Recursively collect `*.md`/`*.org` files under `dir` into `out`, skipping
 /// sidecar files (any other extension, including `.roammeta`). A missing
 /// directory yields no files rather than an error.
+///
+/// Symlinks are skipped entirely (neither descended into nor imported): a
+/// symlinked directory that points at an ancestor (e.g. `vault/loop -> vault`)
+/// would otherwise send the walk into an infinite loop. `DirEntry::file_type`
+/// reports the link itself (it does not traverse), so `is_symlink()` catches
+/// these without a follow.
 fn collect_vault_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), FilesError> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -211,8 +223,12 @@ fn collect_vault_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), FilesEr
 
     for entry in entries {
         let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            continue;
+        }
         let path = entry.path();
-        if entry.file_type()?.is_dir() {
+        if file_type.is_dir() {
             collect_vault_files(&path, out)?;
         } else if is_vault_file(&path) {
             out.push(path);
@@ -572,5 +588,24 @@ mod tests {
         assert_eq!(outcomes[0].0, good);
         let container = container_id(&vault, &good).unwrap();
         assert_eq!(b.store().text(&container), "good");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_does_not_recurse_into_symlink_cycle() {
+        let dir = tempdir().unwrap();
+        let mut b = bridge(dir.path());
+        let vault = dir.path().join("vault");
+        let real = vault.join("real.md");
+        std::fs::write(&real, "real body").unwrap();
+        // A directory symlink pointing back at the vault: descending it would
+        // loop forever. scan must terminate.
+        std::os::unix::fs::symlink(&vault, vault.join("loop")).unwrap();
+
+        let outcomes = b.scan().unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].0, real);
+        let container = container_id(&vault, &real).unwrap();
+        assert_eq!(b.store().text(&container), "real body");
     }
 }
