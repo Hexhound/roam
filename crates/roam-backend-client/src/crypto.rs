@@ -93,7 +93,10 @@ mod tests {
         assert_eq!(key().bucket_id(), key().bucket_id());
         assert_ne!(key().bucket_id(), VaultKey([8u8; 32]).bucket_id());
         // url-safe, no path separators
-        assert!(key().bucket_id().chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+        assert!(key()
+            .bucket_id()
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
     }
 
     #[test]

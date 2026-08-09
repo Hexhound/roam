@@ -1,5 +1,5 @@
 use crate::crypto::VaultKey;
-use roam_storage::{Store, StorageError};
+use roam_storage::{StorageError, Store};
 
 /// Split a per-peer op-log into its individual JSONL line-entries. Each returned
 /// chunk includes its trailing `\n` so that [`reassemble_log`] is a byte-exact
@@ -75,7 +75,10 @@ mod tests {
     fn splits_a_peer_log_into_line_entries() {
         let log = b"{\"a\":1}\n{\"b\":2}\n";
         let lines = split_log_lines(log);
-        assert_eq!(lines, vec![b"{\"a\":1}\n".to_vec(), b"{\"b\":2}\n".to_vec()]);
+        assert_eq!(
+            lines,
+            vec![b"{\"a\":1}\n".to_vec(), b"{\"b\":2}\n".to_vec()]
+        );
     }
 
     #[test]

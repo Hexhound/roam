@@ -63,18 +63,31 @@ async fn b_converges_via_backend_only_then_race_is_noop() {
 
     let a_dir = tempfile::tempdir().unwrap();
     let b_dir = tempfile::tempdir().unwrap();
-    let a = Arc::new(Mutex::new(Store::open(a_dir.path(), Identity::generate()).unwrap()));
-    let b = Arc::new(Mutex::new(Store::open(b_dir.path(), Identity::generate()).unwrap()));
+    let a = Arc::new(Mutex::new(
+        Store::open(a_dir.path(), Identity::generate()).unwrap(),
+    ));
+    let b = Arc::new(Mutex::new(
+        Store::open(b_dir.path(), Identity::generate()).unwrap(),
+    ));
 
-    let (ap, ak) = { let g = a.lock().await; (g.peer_id(), g.identity_verifying_bytes()) };
-    let (bp, bk) = { let g = b.lock().await; (g.peer_id(), g.identity_verifying_bytes()) };
+    let (ap, ak) = {
+        let g = a.lock().await;
+        (g.peer_id(), g.identity_verifying_bytes())
+    };
+    let (bp, bk) = {
+        let g = b.lock().await;
+        (g.peer_id(), g.identity_verifying_bytes())
+    };
     a.lock().await.add_peer(bp, bk).unwrap();
     b.lock().await.add_peer(ap, ak).unwrap();
 
     a.lock().await.set_entry("files", "k", "v1").unwrap();
     reconcile_once(&a, &backend, &key).await.unwrap();
     reconcile_once(&b, &backend, &key).await.unwrap();
-    assert_eq!(b.lock().await.get_entry("files", "k"), Some("v1".to_string()));
+    assert_eq!(
+        b.lock().await.get_entry("files", "k"),
+        Some("v1".to_string())
+    );
 
     // Simulate iroh ALSO delivering A's ops to B (same bytes): import directly, then
     // reconcile — the store must not change and no dup is created.
@@ -83,5 +96,9 @@ async fn b_converges_via_backend_only_then_race_is_noop() {
     let before = b.lock().await.doc_version_bytes();
     b.lock().await.apply_peer_ops(ap, &a_vkey, &a_log).unwrap();
     reconcile_once(&b, &backend, &key).await.unwrap();
-    assert_eq!(b.lock().await.doc_version_bytes(), before, "idempotent: iroh+backend deliver once");
+    assert_eq!(
+        b.lock().await.doc_version_bytes(),
+        before,
+        "idempotent: iroh+backend deliver once"
+    );
 }
