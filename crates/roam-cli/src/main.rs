@@ -191,6 +191,9 @@ async fn pair(vault: &Path, identity_path: &Path, token: String) -> Result<()> {
 /// legacy interactive "note" REPL runs (backward compatible). Both share the
 /// transport/engine setup via [`setup_engine`].
 async fn sync(vault: &Path, identity_path: &Path, folder: Option<PathBuf>) -> Result<()> {
+    // Honor Ctrl-C from a dedicated task so the signal interrupts even a
+    // long-running dial/scan inside the select loop (see `spawn_ctrl_c_exit`).
+    spawn_ctrl_c_exit();
     let engine = setup_engine(vault, identity_path).await?;
     match folder {
         Some(folder) => sync_folder(engine, vault, folder).await,
@@ -401,16 +404,6 @@ async fn sync_folder(
         notified.as_mut().enable();
 
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                println!("\nstopping.");
-                // Exit the process directly instead of unwinding to `main` and
-                // letting the tokio runtime drop. iroh spawns background driver
-                // tasks/threads (magicsock, relay, discovery) that do not all wind
-                // down on drop, so `Runtime::drop` blocks and the daemon hangs
-                // after printing "stopping." The store is committed+persisted on
-                // every scan/apply, so a hard exit loses no state.
-                std::process::exit(0);
-            }
             // Local-change poll: guaranteed fallback for both directions. Runs a
             // FULL scan (`None` hint) so a missed/coalesced-away watcher event
             // (editor atomic-rename quirks, inotify overflow) is always caught.
@@ -558,6 +551,30 @@ fn is_benign_scan_error(err: &FilesError) -> bool {
     matches!(err, FilesError::DirtyFile(_))
 }
 
+/// Install a Ctrl-C handler that hard-exits from a DEDICATED task.
+///
+/// A `tokio::select!` only races its branch GUARDS, not the futures the winning
+/// branch then awaits. So an in-loop `ctrl_c()` branch cannot interrupt a
+/// long-running branch body already in progress — e.g. the ~10s iroh dial
+/// timeout inside `reconnect_active`, or a `spawn_blocking` scan. During that
+/// window the loop is not awaiting `ctrl_c()` at all, so the daemon ignores
+/// the signal until the dial finally returns. A separate task is always being
+/// polled and honors the signal immediately.
+///
+/// The exit is hard (`process::exit`) rather than an unwind to `main`: iroh
+/// spawns background driver tasks/threads (magicsock, relay, discovery) that do
+/// not all wind down on drop, so `Runtime::drop` blocks and the daemon would
+/// hang after "stopping." The store is committed+persisted on every scan/apply,
+/// so a hard exit loses no state.
+fn spawn_ctrl_c_exit() {
+    tokio::spawn(async {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            println!("\nstopping.");
+            std::process::exit(0);
+        }
+    });
+}
+
 /// The legacy interactive "note" REPL (backward compatible). Type lines to append
 /// to the shared "note" container and watch the peer's edits land.
 async fn sync_repl(engine: Arc<Engine<IrohTransport>>) -> Result<()> {
@@ -575,16 +592,6 @@ async fn sync_repl(engine: Arc<Engine<IrohTransport>>) -> Result<()> {
 
     loop {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                println!("\nstopping.");
-                // Exit the process directly instead of unwinding to `main` and
-                // letting the tokio runtime drop. iroh spawns background driver
-                // tasks/threads (magicsock, relay, discovery) that do not all wind
-                // down on drop, so `Runtime::drop` blocks and the daemon hangs
-                // after printing "stopping." The store is committed+persisted on
-                // every scan/apply, so a hard exit loses no state.
-                std::process::exit(0);
-            }
             // stdin line -> append at the current end of the note.
             //
             // Concurrency note: two machines appending at their local
