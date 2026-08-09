@@ -24,4 +24,15 @@ pub trait Transport: Send + Sync {
 
     /// Inbound frames from all peers, demuxed with their peer id.
     fn incoming(&self) -> BoxStream<'static, (u64, Frame)>;
+
+    /// Learn how to reach `peer` (its node key). Idempotent. Default: no-op.
+    async fn add_route(&self, peer: u64, key: [u8; 32]) {
+        let _ = (peer, key);
+    }
+
+    /// Forget `peer` (revoked / gone): stop dialing it and drop any cached
+    /// connection. Default: no-op.
+    async fn remove_route(&self, peer: u64) {
+        let _ = peer;
+    }
 }

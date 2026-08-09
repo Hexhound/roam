@@ -221,6 +221,19 @@ impl Transport for IrohTransport {
         })
         .boxed()
     }
+
+    async fn add_route(&self, peer: u64, key: [u8; 32]) {
+        self.routes.lock().unwrap().insert(peer, key);
+    }
+
+    async fn remove_route(&self, peer: u64) {
+        // Drop the route and any seeded direct address so a later `dial` cannot
+        // resolve the peer, then tear down the cached send stream so the revoked
+        // peer's live stream is closed.
+        self.routes.lock().unwrap().remove(&peer);
+        self.addrs.lock().unwrap().remove(&peer);
+        self.conns.lock().await.remove(&peer);
+    }
 }
 
 /// Handle one inbound connection: resolve its peer id, accept the bi stream,
@@ -340,5 +353,56 @@ mod tests {
                 .unwrap();
         assert_eq!(from, id_a.peer_id());
         assert_eq!(frame, Frame::Ping);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn add_route_makes_a_peer_dialable_and_remove_route_undoes_it() {
+        let id = Identity::generate();
+        let peer = Identity::generate();
+        // Spawn with EMPTY routes: the peer is unknown to the transport.
+        let transport = IrohTransport::spawn(&id, HashMap::new()).await.unwrap();
+
+        // No route yet → dial is refused immediately with Unreachable.
+        assert!(matches!(
+            transport.dial(peer.peer_id()).await,
+            Err(TransportError::Unreachable(_))
+        ));
+
+        // Learn the route: dial now resolves the peer and attempts a real connect
+        // (which never completes here — no address is seeded and discovery finds
+        // nothing), so it must NOT be an immediate Unreachable. A bounded timeout
+        // distinguishes "got past route resolution" (pending or a slow connect
+        // error) from the instant Unreachable refusal.
+        transport
+            .add_route(peer.peer_id(), peer.verifying_key().to_bytes())
+            .await;
+        let dial = tokio::time::timeout(
+            Duration::from_millis(300),
+            transport.dial(peer.peer_id()),
+        )
+        .await;
+        match dial {
+            // Still attempting to connect ⇒ the route resolved. Good.
+            Err(_elapsed) => {}
+            Ok(Err(TransportError::Unreachable(_))) => {
+                panic!("route was added but dial still returned Unreachable")
+            }
+            // A non-Unreachable connect error also means we got past resolution.
+            Ok(other) => {
+                let _ = other;
+            }
+        }
+
+        // Forget the route: dial is refused with Unreachable again.
+        transport.remove_route(peer.peer_id()).await;
+        let after = tokio::time::timeout(
+            Duration::from_millis(300),
+            transport.dial(peer.peer_id()),
+        )
+        .await;
+        assert!(
+            matches!(after, Ok(Err(TransportError::Unreachable(_)))),
+            "remove_route did not undo the route: {after:?}"
+        );
     }
 }

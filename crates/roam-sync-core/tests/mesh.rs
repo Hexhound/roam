@@ -47,6 +47,56 @@ async fn c_learns_b_transitively_through_a() {
 }
 
 #[tokio::test]
+async fn transitive_learn_adds_a_dynamic_route_under_strict_routing() {
+    // Strict-routing transitive mesh: each endpoint can only reach peers in its
+    // seeded `known` set, which grows solely via `add_route`. B is the hub —
+    // paired with A and with C — but A and C are NOT directly paired. A and C
+    // learn each other only transitively via B's roster gossip. For A to converge
+    // with a C edit, A must dial C, which the strict transport permits only if the
+    // engine called `add_route(C)` when it learned C (and C likewise for A).
+    let board = MemorySwitchboard::new();
+    let vault = VaultId::generate();
+    let (da, db, dc) = (tempdir().unwrap(), tempdir().unwrap(), tempdir().unwrap());
+    let (ia, ib, ic) = (Identity::generate(), Identity::generate(), Identity::generate());
+
+    let mut sa = Store::open(da.path(), ia.clone()).unwrap();
+    let mut sb = Store::open(db.path(), ib.clone()).unwrap();
+    let mut sc = Store::open(dc.path(), ic.clone()).unwrap();
+    // B (the hub) vouches for A and C; A and C each only know B.
+    sb.add_peer(ia.peer_id(), ia.verifying_key().to_bytes()).unwrap();
+    sb.add_peer(ic.peer_id(), ic.verifying_key().to_bytes()).unwrap();
+    sa.add_peer(ib.peer_id(), ib.verifying_key().to_bytes()).unwrap();
+    sc.add_peer(ib.peer_id(), ib.verifying_key().to_bytes()).unwrap();
+
+    // Strict routes: A and C initially reach only B; B reaches A and C. A and C
+    // must learn to reach each other dynamically for the C edit to arrive.
+    let ta = board.strict_endpoint(ia.peer_id(), &[ib.peer_id()]);
+    let tb = board.strict_endpoint(ib.peer_id(), &[ia.peer_id(), ic.peer_id()]);
+    let tc = board.strict_endpoint(ic.peer_id(), &[ib.peer_id()]);
+
+    let ea = Arc::new(Engine::new(ia.clone(), vault, sa, Arc::new(ta)));
+    let eb = Arc::new(Engine::new(ib.clone(), vault, sb, Arc::new(tb)));
+    let ec = Arc::new(Engine::new(ic.clone(), vault, sc, Arc::new(tc)));
+    tokio::spawn(ea.clone().run());
+    tokio::spawn(eb.clone().run());
+    tokio::spawn(ec.clone().run());
+
+    ea.connect(ib.peer_id()).await.unwrap();
+    ec.connect(ib.peer_id()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // C writes; the edit must reach A only if A learned a route to C (and C to A).
+    ec.edit_text("note", 0, "C-writes").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert_eq!(
+        ea.store().lock().await.text("note"),
+        "C-writes",
+        "A never learned a dynamic route to C, so the strict transport refused the dial"
+    );
+}
+
+#[tokio::test]
 async fn revoked_peer_edits_stop_propagating() {
     let board = MemorySwitchboard::new();
     let vault = VaultId::generate();

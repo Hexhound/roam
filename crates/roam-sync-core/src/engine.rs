@@ -104,6 +104,8 @@ impl<T: Transport + 'static> Engine<T> {
             let mut store = self.store.lock().await;
             store.add_peer(peer, key)?;
         }
+        // Teach the transport how to reach the new device before we gossip.
+        self.transport.add_route(peer, key).await;
         self.broadcast_own_roster().await;
         Ok(())
     }
@@ -119,6 +121,9 @@ impl<T: Transport + 'static> Engine<T> {
             let mut store = self.store.lock().await;
             store.revoke_peer(peer, key)?;
         }
+        // Forget the route so we stop dialing (and tear down any cached
+        // connection to) the revoked device.
+        self.transport.remove_route(peer).await;
         self.broadcast_own_roster().await;
         Ok(())
     }
@@ -157,6 +162,11 @@ impl<T: Transport + 'static> Engine<T> {
                 if vault != self.vault.0 {
                     return Ok(());
                 }
+                // Read-side revoke gate: never serve a bundle to a peer we do not
+                // currently vouch for as Active (spec §9.6).
+                if !self.is_active(peer).await {
+                    return Ok(());
+                }
                 // Ensure we track an offset for this peer (default: nothing sent).
                 self.ensure_offset(peer).await;
 
@@ -175,6 +185,10 @@ impl<T: Transport + 'static> Engine<T> {
                 // dedups on import. We never answer Ops with Have, so there is no
                 // ping-pong.
                 if roam_crdt::Version::from_bytes(&doc_version).is_err() {
+                    return Ok(());
+                }
+                // Read-side revoke gate: a revoked peer must not pull the document.
+                if !self.is_active(peer).await {
                     return Ok(());
                 }
                 self.push_logs(peer).await;
@@ -207,7 +221,7 @@ impl<T: Transport + 'static> Engine<T> {
                 // any newly-Active peer we are not yet connected to. We DROP the
                 // guard before dialing, because `connect` itself sends frames and
                 // must never run while holding the store lock (deadlock rule).
-                let new_peers: Vec<u64> = {
+                let new_peers: Vec<(u64, [u8; 32])> = {
                     let mut store = self.store.lock().await;
                     if let Err(err) = store.import_roster(author, &key, jsonl) {
                         // Verify/shrink failures: drop the frame, never crash.
@@ -223,22 +237,29 @@ impl<T: Transport + 'static> Engine<T> {
                                     && p.peer_id != self.peer_id()
                                     && !connected.contains(&p.peer_id)
                             })
-                            .map(|p| p.peer_id)
+                            .map(|p| (p.peer_id, p.verifying_key))
                             .collect()
                     }
                 };
-                // Transitive mesh: dial every freshly-learned peer. A peer the
-                // transport cannot reach (e.g. an offline sibling) returns an
-                // error from `connect` — treat it as non-fatal so one unreachable
-                // peer does not abort the loop. The `!connected` guard above
-                // prevents re-connect loops and self-connects.
-                for new_peer in new_peers {
+                // Transitive mesh: teach the transport how to reach every
+                // freshly-learned peer, then dial it. Route + dial happen AFTER
+                // the store guard is dropped (no lock held across an await). A
+                // peer the transport cannot reach (e.g. an offline sibling)
+                // returns an error from `connect` — treat it as non-fatal so one
+                // unreachable peer does not abort the loop. The `!connected` guard
+                // above prevents re-connect loops and self-connects.
+                for (new_peer, new_key) in new_peers {
+                    self.transport.add_route(new_peer, new_key).await;
                     if let Err(err) = self.connect(new_peer).await {
                         let _ = err;
                     }
                 }
             }
             Frame::RosterHave { .. } => {
+                // Read-side revoke gate: a revoked peer must not pull our roster.
+                if !self.is_active(peer).await {
+                    return Ok(());
+                }
                 // Reply with our whole roster; the peer merges + dedups.
                 let own_roster = {
                     let store = self.store.lock().await;
@@ -373,6 +394,18 @@ impl<T: Transport + 'static> Engine<T> {
     /// not crash the engine loop).
     async fn send(&self, peer: u64, frame: Frame) {
         let _ = self.transport.send(peer, frame).await;
+    }
+
+    /// Whether `peer` is currently listed in our roster with
+    /// [`PeerStatus::Active`]. Note `key_for` returns `Some` for a *Revoked* peer
+    /// too (the roster still lists it), so the read-side gate must check the
+    /// status specifically, not mere presence.
+    async fn is_active(&self, peer: u64) -> bool {
+        let store = self.store.lock().await;
+        store
+            .roster()
+            .into_iter()
+            .any(|p| p.peer_id == peer && p.status == PeerStatus::Active)
     }
 
     // Helper: verifying key for a peer from the roster.

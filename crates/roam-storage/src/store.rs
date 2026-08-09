@@ -220,12 +220,19 @@ impl Store {
 
     /// Apply an appended chunk of `author`'s oplog received from a peer.
     ///
-    /// The wire may carry only a suffix, so we concatenate `appended` onto the
-    /// bytes we already hold for `ops/ops-<author>.jsonl` and hand the whole log
-    /// to [`Store::import_peer`], which verifies, refuses to shrink, dedups, and
-    /// advances `persisted`. Because logs are append-only and loro dedups on
-    /// import, resending overlapping suffixes is safe. We never import our own
-    /// ops as a peer.
+    /// These logs are append-only JSONL: earlier bytes never change, so the
+    /// correct log is byte-prefix-consistent. The engine ships the author's FULL
+    /// log on every handshake/`Have` (not just a suffix), so we merge the incoming
+    /// `appended` bytes against what we already hold prefix-aware, avoiding
+    /// doubling the on-disk `ops/ops-<author>.jsonl` on every reconnect:
+    /// - `appended` starts with ours → take `appended` (first time, since empty
+    ///   is a prefix of everything, or a full/longer resend);
+    /// - ours starts with `appended` → keep ours (stale/duplicate prefix);
+    /// - otherwise                   → `stored ++ appended` (genuine suffix).
+    ///
+    /// The resulting whole log goes to [`Store::import_peer`], which verifies,
+    /// refuses to shrink, and advances `persisted`. We never import our own ops
+    /// as a peer.
     pub fn apply_peer_ops(
         &mut self,
         author: u64,
@@ -235,8 +242,20 @@ impl Store {
         if author == self.identity.peer_id() {
             return Ok(());
         }
-        let mut whole = self.export_peer_log(author)?;
-        whole.extend_from_slice(appended);
+        let stored = self.export_peer_log(author)?;
+        let whole = if appended.starts_with(&stored) {
+            // First time (empty stored is a prefix of everything) or a full/longer
+            // resend: take `appended`, avoiding a duplicate concatenation.
+            appended.to_vec()
+        } else if stored.starts_with(appended) {
+            // Stale/duplicate prefix: keep the longer bytes we already hold.
+            stored
+        } else {
+            // Genuine suffix continuation (live-push): append it.
+            let mut whole = stored;
+            whole.extend_from_slice(appended);
+            whole
+        };
         self.import_peer(author, key, whole)
     }
 
@@ -721,6 +740,115 @@ mod tests {
         // Importing our own author id via apply_peer_ops is a no-op.
         a.apply_peer_ops(a.peer_id(), &id_b.verifying_key(), &[1, 2, 3])
             .unwrap();
+    }
+
+    #[test]
+    fn apply_peer_ops_full_resend_does_not_duplicate_on_disk() {
+        // The engine ships the author's FULL log on every handshake/Have. A naive
+        // concatenate would double the on-disk log each time; a prefix-aware merge
+        // must recognize the full resend and leave the stored bytes unchanged.
+        let dir_a = tempdir().unwrap();
+        let dir_b = tempdir().unwrap();
+        let id_a = Identity::generate();
+        let id_b = Identity::generate();
+
+        let mut a = Store::open(dir_a.path(), id_a).unwrap();
+        let mut b = Store::open(dir_b.path(), id_b.clone()).unwrap();
+        a.add_peer(id_b.peer_id(), id_b.verifying_key().to_bytes())
+            .unwrap();
+
+        b.edit_text("note", 0, "one").unwrap();
+        b.edit_text("note", 3, "two").unwrap();
+        let full = b.export_own_log().unwrap();
+
+        a.apply_peer_ops(id_b.peer_id(), &id_b.verifying_key(), &full)
+            .unwrap();
+        let after_first = a.export_peer_log(id_b.peer_id()).unwrap().len();
+
+        // Apply the SAME full log again: a full resend must not grow disk.
+        a.apply_peer_ops(id_b.peer_id(), &id_b.verifying_key(), &full)
+            .unwrap();
+        let after_second = a.export_peer_log(id_b.peer_id()).unwrap().len();
+
+        assert_eq!(
+            after_first, after_second,
+            "full resend duplicated the stored peer log on disk"
+        );
+        assert_eq!(after_first, full.len(), "stored log is not exactly one copy");
+        assert_eq!(a.text("note"), "onetwo");
+    }
+
+    #[test]
+    fn apply_peer_ops_appends_a_genuine_suffix() {
+        // Guard against over-correcting the prefix-aware merge into dropping real
+        // live-push continuations: a genuine suffix (bytes beyond what we hold)
+        // must still be appended.
+        let dir_a = tempdir().unwrap();
+        let dir_b = tempdir().unwrap();
+        let id_a = Identity::generate();
+        let id_b = Identity::generate();
+
+        let mut a = Store::open(dir_a.path(), id_a).unwrap();
+        let mut b = Store::open(dir_b.path(), id_b.clone()).unwrap();
+        a.add_peer(id_b.peer_id(), id_b.verifying_key().to_bytes())
+            .unwrap();
+
+        // First: the full 2-entry log.
+        b.edit_text("note", 0, "one").unwrap();
+        b.edit_text("note", 3, "two").unwrap();
+        let full_two = b.export_own_log().unwrap();
+        a.apply_peer_ops(id_b.peer_id(), &id_b.verifying_key(), &full_two)
+            .unwrap();
+
+        // Then: only the suffix bytes for a later entry (entry 2).
+        b.edit_text("note", 6, "six").unwrap();
+        let full_three = b.export_own_log().unwrap();
+        let suffix = &full_three[full_two.len()..];
+        a.apply_peer_ops(id_b.peer_id(), &id_b.verifying_key(), suffix)
+            .unwrap();
+
+        assert_eq!(
+            a.export_peer_log(id_b.peer_id()).unwrap(),
+            full_three,
+            "genuine suffix was not appended to the stored log"
+        );
+        assert_eq!(a.text("note"), "onetwosix");
+    }
+
+    #[test]
+    fn apply_peer_ops_ignores_a_stale_prefix() {
+        // A stale/duplicate resend (a prefix of what we already hold) must be
+        // dropped: no shrink and no duplication.
+        let dir_a = tempdir().unwrap();
+        let dir_b = tempdir().unwrap();
+        let id_a = Identity::generate();
+        let id_b = Identity::generate();
+
+        let mut a = Store::open(dir_a.path(), id_a).unwrap();
+        let mut b = Store::open(dir_b.path(), id_b.clone()).unwrap();
+        a.add_peer(id_b.peer_id(), id_b.verifying_key().to_bytes())
+            .unwrap();
+
+        b.edit_text("note", 0, "one").unwrap();
+        let first = b.export_own_log().unwrap(); // 1-entry prefix
+        b.edit_text("note", 3, "two").unwrap();
+        b.edit_text("note", 6, "six").unwrap();
+        let full = b.export_own_log().unwrap(); // 3-entry log
+
+        a.apply_peer_ops(id_b.peer_id(), &id_b.verifying_key(), &full)
+            .unwrap();
+        let after_full = a.export_peer_log(id_b.peer_id()).unwrap().len();
+
+        // Apply the older 1-entry prefix: must be a no-op on disk.
+        a.apply_peer_ops(id_b.peer_id(), &id_b.verifying_key(), &first)
+            .unwrap();
+        let after_stale = a.export_peer_log(id_b.peer_id()).unwrap().len();
+
+        assert_eq!(
+            after_full, after_stale,
+            "stale prefix resend altered the stored peer log length"
+        );
+        assert_eq!(a.text("note"), "onetwosix");
     }
 
     #[test]
