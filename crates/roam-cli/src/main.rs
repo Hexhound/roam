@@ -401,10 +401,12 @@ async fn sync_folder(engine: Arc<Engine<IrohTransport>>, folder: PathBuf) -> Res
             }
             // Periodic self-healing reconnect to any active peer (see above).
             _ = reconnect.tick() => {
+                roam_sync_core::dlog!("cli: reconnect tick");
                 engine.reconnect_active().await;
             }
             // Inbound remote change: project remote state to disk promptly.
             _ = &mut notified => {
+                roam_sync_core::dlog!("cli: remote change signal → scanning + projecting");
                 scan_and_maybe_flush(&engine, &bridge, None).await;
             }
             // Local filesystem change (low latency). Debounce the burst: collect

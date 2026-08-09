@@ -37,6 +37,20 @@ impl Frame {
     pub fn decode(bytes: &[u8]) -> Result<Frame, postcard::Error> {
         postcard::from_bytes(bytes)
     }
+
+    /// A short static label for diagnostics/logging (no payload).
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Frame::Hello { .. } => "Hello",
+            Frame::Have { .. } => "Have",
+            Frame::Ops { .. } => "Ops",
+            Frame::RosterHave { .. } => "RosterHave",
+            Frame::RosterOps { .. } => "RosterOps",
+            Frame::Ping => "Ping",
+            Frame::BlobWant { .. } => "BlobWant",
+            Frame::BlobData { .. } => "BlobData",
+        }
+    }
 }
 
 #[cfg(test)]

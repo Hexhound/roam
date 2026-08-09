@@ -71,6 +71,11 @@ impl IrohTransport {
         // Wait (bounded) for the endpoint to discover a direct address so that a
         // later `endpoint_addr()` is dialable on loopback before discovery lags.
         wait_for_direct_addr(&endpoint).await;
+        crate::dlog!(
+            "spawn: my addr={:?} routes={:?}",
+            endpoint.addr(),
+            routes.keys().collect::<Vec<_>>()
+        );
 
         let routes = Arc::new(Mutex::new(routes));
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
@@ -145,8 +150,12 @@ impl Transport for IrohTransport {
 
         let mut send = stream.lock().await;
         match write_frame(&mut send, &frame).await {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                crate::dlog!("send peer={peer} frame={}: ok", frame.kind());
+                Ok(())
+            }
             Err(e) => {
+                crate::dlog!("send peer={peer} frame={}: FAILED ({e}); evicting conn", frame.kind());
                 // The cached stream is dead (idle timeout, reset, peer restart).
                 // Evict it so the NEXT `dial` opens a fresh connection instead of
                 // reusing this corpse forever — otherwise a long-running daemon
@@ -187,23 +196,30 @@ impl Transport for IrohTransport {
         let node_id =
             EndpointId::from_bytes(&key).map_err(|e| TransportError::Io(e.to_string()))?;
         // Prefer a seeded direct address; fall back to a bare node id (discovery).
-        let target = self
-            .addrs
-            .lock()
-            .unwrap()
-            .get(&peer)
-            .cloned()
-            .unwrap_or_else(|| EndpointAddr::new(node_id));
+        let seeded = self.addrs.lock().unwrap().get(&peer).cloned();
+        let via = if seeded.is_some() {
+            "seeded-addr"
+        } else {
+            "discovery"
+        };
+        let target = seeded.unwrap_or_else(|| EndpointAddr::new(node_id));
+        crate::dlog!("dial peer={peer} via={via} node={node_id}: connecting…");
 
-        let conn = self
-            .endpoint
-            .connect(target, SYNC_ALPN)
-            .await
-            .map_err(|e| TransportError::Io(e.to_string()))?;
-        let (send, recv) = conn
-            .open_bi()
-            .await
-            .map_err(|e| TransportError::Io(e.to_string()))?;
+        let conn = match self.endpoint.connect(target, SYNC_ALPN).await {
+            Ok(conn) => conn,
+            Err(e) => {
+                crate::dlog!("dial peer={peer} via={via}: connect FAILED: {e}");
+                return Err(TransportError::Io(e.to_string()));
+            }
+        };
+        let (send, recv) = match conn.open_bi().await {
+            Ok(pair) => pair,
+            Err(e) => {
+                crate::dlog!("dial peer={peer}: open_bi FAILED: {e}");
+                return Err(TransportError::Io(e.to_string()));
+            }
+        };
+        crate::dlog!("dial peer={peer} via={via}: connected, stream open");
 
         // Drain any frames the peer sends back on this connection.
         let tx = self.inbound_tx.clone();
@@ -261,8 +277,11 @@ async fn handle_conn(incoming: Incoming, routes: Routes, tx: InboundTx) -> Resul
         .context("complete inbound handshake")?;
     let remote = conn.remote_id();
     let peer = peer_id_for(&routes, &remote);
+    crate::dlog!("accept: inbound connection from peer={peer} (node={remote})");
     let (_send, recv) = conn.accept_bi().await.context("accept inbound bi stream")?;
-    read_loop(recv, peer, tx).await
+    let result = read_loop(recv, peer, tx).await;
+    crate::dlog!("accept: reader for peer={peer} ended ({result:?})");
+    result
 }
 
 /// Read length-prefixed frames until the stream closes, forwarding each with
@@ -270,6 +289,7 @@ async fn handle_conn(incoming: Incoming, routes: Routes, tx: InboundTx) -> Resul
 async fn read_loop(mut recv: RecvStream, peer: u64, tx: InboundTx) -> Result<()> {
     // A read error (clean EOF or reset) or a dropped receiver ends the loop.
     while let Ok(frame) = read_frame(&mut recv).await {
+        crate::dlog!("recv peer={peer} frame={}", frame.kind());
         if tx.send((peer, frame)).is_err() {
             break;
         }

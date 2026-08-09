@@ -1,5 +1,16 @@
 //! iroh QUIC implementation of the `roam-sync-core` `Transport` trait.
 
+/// Opt-in diagnostics: prints to stderr with a `[transport]` prefix only when
+/// the `ROAM_DEBUG` env var is set. Zero cost (one env lookup) when off.
+#[macro_export]
+macro_rules! dlog {
+    ($($arg:tt)*) => {
+        if ::std::env::var_os("ROAM_DEBUG").is_some() {
+            ::std::eprintln!("[transport] {}", format!($($arg)*));
+        }
+    };
+}
+
 pub mod endpoint;
 pub mod pairing;
 pub mod transport;

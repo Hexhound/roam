@@ -134,11 +134,16 @@ impl<T: Transport + 'static> Engine<T> {
                 .map(|p| p.peer_id)
                 .collect()
         };
+        crate::dlog!("reconnect_active: active peers={peers:?}");
         for peer in peers {
             // Only re-offer if the (re)dial succeeds; a still-unreachable peer is
             // skipped silently and retried on the next tick.
-            if self.transport.dial(peer).await.is_ok() {
-                self.send_bundle(peer).await;
+            match self.transport.dial(peer).await {
+                Ok(()) => {
+                    crate::dlog!("reconnect_active: peer={peer} dial ok, re-offering bundle");
+                    self.send_bundle(peer).await;
+                }
+                Err(e) => crate::dlog!("reconnect_active: peer={peer} dial failed: {e:?}"),
             }
         }
     }
@@ -195,7 +200,11 @@ impl<T: Transport + 'static> Engine<T> {
                 .collect()
         };
 
+        if pushes.is_empty() {
+            crate::dlog!("flush_local: nothing to push (own_log={} bytes)", own_log.len());
+        }
         for (peer, jsonl) in pushes {
+            crate::dlog!("flush_local: pushing {} op-bytes to peer={peer}", jsonl.len());
             self.send(
                 peer,
                 Frame::Ops {
@@ -410,11 +419,13 @@ impl<T: Transport + 'static> Engine<T> {
                 self.push_logs(peer).await;
             }
             Frame::Ops { author, jsonl } => {
+                crate::dlog!("handle Ops from peer={peer} author={author} ({} bytes)", jsonl.len());
                 if author == self.peer_id() {
                     return Ok(());
                 }
                 let Some(key) = self.key_for(author).await else {
                     // Untrusted author (not in our roster): drop.
+                    crate::dlog!("handle Ops author={author}: DROPPED (untrusted/not in roster)");
                     return Ok(());
                 };
                 // Apply under the store lock; note whether the document actually
@@ -437,6 +448,7 @@ impl<T: Transport + 'static> Engine<T> {
                 // apply advanced the document. `notify_waiters` wakes whoever is
                 // currently awaiting `changed()`. RosterOps deliberately does not
                 // fire this — only doc ops project to disk for the CLI.
+                crate::dlog!("handle Ops author={author}: applied, doc_advanced={changed}");
                 if changed {
                     self.changed.notify_waiters();
                 }
@@ -574,6 +586,11 @@ impl<T: Transport + 'static> Engine<T> {
     /// log (recording the sent offset), every held peer log, then our roster.
     async fn send_bundle(&self, peer: u64) {
         let offer = self.gather_offer().await;
+        crate::dlog!(
+            "send_bundle -> peer={peer}: own_log={} bytes, {} peer-logs",
+            offer.own_log.len(),
+            offer.peer_logs.len()
+        );
 
         // Record how much of our own log this peer now has, so live-push only
         // ships the suffix.
