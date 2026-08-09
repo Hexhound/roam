@@ -47,9 +47,10 @@ use std::path::{Path, PathBuf};
 use roam_storage::{Identity, Store};
 
 use crate::error::FilesError;
+use crate::fileset::{EntryKind, EntryStatus, FileEntry, FILESET_MAP_ID};
 use crate::path::container_id;
 use crate::rebase::merge_local_onto_remote;
-use crate::sidecar::{text_hash, Sidecar};
+use crate::sidecar::{sidecar_path, text_hash, Sidecar};
 use crate::textdiff::{diff_to_ops, TextOp};
 
 /// Current sidecar format version written by [`FolderBridge::import_file`].
@@ -160,7 +161,11 @@ impl FolderBridge {
         }
 
         let actual = self.store.text(&container);
-        reconcile_sidecar(
+        // `reconcile_sidecar` returns `Ok` ONLY on the success path (no apply
+        // error and `actual == expected`); every error/desync/DirtyFile path
+        // returns `Err` and short-circuits the `?` below, so the file-set entry
+        // upsert runs on success only.
+        let outcome = reconcile_sidecar(
             file,
             &container,
             &file_text,
@@ -168,7 +173,58 @@ impl FolderBridge {
             &actual,
             ops.len(),
             apply_err,
-        )
+        )?;
+
+        // Upsert the Live file-set entry. The hash is over the disk text `L`
+        // (`file_text`), which is exactly the sidecar baseline recorded on
+        // success — keeping the entry hash and the sidecar consistent.
+        self.store.set_entry(
+            FILESET_MAP_ID,
+            &container,
+            &FileEntry {
+                kind: EntryKind::Text,
+                status: EntryStatus::Live,
+                content_hash: text_hash(&file_text),
+            }
+            .to_value(),
+        )?;
+
+        Ok(outcome)
+    }
+
+    /// Tombstone a file in the file-set map and remove it from disk.
+    ///
+    /// The text container is intentionally left intact (history / resurrection):
+    /// only the file-set entry is flipped to [`EntryStatus::Tombstoned`], and the
+    /// on-disk file and its sidecar are removed. The tombstone records the hash
+    /// of the container's CURRENT store text so a later resurrection guard can
+    /// tell whether the content changed after the delete.
+    pub fn delete_file(&mut self, file: &Path) -> Result<SyncOutcome, FilesError> {
+        let container = container_id(&self.vault_root, file)?;
+
+        // Hash the content that existed at delete time (the current store text).
+        let hash = text_hash(&self.store.text(&container));
+
+        self.store.set_entry(
+            FILESET_MAP_ID,
+            &container,
+            &FileEntry {
+                kind: EntryKind::Text,
+                status: EntryStatus::Tombstoned,
+                content_hash: hash,
+            }
+            .to_value(),
+        )?;
+
+        // Remove the disk file; already-gone is fine, other IO errors propagate.
+        remove_if_present(file)?;
+        // Drop the sidecar too so a later remote re-create reads as remote-new.
+        remove_if_present(&sidecar_path(file))?;
+
+        Ok(SyncOutcome {
+            ops_applied: 0,
+            changed: true,
+        })
     }
 
     /// Project the container's current CRDT text onto disk (CRDT → disk).
@@ -297,6 +353,16 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), FilesError> {
             let _ = std::fs::remove_file(&temp);
             Err(FilesError::Io(err))
         }
+    }
+}
+
+/// Remove `path` if it exists, treating a `NotFound` as success (already gone)
+/// and propagating any other IO error as [`FilesError::Io`].
+fn remove_if_present(path: &Path) -> Result<(), FilesError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(FilesError::Io(err)),
     }
 }
 
@@ -1009,5 +1075,142 @@ mod tests {
         assert_eq!(outcomes[0].0, real);
         let container = container_id(&vault, &real).unwrap();
         assert_eq!(b.store().text(&container), "real body");
+    }
+
+    /// Find the file-set entry for `container` in the map, if any.
+    fn fileset_entry(b: &FolderBridge, container: &str) -> Option<FileEntry> {
+        b.store()
+            .entries(FILESET_MAP_ID)
+            .into_iter()
+            .find(|(key, _)| key == container)
+            .map(|(_, value)| FileEntry::from_value(&value).unwrap())
+    }
+
+    #[test]
+    fn import_upserts_live_fileset_entry() {
+        let dir = tempdir().unwrap();
+        let mut b = bridge(dir.path());
+        let vault = dir.path().join("vault");
+        let file = vault.join("note.md");
+        std::fs::write(&file, "hello\n").unwrap();
+        b.import_file(&file).unwrap();
+
+        let container = container_id(&vault, &file).unwrap();
+        let entry = fileset_entry(&b, &container).unwrap();
+        assert_eq!(
+            entry,
+            FileEntry {
+                kind: EntryKind::Text,
+                status: EntryStatus::Live,
+                content_hash: text_hash("hello\n"),
+            }
+        );
+    }
+
+    #[test]
+    fn reimport_after_edit_updates_entry_hash_still_live() {
+        let dir = tempdir().unwrap();
+        let mut b = bridge(dir.path());
+        let vault = dir.path().join("vault");
+        let file = vault.join("note.md");
+        std::fs::write(&file, "hello\n").unwrap();
+        b.import_file(&file).unwrap();
+
+        std::fs::write(&file, "hello world\n").unwrap();
+        b.import_file(&file).unwrap();
+
+        let container = container_id(&vault, &file).unwrap();
+        let entry = fileset_entry(&b, &container).unwrap();
+        assert_eq!(entry.status, EntryStatus::Live);
+        assert_eq!(entry.content_hash, text_hash("hello world\n"));
+    }
+
+    #[test]
+    fn errored_import_does_not_write_live_entry() {
+        // A NotText import errors before any ops/sidecar/entry write, so no
+        // file-set entry must be created.
+        let dir = tempdir().unwrap();
+        let mut b = bridge(dir.path());
+        let vault = dir.path().join("vault");
+        let file = vault.join("binary.md");
+        std::fs::write(&file, [0xff, 0xfe]).unwrap();
+
+        assert!(matches!(b.import_file(&file), Err(FilesError::NotText(_))));
+
+        let container = container_id(&vault, &file).unwrap();
+        assert!(fileset_entry(&b, &container).is_none());
+    }
+
+    #[test]
+    fn delete_file_tombstones_entry_removes_disk_keeps_container() {
+        let dir = tempdir().unwrap();
+        let mut b = bridge(dir.path());
+        let vault = dir.path().join("vault");
+        let file = vault.join("note.md");
+        std::fs::write(&file, "hello\n").unwrap();
+        b.import_file(&file).unwrap();
+        let container = container_id(&vault, &file).unwrap();
+        let store_text_before = b.store().text(&container);
+
+        let outcome = b.delete_file(&file).unwrap();
+        assert_eq!(outcome.ops_applied, 0);
+        assert!(outcome.changed);
+
+        // Entry tombstoned with hash == store text at delete time.
+        let entry = fileset_entry(&b, &container).unwrap();
+        assert_eq!(entry.status, EntryStatus::Tombstoned);
+        assert_eq!(entry.kind, EntryKind::Text);
+        assert_eq!(entry.content_hash, text_hash(&store_text_before));
+
+        // Disk file and sidecar are gone.
+        assert!(!file.exists());
+        assert!(!crate::sidecar::sidecar_path(&file).exists());
+
+        // Container text is intact (history / resurrection).
+        assert_eq!(b.store().text(&container), store_text_before);
+        assert_eq!(store_text_before, "hello\n");
+    }
+
+    #[test]
+    fn delete_file_tolerates_already_absent_disk_file() {
+        let dir = tempdir().unwrap();
+        let mut b = bridge(dir.path());
+        let vault = dir.path().join("vault");
+        let file = vault.join("note.md");
+        std::fs::write(&file, "hello\n").unwrap();
+        b.import_file(&file).unwrap();
+        let container = container_id(&vault, &file).unwrap();
+
+        // Remove disk file + sidecar out from under delete_file.
+        std::fs::remove_file(&file).unwrap();
+        std::fs::remove_file(crate::sidecar::sidecar_path(&file)).unwrap();
+
+        let outcome = b.delete_file(&file).unwrap();
+        assert!(outcome.changed);
+        let entry = fileset_entry(&b, &container).unwrap();
+        assert_eq!(entry.status, EntryStatus::Tombstoned);
+    }
+
+    #[test]
+    fn delete_file_leaves_exactly_one_tombstoned_entry_for_path() {
+        let dir = tempdir().unwrap();
+        let mut b = bridge(dir.path());
+        let vault = dir.path().join("vault");
+        let file = vault.join("note.md");
+        std::fs::write(&file, "hello\n").unwrap();
+        b.import_file(&file).unwrap();
+        let container = container_id(&vault, &file).unwrap();
+
+        b.delete_file(&file).unwrap();
+
+        let matching: Vec<_> = b
+            .store()
+            .entries(FILESET_MAP_ID)
+            .into_iter()
+            .filter(|(key, _)| key == &container)
+            .collect();
+        assert_eq!(matching.len(), 1);
+        let entry = FileEntry::from_value(&matching[0].1).unwrap();
+        assert_eq!(entry.status, EntryStatus::Tombstoned);
     }
 }
