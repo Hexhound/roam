@@ -15,6 +15,9 @@ mod textdiff;
 
 pub use bridge::{FolderBridge, SyncOutcome};
 pub use error::FilesError;
+// Re-exported so consumers can construct a `FolderBridge` without depending on
+// `roam-storage` directly.
+pub use roam_storage::Identity;
 pub use path::container_id;
 pub use sidecar::{sidecar_path, text_hash, Sidecar};
 pub use textdiff::{diff_to_ops, TextOp};
