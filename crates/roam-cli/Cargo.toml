@@ -18,6 +18,7 @@ iroh.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "io-std", "signal"] }
 clap.workspace = true
 anyhow.workspace = true
+notify.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

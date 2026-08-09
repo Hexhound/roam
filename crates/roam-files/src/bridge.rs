@@ -370,7 +370,31 @@ impl FolderBridge {
     /// Only [`EntryKind::Text`] entries participate; the map holds no other kind
     /// this slice.
     pub fn scan(&self, store: &mut Store) -> Result<Vec<(PathBuf, SyncOutcome)>, FilesError> {
+        self.scan_hinted(store, None)
+    }
+
+    /// Reconcile, but in Step 1 only (re)import the hinted paths instead of
+    /// reading+diffing every file under the vault. Steps 1b/2/3 still iterate the
+    /// full file-set map (delete detection + remote projection must see every
+    /// entry). `None` hint = full walk (identical to [`scan`](Self::scan)).
+    ///
+    /// TRADEOFF — the hint saves the per-file READ + DIFF, not the directory
+    /// walk. Even when hinted we still run `collect_vault_files` (a cheap
+    /// `O(files)` stat-only dir walk) to build the accurate `present` set that
+    /// Steps 2/3 depend on for delete detection and remote projection; we simply
+    /// skip the expensive `import_file` (read + char-diff) for every non-hinted
+    /// file. A hinted path that is not actually a vault file on disk (outside the
+    /// vault, a symlink, or absent) is silently ignored, because Step 1 only ever
+    /// imports the intersection of the hint with the discovered vault files —
+    /// exactly the same filtering (NotText/symlink/extension) a full walk applies.
+    pub fn scan_hinted(
+        &self,
+        store: &mut Store,
+        hint: Option<&HashSet<PathBuf>>,
+    ) -> Result<Vec<(PathBuf, SyncOutcome)>, FilesError> {
         // --- Step 1: flush local disk edits into the CRDT. ---
+        // The dir walk is ALWAYS done (correctness): Steps 2/3 need an accurate
+        // `present` set. Only the import work is narrowed by the hint.
         let mut files = Vec::new();
         collect_vault_files(&self.vault_root, &mut files)?;
         files.sort();
@@ -382,8 +406,15 @@ impl FolderBridge {
             present.insert(container_id(&self.vault_root, file)?);
         }
 
+        // When hinted, import ONLY the discovered vault files that are in the
+        // hint set — this is the read+diff saving. A full walk imports all.
+        let to_import: Vec<PathBuf> = match hint {
+            None => files,
+            Some(set) => files.into_iter().filter(|f| set.contains(f)).collect(),
+        };
+
         let mut outcomes = Vec::new();
-        for file in files {
+        for file in to_import {
             match self.import_file(store, &file) {
                 Ok(outcome) => outcomes.push((file, outcome)),
                 Err(FilesError::NotText(_)) => continue,
@@ -1355,6 +1386,61 @@ mod tests {
         b.import_file(&mut store, &a).unwrap();
         assert_eq!(store.text(&ca), "aaaZ");
         assert_eq!(store.text(&cc), "ccc");
+    }
+
+    #[test]
+    fn scan_hinted_imports_only_hinted_paths() {
+        // A3: two files change on disk, but the hint names only `a.md`. The
+        // hinted scan must import `a.md` and NOT import `b.md`'s change that call.
+        let dir = tempdir().unwrap();
+        let (b, mut store) = bridge(dir.path());
+        let vault = dir.path().join("vault");
+        let a = vault.join("a.md");
+        let bfile = vault.join("b.md");
+        std::fs::write(&a, "a0\n").unwrap();
+        std::fs::write(&bfile, "b0\n").unwrap();
+        b.scan(&mut store).unwrap();
+
+        let ca = container_id(&vault, &a).unwrap();
+        let cb = container_id(&vault, &bfile).unwrap();
+        assert_eq!(store.text(&ca), "a0\n");
+        assert_eq!(store.text(&cb), "b0\n");
+
+        // Both change on disk; hint only a.md.
+        std::fs::write(&a, "a1\n").unwrap();
+        std::fs::write(&bfile, "b1\n").unwrap();
+        let hint: HashSet<PathBuf> = [a.clone()].into_iter().collect();
+        b.scan_hinted(&mut store, Some(&hint)).unwrap();
+
+        // a.md's change imported; b.md's change NOT imported this call.
+        assert_eq!(store.text(&ca), "a1\n");
+        assert_eq!(store.text(&cb), "b0\n");
+    }
+
+    #[test]
+    fn scan_hinted_none_matches_scan_and_is_idempotent() {
+        // A3: `scan_hinted(None)` behaves identically to `scan`, and re-running
+        // it makes no further mutation (idempotence preserved).
+        let dir = tempdir().unwrap();
+        let (b, mut store) = bridge(dir.path());
+        let vault = dir.path().join("vault");
+        let a = vault.join("a.md");
+        let bfile = vault.join("nested").join("b.org");
+        std::fs::create_dir_all(vault.join("nested")).unwrap();
+        std::fs::write(&a, "a0\n").unwrap();
+        std::fs::write(&bfile, "b0\n").unwrap();
+
+        let first = b.scan_hinted(&mut store, None).unwrap();
+        assert!(first.iter().any(|(_, o)| o.changed));
+
+        let ca = container_id(&vault, &a).unwrap();
+        let cb = container_id(&vault, &bfile).unwrap();
+        assert_eq!(store.text(&ca), "a0\n");
+        assert_eq!(store.text(&cb), "b0\n");
+
+        // Second full scan with no external change: a no-op reconcile.
+        let second = b.scan_hinted(&mut store, None).unwrap();
+        assert!(second.iter().all(|(_, o)| !o.changed));
     }
 
     #[test]

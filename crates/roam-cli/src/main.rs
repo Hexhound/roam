@@ -6,18 +6,24 @@
 //! here covers [`append_position`] (see `crates/roam-transport-iroh/tests/e2e.rs`
 //! for the automated two-endpoint check).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use roam_files::{FilesError, FolderBridge, SyncOutcome};
 use roam_storage::{Identity, PeerStatus, Store, VaultId};
 use roam_sync_core::engine::Engine;
 use roam_transport_iroh::{host_pairing, join_pairing, IrohTransport, PairingToken};
 use tokio::io::{AsyncBufReadExt, BufReader, Lines, Stdin};
+use tokio::sync::mpsc;
+
+/// Debounce window for coalescing a burst of filesystem events (an editor save
+/// is typically write + rename + chmod + temp-file churn) into a single scan.
+const FS_DEBOUNCE: Duration = Duration::from_millis(200);
 
 #[derive(Parser)]
 #[command(name = "roam", about = "Manual harness for roam-sync over iroh", version)]
@@ -237,15 +243,48 @@ async fn setup_engine(vault: &Path, identity_path: &Path) -> Result<Arc<Engine<I
 async fn run_scan(
     engine: &Arc<Engine<IrohTransport>>,
     bridge: &FolderBridge,
+    hint: Option<HashSet<PathBuf>>,
 ) -> anyhow::Result<Vec<(PathBuf, SyncOutcome)>> {
     let store = engine.store(); // Arc<Mutex<Store>>
     let bridge = bridge.clone(); // FolderBridge is just a PathBuf (derives Clone).
     tokio::task::spawn_blocking(move || {
         let mut guard = store.blocking_lock(); // OK on a blocking thread.
-        bridge.scan(&mut guard) // sync disk IO with the store locked.
+        // `hint = None` walks + imports the whole vault (the poll fallback);
+        // `Some(set)` limits the read+diff to the watcher's changed paths.
+        bridge.scan_hinted(&mut guard, hint.as_ref()) // sync disk IO, store locked.
     })
     .await? // JoinError (panic) -> anyhow.
     .map_err(Into::into) // FilesError -> anyhow.
+}
+
+/// Coalesce a batch of filesystem-event paths into a deduplicated dirty-set to
+/// hand to `scan_hinted`. Pure (no IO / no timing) so the "N events in → 1
+/// coalesced set out" contract is unit-testable.
+fn coalesce_paths<I: IntoIterator<Item = PathBuf>>(paths: I) -> HashSet<PathBuf> {
+    paths.into_iter().collect()
+}
+
+/// Create a recursive filesystem watcher over `vault_root` that forwards every
+/// changed path into `tx`. Returns `Err` if the watcher cannot initialize (e.g.
+/// inotify limit, or the path does not exist); the caller degrades to poll-only
+/// rather than aborting. The returned watcher must be kept alive for watching to
+/// continue — dropping it stops the watch.
+fn spawn_vault_watcher(
+    vault_root: &Path,
+    tx: mpsc::UnboundedSender<PathBuf>,
+) -> notify::Result<RecommendedWatcher> {
+    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        // A failed event is dropped: the 500ms poll is the guaranteed catch-up,
+        // so a missed watcher event only costs latency, never correctness.
+        if let Ok(event) = res {
+            for path in event.paths {
+                // Send failures mean the receiver is gone (loop exiting); ignore.
+                let _ = tx.send(path);
+            }
+        }
+    })?;
+    watcher.watch(vault_root, RecursiveMode::Recursive)?;
+    Ok(watcher)
 }
 
 /// The real-folder sync loop (Tasks c + d). Imports local disk edits and projects
@@ -256,10 +295,27 @@ async fn sync_folder(engine: Arc<Engine<IrohTransport>>, folder: PathBuf) -> Res
     // Initial publish: import the current vault contents into the store, then
     // gossip to peers. A failing initial scan is logged, not fatal — the poll
     // below retries.
-    scan_and_maybe_flush(&engine, &bridge).await;
+    scan_and_maybe_flush(&engine, &bridge, None).await;
     // Always flush once at startup even if the scan changed nothing locally, so a
     // freshly-connected peer receives whatever the store already held.
     engine.flush_local().await;
+
+    // Low-latency filesystem watcher: forward changed paths over an mpsc channel
+    // into the async `select!`. Kept as a variable so the watcher lives for the
+    // whole loop (dropping it stops watching). If it fails to initialize (e.g.
+    // inotify limit), warn and continue POLL-ONLY — correctness never depends on
+    // the watcher, only latency does.
+    let (fs_tx, mut fs_rx) = mpsc::unbounded_channel::<PathBuf>();
+    let _watcher = match spawn_vault_watcher(&folder, fs_tx) {
+        Ok(watcher) => {
+            println!("fs watcher active (low-latency); 500ms poll is the fallback.");
+            Some(watcher)
+        }
+        Err(err) => {
+            eprintln!("warning: fs watcher unavailable ({err}); running poll-only.");
+            None
+        }
+    };
 
     println!(
         "watching {} for changes; Ctrl-C to stop.",
@@ -292,13 +348,38 @@ async fn sync_folder(engine: Arc<Engine<IrohTransport>>, folder: PathBuf) -> Res
                 println!("\nstopping.");
                 return Ok(());
             }
-            // Local-change poll: guaranteed fallback for both directions.
+            // Local-change poll: guaranteed fallback for both directions. Runs a
+            // FULL scan (`None` hint) so a missed/coalesced-away watcher event
+            // (editor atomic-rename quirks, inotify overflow) is always caught.
             _ = interval.tick() => {
-                scan_and_maybe_flush(&engine, &bridge).await;
+                scan_and_maybe_flush(&engine, &bridge, None).await;
             }
             // Inbound remote change: project remote state to disk promptly.
             _ = &mut notified => {
-                scan_and_maybe_flush(&engine, &bridge).await;
+                scan_and_maybe_flush(&engine, &bridge, None).await;
+            }
+            // Local filesystem change (low latency). Debounce the burst: collect
+            // the first path, then keep draining until the channel goes quiet for
+            // FS_DEBOUNCE, so one editor save (write + rename + chmod + temp file)
+            // becomes ONE hinted scan over the union of changed paths.
+            first = fs_rx.recv() => {
+                if let Some(first) = first {
+                    let mut batch = vec![first];
+                    let debounce = tokio::time::sleep(FS_DEBOUNCE);
+                    tokio::pin!(debounce);
+                    loop {
+                        tokio::select! {
+                            _ = &mut debounce => break,
+                            more = fs_rx.recv() => match more {
+                                Some(path) => batch.push(path),
+                                None => break, // watcher dropped; scan what we have.
+                            },
+                        }
+                    }
+                    let dirty = coalesce_paths(batch);
+                    scan_and_maybe_flush(&engine, &bridge, Some(dirty)).await;
+                }
+                // `None` = watcher channel closed; the poll keeps the loop alive.
             }
         }
     }
@@ -311,8 +392,12 @@ async fn sync_folder(engine: Arc<Engine<IrohTransport>>, folder: PathBuf) -> Res
 /// per-file conditions (quieter note); anything else (including a `spawn_blocking`
 /// panic surfaced as a non-`FilesError` `anyhow`) gets a louder warning. Either
 /// way the daemon keeps running.
-async fn scan_and_maybe_flush(engine: &Arc<Engine<IrohTransport>>, bridge: &FolderBridge) {
-    match run_scan(engine, bridge).await {
+async fn scan_and_maybe_flush(
+    engine: &Arc<Engine<IrohTransport>>,
+    bridge: &FolderBridge,
+    hint: Option<HashSet<PathBuf>>,
+) {
+    match run_scan(engine, bridge, hint).await {
         Ok(outcomes) => {
             report_scan(&outcomes);
             if outcomes.iter().any(|(_, outcome)| outcome.changed) {
@@ -468,9 +553,45 @@ async fn status(vault: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{append_position, describe_outcome, is_benign_scan_error};
+    use super::{
+        append_position, coalesce_paths, describe_outcome, is_benign_scan_error,
+        spawn_vault_watcher,
+    };
     use roam_files::{FilesError, SyncOutcome};
     use std::path::{Path, PathBuf};
+    use tokio::sync::mpsc;
+
+    #[test]
+    fn coalesce_paths_dedups_a_burst_into_one_set() {
+        // A2: N events (with duplicates, as an editor save produces) collapse to
+        // ONE dirty-set of the distinct changed paths.
+        let a = PathBuf::from("/vault/a.md");
+        let b = PathBuf::from("/vault/b.md");
+        let burst = vec![a.clone(), a.clone(), b.clone(), a.clone(), b.clone()];
+        let set = coalesce_paths(burst);
+        assert_eq!(set.len(), 2);
+        assert!(set.contains(&a));
+        assert!(set.contains(&b));
+    }
+
+    #[test]
+    fn coalesce_paths_empty_is_empty() {
+        assert!(coalesce_paths(Vec::<PathBuf>::new()).is_empty());
+    }
+
+    #[test]
+    fn watcher_initializes_over_real_dir_but_fails_on_missing_path() {
+        // A1 fallback decision: a real directory yields Ok (watcher active); a
+        // non-existent path yields Err (caller degrades to poll-only). This
+        // exercises both inputs of the `match` that picks watcher-vs-poll-only.
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        assert!(spawn_vault_watcher(dir.path(), tx).is_ok());
+
+        let missing = dir.path().join("does-not-exist");
+        let (tx2, _rx2) = mpsc::unbounded_channel();
+        assert!(spawn_vault_watcher(&missing, tx2).is_err());
+    }
 
     #[test]
     fn describe_outcome_classifies_import_project_delete() {

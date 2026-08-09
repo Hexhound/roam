@@ -36,13 +36,56 @@ pub enum TextOp {
     },
 }
 
+/// Upper bound on the char length of either side before [`diff_to_ops`] falls
+/// back to a coarse whole-container replace.
+///
+/// `similar::TextDiff::from_chars` is Myers diff with `O(n·m)` memory in the two
+/// char counts, which blows up on large files (a 1M-char pair is ~10^12 cells).
+/// Above this bound we trade a minimal diff for an `O(1)`-memory replace that is
+/// still a CORRECT op sequence (see [`coarse_replace`]).
+pub(crate) const DIFF_MAX_CHARS: usize = 1_000_000;
+
 /// Compute the char-offset [`TextOp`]s that transform `old` into `new`.
 ///
 /// The returned ops are ordered for left-to-right application: folding them
 /// over `old` (splicing chars at each `pos`) yields `new`. When `old == new`
 /// the result is empty. Adjacent same-kind changes are coalesced into a
 /// single op.
+///
+/// When either side exceeds [`DIFF_MAX_CHARS`] chars this falls back to a
+/// coarse whole-container replace to bound memory (see [`coarse_replace`]);
+/// below the threshold it returns the exact `similar` char diff.
 pub fn diff_to_ops(old: &str, new: &str) -> Vec<TextOp> {
+    diff_to_ops_bounded(old, new, DIFF_MAX_CHARS)
+}
+
+/// The coarse fallback: delete every old char then insert `new` at pos 0. This
+/// is `O(1)` in memory (no diff matrix) and applies correctly front-to-back
+/// under the splice model — `Delete{0, old_len}` empties the container, then
+/// `Insert{0, new}` writes the new text. `old_len` is the OLD char count.
+fn coarse_replace(old_len: usize, new: &str) -> Vec<TextOp> {
+    let mut ops = Vec::new();
+    if old_len > 0 {
+        ops.push(TextOp::Delete { pos: 0, len: old_len });
+    }
+    if !new.is_empty() {
+        ops.push(TextOp::Insert {
+            pos: 0,
+            s: new.to_string(),
+        });
+    }
+    ops
+}
+
+/// [`diff_to_ops`] with an injectable threshold so tests can exercise the
+/// boundary without allocating a real multi-megabyte string.
+pub(crate) fn diff_to_ops_bounded(old: &str, new: &str, max_chars: usize) -> Vec<TextOp> {
+    let old_len = old.chars().count();
+    let new_len = new.chars().count();
+    if old_len > max_chars || new_len > max_chars {
+        return coarse_replace(old_len, new);
+    }
+
     let diff = TextDiff::from_chars(old, new);
 
     let mut ops: Vec<TextOp> = Vec::new();
@@ -241,6 +284,57 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn coarse_fallback_above_threshold_round_trips() {
+        // A4: with a tiny injected threshold, a pair that exceeds it takes the
+        // coarse path (whole-container replace) and still round-trips exactly.
+        let old = "hello world";
+        let new = "goodbye world!";
+        let ops = diff_to_ops_bounded(old, new, 3);
+        // Coarse shape: delete-all then insert-all.
+        assert_eq!(
+            ops,
+            vec![
+                TextOp::Delete {
+                    pos: 0,
+                    len: old.chars().count()
+                },
+                TextOp::Insert {
+                    pos: 0,
+                    s: new.to_string()
+                },
+            ]
+        );
+        assert_eq!(apply(old, &ops), new);
+    }
+
+    #[test]
+    fn coarse_fallback_multibyte_uses_char_len_and_round_trips() {
+        // The coarse delete length is in CHARS, not bytes, so multibyte content
+        // still round-trips under the splice model.
+        let old = "café 世界";
+        let new = "🚀 nouveau";
+        let ops = diff_to_ops_bounded(old, new, 2);
+        assert_eq!(ops[0], TextOp::Delete { pos: 0, len: old.chars().count() });
+        assert_eq!(apply(old, &ops), new);
+    }
+
+    #[test]
+    fn below_threshold_uses_precise_diff() {
+        // A4: small inputs stay on the precise `similar` path — a single-char
+        // append is exactly one minimal insert, NOT a whole-container replace.
+        let ops = diff_to_ops_bounded("abc", "abcd", DIFF_MAX_CHARS);
+        assert_eq!(
+            ops,
+            vec![TextOp::Insert {
+                pos: 3,
+                s: "d".to_string()
+            }]
+        );
+        // And it equals the public entry point at the same (default) threshold.
+        assert_eq!(diff_to_ops("abc", "abcd"), ops);
     }
 
     proptest! {

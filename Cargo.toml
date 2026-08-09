@@ -24,3 +24,4 @@ postcard = { version = "1", default-features = false, features = ["use-std"] }
 anyhow = "1"
 iroh = { version = "1.0.0", features = ["platform-verifier"] }
 clap = { version = "4", features = ["derive"] }
+notify = "6"
