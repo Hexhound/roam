@@ -268,6 +268,12 @@ impl Store {
         self.identity.peer_id()
     }
 
+    /// This device's ed25519 verifying-key bytes (for cross-vouching and for peers
+    /// to trust our authored ops).
+    pub fn identity_verifying_bytes(&self) -> [u8; 32] {
+        self.identity.verifying_key_bytes()
+    }
+
     /// The committed document version, encoded for the `Have` wire frame.
     pub fn doc_version_bytes(&self) -> Vec<u8> {
         self.doc.version().to_bytes()

@@ -43,6 +43,11 @@ impl Identity {
         VerifyingKey(self.signing_key.verifying_key())
     }
 
+    /// This identity's raw 32-byte ed25519 verifying-key bytes.
+    pub fn verifying_key_bytes(&self) -> [u8; 32] {
+        self.signing_key.verifying_key().to_bytes()
+    }
+
     /// Sign a message (an update blob).
     pub fn sign(&self, msg: &[u8]) -> Signature {
         self.signing_key.sign(msg)
