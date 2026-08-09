@@ -30,18 +30,21 @@
 //! a later [`FolderBridge::project_file`] writes the merged store text to disk
 //! and advances the baseline to it, converging to `disk == store == baseline`.
 //!
-//! ## #4 — No delete/rename propagation
+//! ## #4 — Delete/rename propagation: resolved via the file-set map
 //!
-//! [`FolderBridge::scan`] only discovers **existing** `*.md`/`*.org` files. A
-//! file removed or renamed on disk leaves its container populated, and
-//! [`FolderBridge::project_file`] would happily **recreate the deleted file**
-//! from that container on the next projection. There is no tombstone and no
-//! path→container map to notice the removal.
+//! [`FolderBridge::scan`] is a full **reconcile** between the vault directory
+//! and the file-set map (`path → (kind, status, content-hash)`). It flushes
+//! local disk edits into the CRDT, tombstones files deleted locally, projects
+//! remote-new files onto disk, and applies remote tombstones (with a
+//! resurrection guard so a concurrent edit merged after the delete wins over
+//! the tombstone). Renames ride this as a delete of the old path plus a
+//! create of the new one.
 //!
-//! Delete/rename sync needs the deferred **file-set-map CRDT**
-//! (`path → (kind, content-ref)`, a separate slice — see the architecture
-//! spec). Delete-sync is **out of scope** for this crate.
+//! Remaining scope: tombstones are retained forever (**no garbage
+//! collection**), and only [`EntryKind::Text`] is handled — **binary/blob
+//! content is still deferred** to a later slice.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use roam_storage::{Identity, Store};
@@ -305,18 +308,53 @@ impl FolderBridge {
         })
     }
 
-    /// Reconcile the whole vault: recursively import every `*.md`/`*.org` file
-    /// under `vault_root`, returning each file's [`SyncOutcome`].
+    /// Reconcile the whole vault against the file-set map (disk ↔ CRDT).
     ///
-    /// Sidecar (`.roammeta`) files are skipped. A file that fails as
-    /// [`FilesError::NotText`] is skipped rather than aborting the whole scan;
-    /// any other error propagates.
+    /// This is the reconcile entry point. It runs three ordered, single-pass
+    /// steps over snapshots of the file-set map — never looping until stable —
+    /// and is itself idempotent: a second `scan` with no external change makes
+    /// no further mutations.
+    ///
+    /// **Step 1 — flush local disk → CRDT.** Recursively import every
+    /// `*.md`/`*.org` file under `vault_root` ([`import_file`](Self::import_file),
+    /// which upserts a [`EntryStatus::Live`] entry and writes a sidecar). Sidecar
+    /// (`.roammeta`) files are skipped; a [`FilesError::NotText`] file is skipped
+    /// rather than aborting the scan. The set of container ids present on disk is
+    /// remembered for the later steps.
+    ///
+    /// **Step 2 — detect local deletions.** For each `Live` entry whose file is
+    /// absent from disk BUT whose sidecar still exists (proof this device once
+    /// had the file), flip the entry to [`EntryStatus::Tombstoned`] (hashing the
+    /// container's current text) and drop the stale sidecar. A `Live` entry that
+    /// is absent WITH no sidecar is a remote-new file this device has never seen,
+    /// handled in Step 3 — not a local delete.
+    ///
+    /// **Step 3 — apply remote state (CRDT → disk).** Re-read the (now updated)
+    /// entries and:
+    /// - `Live` + absent + no sidecar → **remote-new**: project the container to
+    ///   disk (creates file + sidecar).
+    /// - `Tombstoned` + present → **resurrection guard**: if the container's
+    ///   current hash equals the tombstone's hash the delete wins (remove file +
+    ///   sidecar); if it differs, a concurrent edit merged in after the delete,
+    ///   so the edit wins — flip back to `Live` (current hash) and project.
+    /// - all other combinations are already reconciled and skipped.
+    ///
+    /// Only [`EntryKind::Text`] entries participate; the map holds no other kind
+    /// this slice.
     pub fn scan(&mut self) -> Result<Vec<(PathBuf, SyncOutcome)>, FilesError> {
+        // --- Step 1: flush local disk edits into the CRDT. ---
         let mut files = Vec::new();
         collect_vault_files(&self.vault_root, &mut files)?;
         files.sort();
 
-        let mut outcomes = Vec::with_capacity(files.len());
+        // Container ids that exist on disk (all discovered vault files, even a
+        // NotText one that import will skip — it still "exists" for Step 2/3).
+        let mut present: HashSet<String> = HashSet::new();
+        for file in &files {
+            present.insert(container_id(&self.vault_root, file)?);
+        }
+
+        let mut outcomes = Vec::new();
         for file in files {
             match self.import_file(&file) {
                 Ok(outcome) => outcomes.push((file, outcome)),
@@ -324,6 +362,121 @@ impl FolderBridge {
                 Err(err) => return Err(err),
             }
         }
+
+        // --- Step 2: tombstone locally-deleted files. ---
+        // Snapshot the entries so this is a single pass (import above may have
+        // mutated them). An unchanged import in Step 1 is a no-op that does NOT
+        // rewrite its entry, so a remote tombstone on a present-but-unchanged
+        // file survives Step 1 to be handled in Step 3.
+        for (key, value) in self.store.entries(FILESET_MAP_ID) {
+            let entry = FileEntry::from_value(&value)?;
+            if entry.status != EntryStatus::Live || present.contains(&key) {
+                continue;
+            }
+            // `vault_root.join(key)` inverts container_id → absolute path. The
+            // key is a `/`-separated vault-relative path, so this is correct on
+            // unix; on Windows the `/` separators would need translating to `\`
+            // (out of scope — this crate targets unix vaults).
+            let file = self.vault_root.join(&key);
+            let sidecar = sidecar_path(&file);
+            if !sidecar.exists() {
+                // Absent file with no sidecar: a remote-new entry this device
+                // never had — leave it for Step 3, do NOT tombstone.
+                continue;
+            }
+            // Locally deleted: this device knew the file (sidecar present) and
+            // it is now gone. Tombstone at the container's current text, and
+            // drop the stale sidecar so a later remote re-create reads as new.
+            self.store.set_entry(
+                FILESET_MAP_ID,
+                &key,
+                &FileEntry {
+                    kind: entry.kind,
+                    status: EntryStatus::Tombstoned,
+                    content_hash: text_hash(&self.store.text(&key)),
+                }
+                .to_value(),
+            )?;
+            remove_if_present(&sidecar)?;
+            outcomes.push((
+                file,
+                SyncOutcome {
+                    ops_applied: 0,
+                    changed: true,
+                },
+            ));
+        }
+
+        // --- Step 3: apply remote state onto disk. ---
+        for (key, value) in self.store.entries(FILESET_MAP_ID) {
+            let entry = FileEntry::from_value(&value)?;
+            let file = self.vault_root.join(&key);
+            let file_present = present.contains(&key);
+            match entry.status {
+                EntryStatus::Live => {
+                    // Remote-new: Live entry with no local file and no sidecar
+                    // (never seen here). Present files were handled in Step 1;
+                    // absent-with-sidecar became a tombstone in Step 2.
+                    if !file_present && !sidecar_path(&file).exists() {
+                        let outcome = self.project_file(&file)?;
+                        outcomes.push((file, outcome));
+                    }
+                }
+                EntryStatus::Tombstoned => {
+                    // Only a present file needs a decision; an absent tombstone
+                    // is already reconciled.
+                    if !file_present {
+                        continue;
+                    }
+                    let current_hash = text_hash(&self.store.text(&key));
+                    if current_hash == entry.content_hash {
+                        // Delete wins: no edit landed after the tombstone.
+                        remove_if_present(&file)?;
+                        remove_if_present(&sidecar_path(&file))?;
+                        outcomes.push((
+                            file,
+                            SyncOutcome {
+                                ops_applied: 0,
+                                changed: true,
+                            },
+                        ));
+                    } else {
+                        // Edit wins / resurrection: the container diverged from
+                        // the tombstone hash, so a concurrent edit merged in
+                        // after the delete. Flip back to Live at the CURRENT
+                        // container hash (so a later reconcile sees Live+matching
+                        // and is stable), keep the file, and project so disk
+                        // matches the edited container.
+                        self.store.set_entry(
+                            FILESET_MAP_ID,
+                            &key,
+                            &FileEntry {
+                                kind: entry.kind,
+                                status: EntryStatus::Live,
+                                content_hash: current_hash,
+                            }
+                            .to_value(),
+                        )?;
+                        match self.project_file(&file) {
+                            Ok(outcome) => outcomes.push((file, outcome)),
+                            // A dirty disk file carries un-imported local edits —
+                            // which ARE the edits the resurrection preserves. Keep
+                            // the file as-is (do not clobber) and still report a
+                            // change; the entry is already Live.
+                            Err(FilesError::DirtyFile(_)) => outcomes.push((
+                                file,
+                                SyncOutcome {
+                                    ops_applied: 0,
+                                    changed: true,
+                                },
+                            )),
+                            Err(err) => return Err(err),
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(outcomes)
     }
 
@@ -1212,5 +1365,166 @@ mod tests {
         assert_eq!(matching.len(), 1);
         let entry = FileEntry::from_value(&matching[0].1).unwrap();
         assert_eq!(entry.status, EntryStatus::Tombstoned);
+    }
+
+    /// A stable, sorted snapshot of the whole file-set map for equality asserts.
+    fn fileset_snapshot(b: &FolderBridge) -> Vec<(String, String)> {
+        let mut entries = b.store().entries(FILESET_MAP_ID);
+        entries.sort();
+        entries
+    }
+
+    fn live(hash: String) -> String {
+        FileEntry {
+            kind: EntryKind::Text,
+            status: EntryStatus::Live,
+            content_hash: hash,
+        }
+        .to_value()
+    }
+
+    fn tombstoned(hash: String) -> String {
+        FileEntry {
+            kind: EntryKind::Text,
+            status: EntryStatus::Tombstoned,
+            content_hash: hash,
+        }
+        .to_value()
+    }
+
+    #[test]
+    fn scan_tombstones_locally_deleted_file() {
+        let dir = tempdir().unwrap();
+        let mut b = bridge(dir.path());
+        let vault = dir.path().join("vault");
+        let file = vault.join("a.md");
+        std::fs::write(&file, "hello\n").unwrap();
+        b.import_file(&file).unwrap();
+        let container = container_id(&vault, &file).unwrap();
+
+        // Delete the disk file directly (NOT via delete_file); the sidecar is
+        // left behind, which is what proves this device once had the file.
+        std::fs::remove_file(&file).unwrap();
+        assert!(sidecar_path(&file).exists());
+
+        b.scan().unwrap();
+
+        let entry = fileset_entry(&b, &container).unwrap();
+        assert_eq!(entry.status, EntryStatus::Tombstoned);
+        assert_eq!(entry.content_hash, text_hash("hello\n"));
+        // The stale sidecar is dropped so a later remote re-create reads as new.
+        assert!(!sidecar_path(&file).exists());
+
+        // Idempotent: a second scan with no external change mutates nothing.
+        let before = fileset_snapshot(&b);
+        b.scan().unwrap();
+        assert_eq!(fileset_snapshot(&b), before);
+        assert!(!file.exists());
+    }
+
+    #[test]
+    fn scan_projects_remote_new_file() {
+        let dir = tempdir().unwrap();
+        let mut b = bridge(dir.path());
+        let vault = dir.path().join("vault");
+        let file = vault.join("b.md");
+
+        // Inject a remote Live entry AND remote container content, with no disk
+        // file and no sidecar — exactly what a synced-in peer create looks like.
+        b.store
+            .set_entry(FILESET_MAP_ID, "b.md", &live(text_hash("remote\n")))
+            .unwrap();
+        b.store.edit_text("b.md", 0, "remote\n").unwrap();
+        assert!(!file.exists());
+        assert!(!sidecar_path(&file).exists());
+
+        b.scan().unwrap();
+
+        // The file is created on disk with the remote content and a sidecar.
+        assert_eq!(std::fs::read(&file).unwrap(), b"remote\n");
+        assert!(sidecar_path(&file).exists());
+        assert_eq!(fileset_entry(&b, "b.md").unwrap().status, EntryStatus::Live);
+
+        // Idempotent.
+        let before = fileset_snapshot(&b);
+        let disk_before = std::fs::read(&file).unwrap();
+        b.scan().unwrap();
+        assert_eq!(fileset_snapshot(&b), before);
+        assert_eq!(std::fs::read(&file).unwrap(), disk_before);
+    }
+
+    #[test]
+    fn scan_applies_remote_tombstone_delete_wins() {
+        let dir = tempdir().unwrap();
+        let mut b = bridge(dir.path());
+        let vault = dir.path().join("vault");
+        let file = vault.join("c.md");
+        std::fs::write(&file, "x\n").unwrap();
+        b.import_file(&file).unwrap();
+        let container = container_id(&vault, &file).unwrap();
+
+        // Simulate a synced-in remote tombstone whose hash matches the
+        // container's CURRENT text: no edit landed after the delete.
+        b.store
+            .set_entry(
+                FILESET_MAP_ID,
+                &container,
+                &tombstoned(text_hash(&b.store().text(&container))),
+            )
+            .unwrap();
+
+        b.scan().unwrap();
+
+        // Delete wins: the disk file and its sidecar are removed.
+        assert!(!file.exists());
+        assert!(!sidecar_path(&file).exists());
+        assert_eq!(
+            fileset_entry(&b, &container).unwrap().status,
+            EntryStatus::Tombstoned
+        );
+
+        // Idempotent.
+        let before = fileset_snapshot(&b);
+        b.scan().unwrap();
+        assert_eq!(fileset_snapshot(&b), before);
+        assert!(!file.exists());
+    }
+
+    #[test]
+    fn scan_applies_remote_tombstone_resurrection_edit_wins() {
+        let dir = tempdir().unwrap();
+        let mut b = bridge(dir.path());
+        let vault = dir.path().join("vault");
+        let file = vault.join("d.md");
+        std::fs::write(&file, "x\n").unwrap();
+        b.import_file(&file).unwrap();
+        let container = container_id(&vault, &file).unwrap();
+
+        // Remote tombstone with a STALE hash (the pre-edit text)...
+        b.store
+            .set_entry(FILESET_MAP_ID, &container, &tombstoned(text_hash("x\n")))
+            .unwrap();
+        // ...then a concurrent edit merged into the container AFTER the delete,
+        // so the container diverges from the tombstone hash.
+        let end = b.store().text(&container).chars().count();
+        b.store.edit_text(&container, end, "more\n").unwrap();
+        assert_eq!(b.store().text(&container), "x\nmore\n");
+
+        b.scan().unwrap();
+
+        // Edit wins: the file is kept, the entry flips back to Live with the NEW
+        // hash, and disk matches the edited container.
+        assert!(file.exists());
+        let entry = fileset_entry(&b, &container).unwrap();
+        assert_eq!(entry.status, EntryStatus::Live);
+        assert_eq!(entry.content_hash, text_hash("x\nmore\n"));
+        assert_eq!(std::fs::read(&file).unwrap(), b"x\nmore\n");
+
+        // Idempotent.
+        let before = fileset_snapshot(&b);
+        let disk_before = std::fs::read(&file).unwrap();
+        b.scan().unwrap();
+        assert_eq!(fileset_snapshot(&b), before);
+        assert_eq!(std::fs::read(&file).unwrap(), disk_before);
     }
 }
