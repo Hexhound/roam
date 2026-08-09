@@ -16,3 +16,8 @@ similar = "2"
 [dev-dependencies]
 proptest.workspace = true
 tempfile.workspace = true
+# Integration tests reach for the sibling storage crate directly: `Identity`
+# (required by `FolderBridge::open`) is not re-exported by `roam-files`, and the
+# convergence test merges exported oplogs through the public `Store` API that
+# `FolderBridge::store()` hands back.
+roam-storage = { path = "../roam-storage" }
