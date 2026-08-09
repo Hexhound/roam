@@ -172,10 +172,13 @@ async fn sync(vault: &Path, identity_path: &Path) -> Result<()> {
 
     // Build iroh routes from the active roster in a single pass, then derive the
     // connect list from its keys, before the store is moved into the engine.
+    // Skip our own self-entry (the roster seeds `{self -> self_key}`): dialing
+    // ourselves is unsupported and just prints noise in the demo.
+    let me = identity.peer_id();
     let routes: HashMap<u64, [u8; 32]> = store
         .roster()
         .into_iter()
-        .filter(|p| p.status == PeerStatus::Active)
+        .filter(|p| p.status == PeerStatus::Active && p.peer_id != me)
         .map(|p| (p.peer_id, p.verifying_key))
         .collect();
     let active: Vec<u64> = routes.keys().copied().collect();
