@@ -1,3 +1,4 @@
+use crate::blob::BlobStore;
 use crate::error::StorageError;
 use crate::identity::{Identity, VerifyingKey};
 use crate::oplog::OpLog;
@@ -50,6 +51,13 @@ pub struct Store {
     own_roster: RosterLog,
     /// Materialized view of the merged roster across all trusted logs.
     peers: Vec<PeerRecord>,
+    /// Content-addressed store for binary blobs, rooted at `<root>/assets`.
+    /// Blob bytes live BESIDE the CRDT state (not inside it) so the file-set
+    /// map only ever carries a blob's hash-reference while the bytes are kept
+    /// here on plain disk (see [`BlobStore`]). Owning it on `Store` lets the
+    /// bridge (and later blob-transfer/projection slices) reach the blobs
+    /// through the one shared store handle.
+    blobs: BlobStore,
 }
 
 impl Store {
@@ -99,6 +107,10 @@ impl Store {
         doc.commit();
         let persisted = doc.version();
         let own_roster = RosterLog::new(&roster_dir, identity.peer_id());
+        // Blob bytes live beside the CRDT state under `<root>/assets`. Opening
+        // it here (creating the dir if absent) means every caller sharing this
+        // Store reaches the same blob store via `blobs()`.
+        let blobs = BlobStore::open(&root.join("assets"))?;
         let store = Self {
             root: root.to_path_buf(),
             identity,
@@ -107,6 +119,7 @@ impl Store {
             persisted,
             own_roster,
             peers,
+            blobs,
         };
         store.write_peers_cache()?;
         Ok(store)
@@ -164,6 +177,14 @@ impl Store {
 
     pub fn text(&self, id: &str) -> String {
         self.doc.text(id)
+    }
+
+    /// The content-addressed [`BlobStore`] rooted at `<root>/assets`, holding
+    /// binary payloads that live OUTSIDE the CRDT (only their hash-reference
+    /// rides the op-log). The bridge routes non-text files here; later slices
+    /// (cross-device byte transfer, disk projection, GC) reach them the same way.
+    pub fn blobs(&self) -> &BlobStore {
+        &self.blobs
     }
 
     /// Insert text, commit, and durably append the resulting signed delta.
@@ -509,6 +530,20 @@ mod tests {
     use super::*;
     use crate::identity::Identity;
     use tempfile::tempdir;
+
+    #[test]
+    fn store_owns_a_blob_store_rooted_at_assets() {
+        // The Store opens a BlobStore under `<root>/assets` so blob bytes live
+        // beside the CRDT state and callers reach them via `blobs()`.
+        let dir = tempdir().unwrap();
+        let store = Store::open(dir.path(), Identity::generate()).unwrap();
+
+        let hash = store.blobs().put(&[0x00, 0xff, 0x7f]).unwrap();
+        assert!(store.blobs().has(&hash));
+        assert_eq!(store.blobs().get(&hash).unwrap(), Some(vec![0x00, 0xff, 0x7f]));
+        // Bytes landed under the assets dir beside the CRDT state.
+        assert!(dir.path().join("assets").join(&hash).exists());
+    }
 
     #[test]
     fn edits_persist_and_survive_reopen() {

@@ -248,11 +248,24 @@ impl FolderBridge {
             });
         }
 
-        // Read bytes then decode so a non-UTF-8 file is a distinct error from
-        // an IO failure.
+        // Read bytes, then route TEXT vs BLOB by decoding UTF-8:
+        // - UTF-8 OK           → TEXT path (OT-rebase into a text container).
+        // - NOT UTF-8, md/org  → a CORRUPT text note: NotText (preserved).
+        // - NOT UTF-8, other   → BLOB path (bytes → BlobStore, Blob entry).
+        //
+        // The md/org carve-out keeps a non-UTF-8 `.md`/`.org` an error (a broken
+        // text note is not silently reinterpreted as an asset); only files with a
+        // tracked ASSET extension (see `is_asset_file`) become blobs.
         let bytes = std::fs::read(file)?;
-        let file_text =
-            String::from_utf8(bytes).map_err(|_| FilesError::NotText(file.to_path_buf()))?;
+        let file_text = match String::from_utf8(bytes) {
+            Ok(text) => text,
+            Err(err) => {
+                if is_vault_file(file) {
+                    return Err(FilesError::NotText(file.to_path_buf()));
+                }
+                return self.import_blob(store, &container, err.into_bytes());
+            }
+        };
 
         // Baseline (`A`) for the diff: the sidecar's last-synced text when
         // present, otherwise the store's CURRENT text (NOT ""). Re-seeding
@@ -347,6 +360,42 @@ impl FolderBridge {
         )?;
 
         Ok(outcome)
+    }
+
+    /// Route a non-text file's BYTES into the content-addressed blob store and
+    /// upsert a [`EntryKind::Blob`] file-set entry that references them.
+    ///
+    /// The bytes are kept OUTSIDE the CRDT (in [`Store::blobs`]); only the blake3
+    /// hash-reference — the entry's `content_hash` — rides the op-log, so the ref
+    /// gossips to peers while the bytes transfer out-of-band (a later slice). NO
+    /// text container is created, and a blob has NO sidecar: re-import change
+    /// detection compares the file's hash against the existing entry, so an
+    /// unchanged binary is idempotent (no new map op, no new blob).
+    fn import_blob(
+        &self,
+        store: &mut Store,
+        container: &str,
+        bytes: Vec<u8>,
+    ) -> Result<SyncOutcome, FilesError> {
+        // Store the bytes (idempotent/dedup) and take their content hash as the
+        // blob-ref. `content_hash` doubles as the blob-ref for a Blob entry.
+        let hash = store.blobs().put(&bytes)?;
+        let value = FileEntry {
+            kind: EntryKind::Blob,
+            status: EntryStatus::Live,
+            content_hash: hash,
+            renamed_from: None,
+            tombstoned_at: None,
+        }
+        .to_value();
+
+        // Idempotent no-op: an unchanged binary hashes the same and yields the
+        // identical entry value, so re-importing writes no new map op.
+        if store.get_entry(FILESET_MAP_ID, container).as_deref() == Some(value.as_str()) {
+            return Ok(SyncOutcome::unchanged());
+        }
+        store.set_entry(FILESET_MAP_ID, container, &value)?;
+        Ok(SyncOutcome::changed_no_ops())
     }
 
     /// Tombstone a file in the file-set map and remove it from disk.
@@ -613,6 +662,23 @@ impl FolderBridge {
             // `/`-separated vault-relative key and joining each component so the
             // result uses native separators on every platform (B1).
             let file = key_to_path(&self.vault_root, &key);
+
+            // BLOB local-delete detection (blob-aware variant of the text rule
+            // below). A blob has NO sidecar, so the "this device once had the
+            // file" signal is the BYTES being present in the local blob store:
+            //   Live Blob + file absent + bytes LOCAL   → locally deleted →
+            //     tombstone (the blob-ref IS the entry's own content_hash).
+            //   Live Blob + file absent + bytes ABSENT  → a remote-new blob-ref
+            //     whose bytes have not transferred yet (a later slice) — leave it
+            //     for Step 3, do NOT tombstone (we never had it here).
+            if entry.kind == EntryKind::Blob {
+                if store.blobs().has(&entry.content_hash) {
+                    write_tombstone(store, &key, EntryKind::Blob, entry.content_hash.clone())?;
+                    outcomes.push((file, SyncOutcome::changed_no_ops()));
+                }
+                continue;
+            }
+
             let sidecar = sidecar_path(&file);
             if !sidecar.exists() {
                 // Absent file with no sidecar: a remote-new entry this device
@@ -642,6 +708,17 @@ impl FolderBridge {
             let file_present = present.contains(&key);
             match entry.status {
                 EntryStatus::Live => {
+                    // BLOB CRDT→disk projection (writing a remote blob's bytes to
+                    // disk) is a LATER slice, so never project a blob here. This
+                    // is the graceful-skip guard: a bytes-absent remote-new
+                    // blob-ref has nothing to write yet (no crash, no empty/corrupt
+                    // file), and a present blob is already on disk. TODO (blob
+                    // projection slice): when the bytes are local but the file is
+                    // absent, write `store.blobs().get(&entry.content_hash)` to
+                    // disk (byte-for-byte) instead of skipping.
+                    if entry.kind == EntryKind::Blob {
+                        continue;
+                    }
                     if !file_present && !sidecar_path(&file).exists() {
                         // Remote-new: Live entry with no local file and no
                         // sidecar (never seen here). Absent-with-sidecar became
@@ -678,6 +755,16 @@ impl FolderBridge {
                     }
                 }
                 EntryStatus::Tombstoned => {
+                    // A BLOB tombstone has no text container to hash and no text
+                    // file to project. A present blob would already have been
+                    // re-imported to Live in Step 1 (so it is not seen here); an
+                    // absent blob tombstone is fully reconciled. Clean any stray
+                    // sidecar defensively (a blob has none, so this is a no-op in
+                    // practice) and skip the text-only resurrection logic.
+                    if entry.kind == EntryKind::Blob {
+                        remove_if_present(&sidecar_path(&file))?;
+                        continue;
+                    }
                     if !file_present {
                         // An absent tombstone is reconciled EXCEPT for a leaked
                         // sidecar: a remote tombstone can arrive for a file whose
@@ -1022,7 +1109,10 @@ fn collect_vault_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), FilesEr
         let path = entry.path();
         if file_type.is_dir() {
             collect_vault_files(&path, out)?;
-        } else if is_vault_file(&path) {
+        } else if is_vault_file(&path) || is_asset_file(&path) {
+            // Text notes (md/org) AND tracked binary assets are both collected:
+            // import routes each by content (see `import_file`). Everything else
+            // (a bare `.txt`, a `.roammeta` sidecar) is ignored.
             out.push(path);
         }
     }
@@ -1036,6 +1126,35 @@ fn is_vault_file(path: &Path) -> bool {
             let ext = ext.to_ascii_lowercase();
             ext == "md" || ext == "org"
         }
+        None => false,
+    }
+}
+
+/// Whether `path` is a tracked BINARY asset (routed to the blob store) by its
+/// extension. An explicit allowlist, deliberately DISJOINT from the text vault
+/// extensions ([`is_vault_file`]) and from ignored files (a bare `.txt`, a
+/// `.roammeta` sidecar): only these become [`EntryKind::Blob`] entries. New
+/// asset kinds are added here as they are supported.
+fn is_asset_file(path: &Path) -> bool {
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some(ext) => matches!(
+            ext.to_ascii_lowercase().as_str(),
+            "png" | "jpg"
+                | "jpeg"
+                | "gif"
+                | "webp"
+                | "bmp"
+                | "ico"
+                | "pdf"
+                | "mp3"
+                | "mp4"
+                | "mov"
+                | "webm"
+                | "wav"
+                | "ogg"
+                | "zip"
+                | "bin"
+        ),
         None => false,
     }
 }
@@ -2686,5 +2805,191 @@ mod tests {
             "disjoint concurrent edits must NOT be flagged: {outcome:?}"
         );
         assert_eq!(store.text(&container), "XYZ hello world END\n");
+    }
+
+    // --- D3: binary files route to the blob store (EntryKind::Blob). ---
+
+    #[test]
+    fn import_binary_file_stores_blob_and_writes_blob_entry() {
+        let dir = tempdir().unwrap();
+        let (b, mut store) = bridge(dir.path());
+        let vault = dir.path().join("vault");
+        let file = vault.join("image.png");
+        let payload: Vec<u8> = vec![0x89, b'P', b'N', b'G', 0xff, 0x00, 0xfe];
+        std::fs::write(&file, &payload).unwrap();
+
+        let outcome = b.import_file(&mut store, &file).unwrap();
+        assert!(outcome.changed);
+        assert_eq!(outcome.ops_applied, 0, "a blob applies no CRDT text ops");
+
+        let container = container_id(&vault, &file).unwrap();
+        let entry = fileset_entry(&store, &container).unwrap();
+        assert_eq!(entry.kind, EntryKind::Blob);
+        assert_eq!(entry.status, EntryStatus::Live);
+        // content_hash doubles as the blob-ref: the blake3 of the file's bytes.
+        assert_eq!(
+            entry.content_hash,
+            roam_storage::BlobStore::hash(&payload)
+        );
+        // The bytes are in the blob store, keyed by that hash.
+        assert!(store.blobs().has(&entry.content_hash));
+        assert_eq!(store.blobs().get(&entry.content_hash).unwrap(), Some(payload));
+        // No text container was created for the blob.
+        assert_eq!(store.text(&container), "");
+    }
+
+    #[test]
+    fn reimport_unchanged_binary_is_idempotent() {
+        let dir = tempdir().unwrap();
+        let (b, mut store) = bridge(dir.path());
+        let vault = dir.path().join("vault");
+        let file = vault.join("data.bin");
+        std::fs::write(&file, [0x00, 0xff, 0x01]).unwrap();
+        b.import_file(&mut store, &file).unwrap();
+
+        let log_before = store.export_own_log().unwrap().len();
+        let outcome = b.import_file(&mut store, &file).unwrap();
+        assert!(!outcome.changed, "unchanged binary re-import must be a no-op");
+        assert_eq!(
+            store.export_own_log().unwrap().len(),
+            log_before,
+            "an idempotent blob re-import must append no new op"
+        );
+    }
+
+    #[test]
+    fn changed_binary_updates_entry_hash_and_stores_new_blob() {
+        let dir = tempdir().unwrap();
+        let (b, mut store) = bridge(dir.path());
+        let vault = dir.path().join("vault");
+        let file = vault.join("data.bin");
+        std::fs::write(&file, [0x00, 0xff]).unwrap();
+        b.import_file(&mut store, &file).unwrap();
+        let container = container_id(&vault, &file).unwrap();
+        let first = fileset_entry(&store, &container).unwrap().content_hash;
+
+        let new_bytes = vec![0xfe, 0x00, 0x7f];
+        std::fs::write(&file, &new_bytes).unwrap();
+        let outcome = b.import_file(&mut store, &file).unwrap();
+        assert!(outcome.changed);
+
+        let second = fileset_entry(&store, &container).unwrap().content_hash;
+        assert_ne!(first, second, "a changed blob must update the entry hash");
+        assert_eq!(second, roam_storage::BlobStore::hash(&new_bytes));
+        // Both blobs are stored (the old one is orphaned, GC'd in a later slice).
+        assert!(store.blobs().has(&first));
+        assert!(store.blobs().has(&second));
+    }
+
+    #[test]
+    fn binary_md_is_still_not_text_not_blob() {
+        // A `.md`/`.org` file that fails UTF-8 is a CORRUPT TEXT note, not an
+        // asset: it stays a NotText error and creates no blob entry (unchanged).
+        let dir = tempdir().unwrap();
+        let (b, mut store) = bridge(dir.path());
+        let vault = dir.path().join("vault");
+        let file = vault.join("corrupt.md");
+        std::fs::write(&file, [0xff, 0xfe]).unwrap();
+
+        assert!(matches!(
+            b.import_file(&mut store, &file),
+            Err(FilesError::NotText(_))
+        ));
+        let container = container_id(&vault, &file).unwrap();
+        assert!(fileset_entry(&store, &container).is_none());
+    }
+
+    #[test]
+    fn deleting_a_binary_file_locally_tombstones_the_blob_entry() {
+        let dir = tempdir().unwrap();
+        let (b, mut store) = bridge(dir.path());
+        let vault = dir.path().join("vault");
+        let file = vault.join("pic.png");
+        std::fs::write(&file, [0x89, 0xff, 0x00]).unwrap();
+
+        // A full scan discovers + imports the blob (Live Blob entry).
+        b.scan(&mut store).unwrap();
+        let container = container_id(&vault, &file).unwrap();
+        assert_eq!(fileset_entry(&store, &container).unwrap().status, EntryStatus::Live);
+
+        // Delete the file on disk, then scan: blob-aware local-delete detection
+        // (bytes still in the blob store = this device once had it, file now
+        // absent) must tombstone the entry even though a blob has NO sidecar.
+        std::fs::remove_file(&file).unwrap();
+        b.scan(&mut store).unwrap();
+        assert_eq!(
+            fileset_entry(&store, &container).unwrap().status,
+            EntryStatus::Tombstoned
+        );
+    }
+
+    #[test]
+    fn scan_reconciles_text_and_binary_together() {
+        let dir = tempdir().unwrap();
+        let (b, mut store) = bridge(dir.path());
+        let vault = dir.path().join("vault");
+        let note = vault.join("note.md");
+        let pic = vault.join("pic.png");
+        std::fs::write(&note, "hello\n").unwrap();
+        std::fs::write(&pic, [0xff, 0x00, 0x10]).unwrap();
+
+        b.scan(&mut store).unwrap();
+
+        let note_c = container_id(&vault, &note).unwrap();
+        let pic_c = container_id(&vault, &pic).unwrap();
+        let note_entry = fileset_entry(&store, &note_c).unwrap();
+        let pic_entry = fileset_entry(&store, &pic_c).unwrap();
+        assert_eq!(note_entry.kind, EntryKind::Text);
+        assert_eq!(note_entry.status, EntryStatus::Live);
+        assert_eq!(pic_entry.kind, EntryKind::Blob);
+        assert_eq!(pic_entry.status, EntryStatus::Live);
+        assert_eq!(store.text(&note_c), "hello\n");
+        assert!(store.blobs().has(&pic_entry.content_hash));
+
+        // Idempotent: a second scan with no change makes no further mutation and
+        // leaves BOTH entries Live (the blob is not falsely tombstoned).
+        b.scan(&mut store).unwrap();
+        assert_eq!(fileset_entry(&store, &note_c).unwrap().status, EntryStatus::Live);
+        assert_eq!(fileset_entry(&store, &pic_c).unwrap().status, EntryStatus::Live);
+    }
+
+    #[test]
+    fn remote_new_blob_without_bytes_is_skipped_gracefully() {
+        // Simulate a Blob entry that arrived from a peer (its hash-ref rode the
+        // op-log) whose BYTES have not yet transferred (a later slice). scan must
+        // NOT crash, NOT tombstone it (bytes absent = never had it locally), and
+        // NOT project a corrupt/empty file to disk.
+        let dir = tempdir().unwrap();
+        let (b, mut store) = bridge(dir.path());
+        let vault = dir.path().join("vault");
+        let file = vault.join("remote.png");
+        let container = container_id(&vault, &file).unwrap();
+
+        // A well-formed blob-ref whose bytes are NOT in the local blob store.
+        let phantom = roam_storage::BlobStore::hash(&[0x01, 0x02, 0x03, 0xff]);
+        assert!(!store.blobs().has(&phantom));
+        store
+            .set_entry(
+                FILESET_MAP_ID,
+                &container,
+                &FileEntry {
+                    kind: EntryKind::Blob,
+                    status: EntryStatus::Live,
+                    content_hash: phantom.clone(),
+                    renamed_from: None,
+                    tombstoned_at: None,
+                }
+                .to_value(),
+            )
+            .unwrap();
+
+        // Must not panic/error.
+        b.scan(&mut store).unwrap();
+
+        // Entry stays Live (not tombstoned) and NO file was written to disk.
+        let entry = fileset_entry(&store, &container).unwrap();
+        assert_eq!(entry.status, EntryStatus::Live);
+        assert_eq!(entry.content_hash, phantom);
+        assert!(!file.exists(), "a bytes-absent blob-ref must not project a file");
     }
 }

@@ -35,13 +35,23 @@ pub enum EntryStatus {
     Tombstoned,
 }
 
-/// The kind of content an entry tracks. Only [`EntryKind::Text`] exists this
-/// slice; binary/blob kinds are deferred to a later task.
+/// The kind of content an entry tracks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EntryKind {
-    /// UTF-8 text content synced via the CRDT text layer.
+    /// UTF-8 text content synced via the CRDT text layer. Its
+    /// [`FileEntry::content_hash`] is the blake3 hash of the file's TEXT.
     Text,
+    /// Binary content kept OUTSIDE the CRDT in the content-addressed
+    /// [`roam_storage::BlobStore`]; only the hash-reference rides the op-log.
+    ///
+    /// A `Blob` entry REUSES [`FileEntry::content_hash`] as its blob-ref: the
+    /// field holds the blake3 hex hash of the file's BYTES, which is exactly the
+    /// key under which those bytes live in the `BlobStore`. No separate
+    /// `blob_ref` field is needed — for `kind == Blob`, `content_hash` IS the
+    /// blob reference. The bytes themselves are transferred out-of-band (a later
+    /// slice); only this hash-ref is carried by the CRDT.
+    Blob,
 }
 
 /// A single file-set map value: the sync-relevant metadata for one file,
@@ -243,6 +253,55 @@ mod tests {
             .contains("\"tombstoned\""));
         // And the kind token, likewise.
         assert!(sample(EntryStatus::Live).to_value().contains("\"text\""));
+    }
+
+    #[test]
+    fn blob_entry_round_trips() {
+        // A Blob entry: content_hash doubles as the blob-ref (blake3 of the
+        // file's BYTES). Round-trip through the JSON map value must preserve it.
+        let entry = FileEntry {
+            kind: EntryKind::Blob,
+            status: EntryStatus::Live,
+            content_hash: "a".repeat(64), // a 64-hex blob hash
+            renamed_from: None,
+            tombstoned_at: None,
+        };
+        let value = entry.to_value();
+        assert_eq!(FileEntry::from_value(&value).unwrap(), entry);
+    }
+
+    #[test]
+    fn blob_wire_shape_uses_lowercase_blob_token() {
+        // Pins the on-wire kind token so a future rename is caught, and asserts a
+        // Text entry still serializes `"kind":"text"`.
+        let blob = FileEntry {
+            kind: EntryKind::Blob,
+            status: EntryStatus::Live,
+            content_hash: "ff".repeat(32),
+            renamed_from: None,
+            tombstoned_at: None,
+        };
+        assert!(blob.to_value().contains("\"kind\":\"blob\""), "{}", blob.to_value());
+        assert!(sample(EntryStatus::Live).to_value().contains("\"kind\":\"text\""));
+    }
+
+    #[test]
+    fn blob_entry_parses_from_explicit_wire_json() {
+        // A hand-written wire value with kind:blob must deserialize, and the
+        // forward-compat rule (unknown fields ignored) must still hold for blobs.
+        let json = r#"{
+            "kind": "blob",
+            "status": "live",
+            "content_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "future_field": true
+        }"#;
+        let entry = FileEntry::from_value(json).unwrap();
+        assert_eq!(entry.kind, EntryKind::Blob);
+        assert_eq!(entry.status, EntryStatus::Live);
+        assert_eq!(
+            entry.content_hash,
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        );
     }
 
     #[test]
