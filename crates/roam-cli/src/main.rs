@@ -2,9 +2,9 @@
 //!
 //! This is an operator tool, not a product surface: it wires the storage,
 //! sync-engine, and iroh-transport crates together so two vaults can be paired
-//! and synced by hand. Each subcommand is a small `async fn`; there are no unit
-//! tests here (see `crates/roam-transport-iroh/tests/e2e.rs` for the automated
-//! two-endpoint check).
+//! and synced by hand. Each subcommand is a small `async fn`; the only unit test
+//! here covers [`append_position`] (see `crates/roam-transport-iroh/tests/e2e.rs`
+//! for the automated two-endpoint check).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -16,7 +16,7 @@ use clap::{Parser, Subcommand};
 use roam_storage::{Identity, PeerStatus, Store, VaultId};
 use roam_sync_core::engine::Engine;
 use roam_transport_iroh::{host_pairing, join_pairing, IrohTransport, PairingToken};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, BufReader, Lines, Stdin};
 
 #[derive(Parser)]
 #[command(name = "roam", about = "Manual harness for roam-sync over iroh", version)]
@@ -193,22 +193,78 @@ async fn sync(vault: &Path, identity_path: &Path) -> Result<()> {
             Err(e) => println!("connect to peer {peer} failed: {e}"),
         }
     }
-    println!("running; press Ctrl-C to stop.");
+    println!("running; type a line to append, Ctrl-C to stop.");
 
-    // Print a heartbeat of the document state as frames flow, until Ctrl-C.
-    let mut ticker = tokio::time::interval(Duration::from_secs(3));
+    // Interactive REPL: type lines to append to the shared "note" container and
+    // watch the peer's edits land. Three concurrent branches under one select!.
+    //
+    // stdin is an Option so we can disable it on EOF (piped input / non-TTY)
+    // without exiting — the change watcher must keep running so the peer stays
+    // visible even after our own input stream closes.
+    let mut lines: Option<Lines<BufReader<Stdin>>> = Some(BufReader::new(tokio::io::stdin()).lines());
+    let mut ticker = tokio::time::interval(Duration::from_millis(500));
+    let mut last_seen = String::new();
+
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 println!("\nstopping.");
                 return Ok(());
             }
+            // stdin line -> append at the current end of the note.
+            //
+            // Concurrency note: two machines appending at their local
+            // end-position can interleave (the position is computed before a
+            // peer's edit lands), but Loro merges both inserts — no data is
+            // lost, only the interleaving order may vary. Fine for a demo.
+            line = read_next(&mut lines), if lines.is_some() => {
+                match line {
+                    Some(line) => {
+                        let pos = append_position(&engine.store().lock().await.text("note"));
+                        engine
+                            .edit_text("note", pos, &format!("{line}\n"))
+                            .await
+                            .context("append edit")?;
+                        println!("you> {line}");
+                    }
+                    // EOF: stop reading stdin but keep syncing.
+                    None => lines = None,
+                }
+            }
+            // Poll the note for changes (peer edits + our own applied edits).
+            // Lock -> clone the String -> drop the guard, then compare/print;
+            // never hold the store mutex across an await or I/O.
             _ = ticker.tick() => {
-                let text = engine.store().lock().await.text("note");
-                println!("note len={} bytes", text.len());
+                let text = {
+                    let store = engine.store();
+                    let guard = store.lock().await;
+                    guard.text("note")
+                };
+                if text != last_seen {
+                    println!("--- note ---\n{text}");
+                    last_seen = text;
+                }
             }
         }
     }
+}
+
+/// Read the next stdin line, or `None` on EOF/error.
+///
+/// Split out so the `select!` branch stays a plain expression; the caller
+/// guards it with `if lines.is_some()` and only reaches here with `Some`.
+async fn read_next(lines: &mut Option<Lines<BufReader<Stdin>>>) -> Option<String> {
+    match lines {
+        Some(l) => l.next_line().await.ok().flatten(),
+        None => None,
+    }
+}
+
+/// Append position for a text container: the count of unicode codepoints, which
+/// is Loro's position unit. Using `.len()` (bytes) would corrupt positions for
+/// any non-ASCII text (e.g. inserting after "café" needs pos 4, not 5).
+fn append_position(text: &str) -> usize {
+    text.chars().count()
 }
 
 async fn status(vault: &Path) -> Result<()> {
@@ -229,4 +285,20 @@ async fn status(vault: &Path) -> Result<()> {
     println!("note: {} bytes", store.text("note").len());
     println!("doc version: {} bytes", store.doc_version_bytes().len());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::append_position;
+
+    #[test]
+    fn append_position_counts_codepoints_not_bytes() {
+        // "café": 4 codepoints but 5 bytes (é is 2 bytes in UTF-8).
+        assert_eq!(append_position("café"), 4);
+        assert_eq!("café".len(), 5);
+        // A multi-byte emoji still counts as one codepoint position.
+        assert_eq!(append_position("a🌍b"), 3);
+        // Empty text appends at the start.
+        assert_eq!(append_position(""), 0);
+    }
 }
