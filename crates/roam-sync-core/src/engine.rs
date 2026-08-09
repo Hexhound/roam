@@ -19,6 +19,11 @@ pub struct Engine<T: Transport> {
     /// one-time reverse handshake so two peers that both connect (and both see
     /// each other's `Hello`) never trade `Hello`s forever.
     connected: Arc<Mutex<HashSet<u64>>>,
+    /// Fired after a REMOTE change lands (an inbound `Frame::Ops` that actually
+    /// advances the document). A single consumer (the CLI) awaits this to know
+    /// when to re-project the store to disk. `notify_waiters` is used, so it only
+    /// wakes waiters already awaiting — no permit is stored for future awaits.
+    changed: Arc<tokio::sync::Notify>,
 }
 
 /// Everything we offer a peer on connect or in a `Hello` reply, gathered under a
@@ -41,11 +46,24 @@ impl<T: Transport + 'static> Engine<T> {
             transport,
             sent_offsets: Arc::new(Mutex::new(HashMap::new())),
             connected: Arc::new(Mutex::new(HashSet::new())),
+            changed: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
     pub fn store(&self) -> Arc<Mutex<Store>> {
         self.store.clone()
+    }
+
+    /// A handle to the remote-change signal. Fired via `notify_waiters` after a
+    /// successful inbound `Frame::Ops` apply that advanced the document, so a
+    /// consumer can `.notified().await` to learn when remote data landed.
+    ///
+    /// Single-consumer (CLI) use: `notify_waiters` wakes whoever is currently
+    /// awaiting and stores no permit, so register the waiter before awaiting a
+    /// change. Roster changes (`Frame::RosterOps`) deliberately do NOT fire this
+    /// — only document ops project to disk for the CLI.
+    pub fn changed(&self) -> Arc<tokio::sync::Notify> {
+        self.changed.clone()
     }
 
     fn peer_id(&self) -> u64 {
@@ -62,11 +80,40 @@ impl<T: Transport + 'static> Engine<T> {
     }
 
     /// Apply a local text edit and live-push it to all connected peers.
+    ///
+    /// The push is delegated to [`flush_local`](Self::flush_local): apply the
+    /// edit under the store lock, drop the guard, then flush. Behaviour is
+    /// identical to computing+sending the suffix inline (the convergence tests
+    /// prove it); factoring the push out lets store-bypassing writers (e.g. a
+    /// folder scan) gossip via the same path.
     pub async fn edit_text(&self, id: &str, pos: usize, s: &str) -> anyhow::Result<()> {
-        let own_log = {
+        {
             let mut store = self.store.lock().await;
             store.edit_text(id, pos, s)?;
-            store.export_own_log()?
+        }
+        self.flush_local().await;
+        Ok(())
+    }
+
+    /// Recompute each connected peer's unsent own-log suffix and send it as
+    /// `Frame::Ops`. Reusable local-op gossip for any caller that mutated the
+    /// store directly (bypassing [`edit_text`](Self::edit_text)), e.g. a folder
+    /// scan writing import ops straight to the store.
+    ///
+    /// Same lock discipline as `edit_text`: read the own log under the store
+    /// lock, compute per-peer suffixes + advance offsets under the offsets lock,
+    /// drop both guards, then await the transport sends (never hold a lock across
+    /// a transport await).
+    ///
+    /// Idempotent: each peer's offset is clamped/advanced to `own_log.len()`, so
+    /// with no connected peers, or when every offset already covers the whole own
+    /// log, no non-empty suffix is produced and nothing is sent. This preserves
+    /// the `sent_offsets` bookkeeping that stops already-sent ops being resent
+    /// (the guard against peer-log duplication).
+    pub async fn flush_local(&self) {
+        let own_log = {
+            let store = self.store.lock().await;
+            store.export_own_log().unwrap_or_default()
         };
 
         // Compute per-peer suffixes and advance offsets under the offsets lock
@@ -94,7 +141,6 @@ impl<T: Transport + 'static> Engine<T> {
             )
             .await;
         }
-        Ok(())
     }
 
     /// Vouch for `peer` (holding `key`) locally, then gossip the updated roster
@@ -206,10 +252,28 @@ impl<T: Transport + 'static> Engine<T> {
                     // Untrusted author (not in our roster): drop.
                     return Ok(());
                 };
-                let mut store = self.store.lock().await;
-                if let Err(err) = store.apply_peer_ops(author, &key, &jsonl) {
-                    // Revoked/unknown/verify failures: drop the frame, never crash.
-                    let _ = err;
+                // Apply under the store lock; note whether the document actually
+                // advanced (empty/duplicate resends return Ok but change
+                // nothing). Compare doc versions under the lock, then drop the
+                // guard BEFORE firing the change signal.
+                let changed = {
+                    let mut store = self.store.lock().await;
+                    let before = store.doc_version_bytes();
+                    match store.apply_peer_ops(author, &key, &jsonl) {
+                        Ok(()) => store.doc_version_bytes() != before,
+                        Err(err) => {
+                            // Revoked/unknown/verify failures: drop, never crash.
+                            let _ = err;
+                            false
+                        }
+                    }
+                };
+                // Fire the remote-change Notify outside the lock, only when the
+                // apply advanced the document. `notify_waiters` wakes whoever is
+                // currently awaiting `changed()`. RosterOps deliberately does not
+                // fire this — only doc ops project to disk for the CLI.
+                if changed {
+                    self.changed.notify_waiters();
                 }
             }
             Frame::RosterOps { author, jsonl } => {
