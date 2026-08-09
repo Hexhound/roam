@@ -1,11 +1,6 @@
 use std::path::PathBuf;
 
 /// Errors produced by the `roam-files` crate.
-///
-/// Several variants are defined ahead of the tasks that use them
-/// (sidecar parsing, text diffing, storage bridging); `dead_code` is
-/// allowed on the enum until those tasks land.
-#[allow(dead_code)]
 #[derive(Debug, thiserror::Error)]
 pub enum FilesError {
     /// An error surfaced from the underlying storage layer.
@@ -33,4 +28,12 @@ pub enum FilesError {
     /// includes the affected container id.
     #[error("desync: {0}")]
     Desync(String),
+
+    /// Projecting the CRDT onto disk would overwrite a file that carries
+    /// local, un-imported edits (its on-disk bytes differ from both the
+    /// last-synced baseline and the store text). Refused rather than
+    /// silently destroying the user's edits — the caller must import first
+    /// (or otherwise resolve) before projecting. Holds the affected path.
+    #[error("refusing to overwrite un-imported local edits: {0}")]
+    DirtyFile(PathBuf),
 }

@@ -5,6 +5,45 @@
 //! reconciles a single file's on-disk text into its container, using the
 //! sidecar's last-synced text as the baseline so only the minimal delta is
 //! applied to the CRDT.
+//!
+//! # LIMITATIONS (resolve before wiring into the concurrent sync engine)
+//!
+//! This crate is **single-writer-correct only**. Two known integration
+//! landmines MUST be resolved before it is driven by the concurrent sync
+//! engine (where a remote peer can mutate the same container). Both are
+//! out of scope for this crate as it stands; they are documented here (and
+//! in the architecture spec) so they are not silently inherited.
+//!
+//! ## #1 — Baseline-relative offsets break under concurrent remote merges
+//!
+//! [`FolderBridge::import_file`] computes edit ops as **char offsets relative
+//! to the sidecar baseline** (or, absent a sidecar, `self.store.text()` at the
+//! moment of import), then applies those offsets to `self.store`. This is only
+//! correct while `store.text() == baseline` at apply time — i.e. while this
+//! device is the sole writer.
+//!
+//! Once the sync engine merges a remote peer's edits into the same container,
+//! `store.text() != baseline`, so the pre-computed offsets land at the wrong
+//! position — mid-remote-content or out of bounds — producing **Desync and
+//! persisted corruption** rather than a clean merge.
+//!
+//! Resolving it requires **content-anchored rebasing** of the diff against the
+//! live `store.text()` (anchor ops to surrounding content, not raw offsets),
+//! or at minimum an assertion that `store.text() == baseline` immediately
+//! before applying (fail loudly instead of corrupting). Do not wire this into
+//! a multi-writer path until one of those exists.
+//!
+//! ## #4 — No delete/rename propagation
+//!
+//! [`FolderBridge::scan`] only discovers **existing** `*.md`/`*.org` files. A
+//! file removed or renamed on disk leaves its container populated, and
+//! [`FolderBridge::project_file`] would happily **recreate the deleted file**
+//! from that container on the next projection. There is no tombstone and no
+//! path→container map to notice the removal.
+//!
+//! Delete/rename sync needs the deferred **file-set-map CRDT**
+//! (`path → (kind, content-ref)`, a separate slice — see the architecture
+//! spec). Delete-sync is **out of scope** for this crate.
 
 use std::path::{Path, PathBuf};
 
@@ -63,13 +102,21 @@ impl FolderBridge {
         let file_text = String::from_utf8(bytes)
             .map_err(|_| FilesError::NotText(file.to_path_buf()))?;
 
+        // Baseline for the diff: the sidecar's last-synced text when present,
+        // otherwise the store's CURRENT text (NOT ""). Re-seeding against ""
+        // when the container is already populated (cold-reopen oplog replay, or
+        // a deleted/unsynced `.roammeta`) would make an unchanged file diff as
+        // a full insert at pos 0 — DOUBLING the container. Diffing against the
+        // store's real text makes an unchanged file a no-op and a changed file
+        // apply only the real delta. See LIMITATION #1 for why this is only
+        // single-writer-correct.
         let sidecar = Sidecar::load(file)?;
-        let baseline = sidecar
-            .as_ref()
-            .map(|s| s.last_synced_text.as_str())
-            .unwrap_or("");
+        let baseline = match &sidecar {
+            Some(s) => s.last_synced_text.clone(),
+            None => self.store.text(&container),
+        };
 
-        let ops = diff_to_ops(baseline, &file_text);
+        let ops = diff_to_ops(&baseline, &file_text);
         if ops.is_empty() {
             return Ok(SyncOutcome {
                 ops_applied: 0,
@@ -122,15 +169,38 @@ impl FolderBridge {
             Err(err) => return Err(FilesError::Io(err)),
         };
 
+        // A sidecar parse error is intentionally surfaced rather than treated
+        // as "unsynced" — a corrupt sidecar is worth reporting.
+        let sidecar = Sidecar::load(file)?;
+
         if on_disk.as_deref() == Some(text.as_str()) {
-            // A sidecar parse error is intentionally surfaced rather than
-            // treated as "unsynced" — a corrupt sidecar is worth reporting.
-            if let Some(sidecar) = Sidecar::load(file)? {
+            if let Some(sidecar) = &sidecar {
                 if sidecar.last_synced_text == text {
                     return Ok(SyncOutcome {
                         ops_applied: 0,
                         changed: false,
                     });
+                }
+            }
+        }
+
+        // Dirty-file guard (data-loss protection): refuse to clobber a file
+        // that carries local edits the user hasn't imported yet. The file is
+        // dirty when it exists, is valid UTF-8, differs from the store text (so
+        // an overwrite WOULD change it), AND differs from the last-synced
+        // baseline (so it was edited on disk since the last sync). A file that
+        // is absent, or already equals the baseline (clean, merely stale vs the
+        // store), is safe to project. When no sidecar exists we have no proof
+        // the file is clean, so an existing differing file is treated as dirty
+        // rather than silently overwritten.
+        if let Some(disk) = on_disk.as_deref() {
+            if disk != text {
+                let edited_since_sync = match &sidecar {
+                    Some(sidecar) => disk != sidecar.last_synced_text,
+                    None => true,
+                };
+                if edited_since_sync {
+                    return Err(FilesError::DirtyFile(file.to_path_buf()));
                 }
             }
         }
@@ -379,6 +449,96 @@ mod tests {
 
         let container = container_id(&dir.path().join("vault"), &file).unwrap();
         assert_eq!(b.store().text(&container), "cafés\n");
+    }
+
+    #[test]
+    fn missing_sidecar_reseeds_baseline_from_store_not_empty() {
+        // Regression (#2): a populated container + an absent sidecar + an
+        // UNCHANGED file must NOT double the container. The baseline defaults
+        // to the store's current text (not ""), so an unchanged file is a
+        // no-op rather than a full re-insert at pos 0.
+        let dir = tempdir().unwrap();
+        let mut b = bridge(dir.path());
+        let file = dir.path().join("vault").join("note.md");
+        std::fs::write(&file, "hello\n").unwrap();
+        b.import_file(&file).unwrap();
+
+        // Delete the sidecar off disk (simulates a deleted/unsynced
+        // `.roammeta` or a cold-reopen oplog replay with no sidecar yet).
+        std::fs::remove_file(crate::sidecar::sidecar_path(&file)).unwrap();
+
+        // Re-import the SAME unchanged file: must be a no-op, not a double.
+        let outcome = b.import_file(&file).unwrap();
+        assert_eq!(outcome.ops_applied, 0);
+        assert!(!outcome.changed);
+
+        let container = container_id(&dir.path().join("vault"), &file).unwrap();
+        assert_eq!(b.store().text(&container), "hello\n");
+    }
+
+    #[test]
+    fn missing_sidecar_diffs_only_delta_against_store() {
+        // Regression (#2): absent sidecar + a container already holding
+        // "hello\n" + a disk file "hello world\n" must diff only the delta
+        // against the store's current text, ending at "hello world\n" (not
+        // doubled, not re-seeded from empty).
+        let dir = tempdir().unwrap();
+        let mut b = bridge(dir.path());
+        let file = dir.path().join("vault").join("note.md");
+        std::fs::write(&file, "hello\n").unwrap();
+        b.import_file(&file).unwrap();
+
+        std::fs::remove_file(crate::sidecar::sidecar_path(&file)).unwrap();
+        std::fs::write(&file, "hello world\n").unwrap();
+
+        let outcome = b.import_file(&file).unwrap();
+        assert!(outcome.changed);
+        // Minimal delta against the store: one insert, not a full re-seed.
+        assert_eq!(outcome.ops_applied, 1);
+
+        let container = container_id(&dir.path().join("vault"), &file).unwrap();
+        assert_eq!(b.store().text(&container), "hello world\n");
+    }
+
+    #[test]
+    fn project_file_refuses_to_clobber_dirty_local_edits() {
+        // Regression (#3): the on-disk file has local edits the user hasn't
+        // imported yet. Projecting must NOT overwrite them; it returns
+        // Err(DirtyFile) and leaves the file bytes untouched.
+        let dir = tempdir().unwrap();
+        let mut b = bridge(dir.path());
+        let file = dir.path().join("vault").join("note.md");
+        std::fs::write(&file, "hello\n").unwrap();
+        b.import_file(&file).unwrap();
+
+        // Edit disk WITHOUT importing: now disk != baseline and disk != store.
+        std::fs::write(&file, "local edit\n").unwrap();
+
+        let result = b.project_file(&file);
+        assert!(matches!(result, Err(FilesError::DirtyFile(_))));
+        // The user's local edit survives untouched.
+        assert_eq!(std::fs::read(&file).unwrap(), b"local edit\n");
+    }
+
+    #[test]
+    fn project_file_projects_when_disk_is_clean_but_stale() {
+        // The clean case still projects: the on-disk file equals the sidecar
+        // baseline (no un-imported local edit) but the store has advanced, so
+        // overwriting disk with store text is safe.
+        let dir = tempdir().unwrap();
+        let mut b = bridge(dir.path());
+        let file = dir.path().join("vault").join("note.md");
+        std::fs::write(&file, "hello\n").unwrap();
+        b.import_file(&file).unwrap();
+
+        // Advance the store only (disk stays at the baseline "hello\n").
+        let container = container_id(&dir.path().join("vault"), &file).unwrap();
+        b.store.edit_text(&container, 5, " world").unwrap();
+        assert_eq!(b.store().text(&container), "hello world\n");
+
+        let outcome = b.project_file(&file).unwrap();
+        assert!(outcome.changed);
+        assert_eq!(std::fs::read(&file).unwrap(), b"hello world\n");
     }
 
     #[test]
