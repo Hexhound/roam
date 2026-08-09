@@ -530,6 +530,87 @@ impl FolderBridge {
         Ok(outcomes)
     }
 
+    /// Rename a file within the vault: move its content to the new path's
+    /// container, mark the new path Live and the old path Tombstoned in the
+    /// file-set map, and move the file + sidecar on disk.
+    ///
+    /// Modeled as tombstone-old + a new-entry-carrying-content (Loro has no
+    /// re-key-with-content op), so the rename does NOT preserve the old
+    /// container's edit history — the new container starts from the old
+    /// container's CURRENT text. `from == to` is a no-op (returns
+    /// `changed: false`), never touching disk or the store. This handles a
+    /// single file only; directory renames are out of scope.
+    ///
+    /// Ordering is data-loss-safe: flush `from`'s pending disk edits → seed the
+    /// `to` container → set the map entries → project `to` to disk → only THEN
+    /// remove the `from` file + sidecar. A failure before `to` is written on
+    /// disk therefore leaves the `from` file intact.
+    pub fn rename_file(&mut self, from: &Path, to: &Path) -> Result<SyncOutcome, FilesError> {
+        let from_container = container_id(&self.vault_root, from)?;
+        let to_container = container_id(&self.vault_root, to)?;
+
+        // No-op: same path/container. Nothing to move; leave all data untouched.
+        if from_container == to_container {
+            return Ok(SyncOutcome {
+                ops_applied: 0,
+                changed: false,
+            });
+        }
+
+        // Flush any pending local disk edits on `from` first, so the container
+        // reflects the LATEST disk content before we copy it. A missing `from`
+        // file has nothing to flush; a NotText file propagates its error.
+        if from.exists() {
+            self.import_file(from)?;
+        }
+
+        // Copy the current container text into the (assumed fresh/empty) `to`
+        // container. Seeding at pos 0 is correct for a new destination; an
+        // empty source is a no-op insert we skip.
+        let text = self.store.text(&from_container);
+        if !text.is_empty() {
+            self.store.edit_text(&to_container, 0, &text)?;
+        }
+        let hash = text_hash(&text);
+
+        // File-set map: new path Live, old path Tombstoned. The tombstone hash
+        // is the MOVED content's hash — consistent with the resurrection guard:
+        // absent a concurrent edit to `from` after the rename, the old container
+        // still hashes to this and stays deleted.
+        self.store.set_entry(
+            FILESET_MAP_ID,
+            &to_container,
+            &FileEntry {
+                kind: EntryKind::Text,
+                status: EntryStatus::Live,
+                content_hash: hash.clone(),
+            }
+            .to_value(),
+        )?;
+        self.store.set_entry(
+            FILESET_MAP_ID,
+            &from_container,
+            &FileEntry {
+                kind: EntryKind::Text,
+                status: EntryStatus::Tombstoned,
+                content_hash: hash,
+            }
+            .to_value(),
+        )?;
+
+        // Disk: write the destination FIRST (creates `to` file + sidecar,
+        // byte-stable), then remove the source. Removing `from` only after `to`
+        // is on disk means a failure partway never loses the content.
+        self.project_file(to)?;
+        remove_if_present(from)?;
+        remove_if_present(&sidecar_path(from))?;
+
+        Ok(SyncOutcome {
+            ops_applied: 0,
+            changed: true,
+        })
+    }
+
     /// Borrow the underlying [`Store`] (escape hatch for tests / engine wiring).
     pub fn store(&self) -> &Store {
         &self.store
@@ -1743,5 +1824,126 @@ mod tests {
         b.scan().unwrap();
         assert_eq!(fileset_snapshot(&b), before);
         assert_eq!(std::fs::read(&file).unwrap(), disk_before);
+    }
+
+    #[test]
+    fn rename_file_moves_content_disk_and_entries() {
+        let dir = tempdir().unwrap();
+        let mut b = bridge(dir.path());
+        let vault = dir.path().join("vault");
+        let old = vault.join("old.md");
+        let new = vault.join("new.md");
+        std::fs::write(&old, "content\n").unwrap();
+        b.import_file(&old).unwrap();
+        let old_container = container_id(&vault, &old).unwrap();
+        let new_container = container_id(&vault, &new).unwrap();
+
+        let outcome = b.rename_file(&old, &new).unwrap();
+        assert_eq!(outcome.ops_applied, 0);
+        assert!(outcome.changed);
+
+        // The content lives in the new container now.
+        assert_eq!(b.store().text(&new_container), "content\n");
+
+        // The new file exists on disk with the content and a sidecar.
+        assert_eq!(std::fs::read(&new).unwrap(), b"content\n");
+        assert!(sidecar_path(&new).exists());
+
+        // The old file and its sidecar are gone.
+        assert!(!old.exists());
+        assert!(!sidecar_path(&old).exists());
+
+        // Entries: new → Live, old → Tombstoned, both hashing the moved content.
+        let new_entry = fileset_entry(&b, &new_container).unwrap();
+        assert_eq!(new_entry.status, EntryStatus::Live);
+        assert_eq!(new_entry.content_hash, text_hash("content\n"));
+        let old_entry = fileset_entry(&b, &old_container).unwrap();
+        assert_eq!(old_entry.status, EntryStatus::Tombstoned);
+        assert_eq!(old_entry.content_hash, text_hash("content\n"));
+    }
+
+    #[test]
+    fn rename_into_subdir_creates_parent_dir() {
+        let dir = tempdir().unwrap();
+        let mut b = bridge(dir.path());
+        let vault = dir.path().join("vault");
+        let old = vault.join("old.md");
+        let new = vault.join("sub").join("new.md");
+        std::fs::write(&old, "content\n").unwrap();
+        b.import_file(&old).unwrap();
+
+        b.rename_file(&old, &new).unwrap();
+
+        assert!(new.exists());
+        assert_eq!(std::fs::read(&new).unwrap(), b"content\n");
+        assert!(!old.exists());
+    }
+
+    #[test]
+    fn rename_flushes_pending_disk_edits_before_moving() {
+        let dir = tempdir().unwrap();
+        let mut b = bridge(dir.path());
+        let vault = dir.path().join("vault");
+        let old = vault.join("old.md");
+        let new = vault.join("new.md");
+        std::fs::write(&old, "a\n").unwrap();
+        b.import_file(&old).unwrap();
+
+        // Edit the disk file WITHOUT importing: the pending edit must be flushed
+        // by rename so the LATEST disk content ("a b\n") is what moves.
+        std::fs::write(&old, "a b\n").unwrap();
+
+        b.rename_file(&old, &new).unwrap();
+
+        let new_container = container_id(&vault, &new).unwrap();
+        assert_eq!(b.store().text(&new_container), "a b\n");
+        assert_eq!(std::fs::read(&new).unwrap(), b"a b\n");
+    }
+
+    #[test]
+    fn rename_then_scan_is_stable() {
+        let dir = tempdir().unwrap();
+        let mut b = bridge(dir.path());
+        let vault = dir.path().join("vault");
+        let old = vault.join("old.md");
+        let new = vault.join("new.md");
+        std::fs::write(&old, "content\n").unwrap();
+        b.import_file(&old).unwrap();
+
+        b.rename_file(&old, &new).unwrap();
+
+        // A post-rename scan must not recreate old.md (Tombstoned + absent) nor
+        // disturb new.md (Live + present): disk and entries stay stable.
+        let entries_before = fileset_snapshot(&b);
+        let new_disk_before = std::fs::read(&new).unwrap();
+        b.scan().unwrap();
+        assert_eq!(fileset_snapshot(&b), entries_before);
+        assert_eq!(std::fs::read(&new).unwrap(), new_disk_before);
+        assert!(!old.exists());
+        assert!(new.exists());
+    }
+
+    #[test]
+    fn rename_from_equals_to_is_a_no_op() {
+        let dir = tempdir().unwrap();
+        let mut b = bridge(dir.path());
+        let vault = dir.path().join("vault");
+        let file = vault.join("note.md");
+        std::fs::write(&file, "content\n").unwrap();
+        b.import_file(&file).unwrap();
+        let container = container_id(&vault, &file).unwrap();
+
+        let outcome = b.rename_file(&file, &file).unwrap();
+        assert_eq!(outcome.ops_applied, 0);
+        assert!(!outcome.changed);
+
+        // No data lost: file, sidecar, container, and the Live entry all survive.
+        assert_eq!(std::fs::read(&file).unwrap(), b"content\n");
+        assert!(sidecar_path(&file).exists());
+        assert_eq!(b.store().text(&container), "content\n");
+        assert_eq!(
+            fileset_entry(&b, &container).unwrap().status,
+            EntryStatus::Live
+        );
     }
 }
