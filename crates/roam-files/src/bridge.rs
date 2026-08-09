@@ -99,9 +99,136 @@ impl FolderBridge {
         reconcile_sidecar(file, &container, &file_text, &actual, ops.len(), apply_err)
     }
 
+    /// Project the container's current CRDT text onto disk (CRDT → disk).
+    ///
+    /// Writes the container's text to `file` atomically (byte-for-byte, no
+    /// normalization or added trailing newline) and records a sidecar so a
+    /// subsequent [`import_file`](Self::import_file) sees no change. When the
+    /// file already holds exactly that text AND the sidecar already records it
+    /// as synced, this is a no-op that leaves disk untouched.
+    ///
+    /// `changed` reflects whether disk was written; `ops_applied` is always 0
+    /// because projection never mutates the CRDT.
+    pub fn project_file(&mut self, file: &Path) -> Result<SyncOutcome, FilesError> {
+        let container = container_id(&self.vault_root, file)?;
+        let text = self.store.text(&container);
+
+        // Read the current on-disk text, if any. A missing file is "absent";
+        // a non-UTF-8 file simply won't compare equal, so we fall through to a
+        // fresh write rather than erroring.
+        let on_disk = match std::fs::read(file) {
+            Ok(bytes) => String::from_utf8(bytes).ok(),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => return Err(FilesError::Io(err)),
+        };
+
+        if on_disk.as_deref() == Some(text.as_str()) {
+            if let Some(sidecar) = Sidecar::load(file)? {
+                if sidecar.last_synced_text == text {
+                    return Ok(SyncOutcome {
+                        ops_applied: 0,
+                        changed: false,
+                    });
+                }
+            }
+        }
+
+        if let Some(parent) = file.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        atomic_write(file, text.as_bytes())?;
+
+        Sidecar {
+            version: SIDECAR_VERSION,
+            doc_id: container,
+            last_synced_hash: text_hash(&text),
+            last_synced_text: text,
+        }
+        .store(file)?;
+
+        Ok(SyncOutcome {
+            ops_applied: 0,
+            changed: true,
+        })
+    }
+
+    /// Reconcile the whole vault: recursively import every `*.md`/`*.org` file
+    /// under `vault_root`, returning each file's [`SyncOutcome`].
+    ///
+    /// Sidecar (`.roammeta`) files are skipped. A file that fails as
+    /// [`FilesError::NotText`] is skipped rather than aborting the whole scan;
+    /// any other error propagates.
+    pub fn scan(&mut self) -> Result<Vec<(PathBuf, SyncOutcome)>, FilesError> {
+        let mut files = Vec::new();
+        collect_vault_files(&self.vault_root, &mut files)?;
+        files.sort();
+
+        let mut outcomes = Vec::with_capacity(files.len());
+        for file in files {
+            match self.import_file(&file) {
+                Ok(outcome) => outcomes.push((file, outcome)),
+                Err(FilesError::NotText(_)) => continue,
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(outcomes)
+    }
+
     /// Borrow the underlying [`Store`] (escape hatch for tests / engine wiring).
     pub fn store(&self) -> &Store {
         &self.store
+    }
+}
+
+/// Atomically write `bytes` to `path` by writing a sibling temp file and
+/// renaming it over `path` (same directory, so the rename stays on one
+/// filesystem and is atomic). Mirrors [`Sidecar::store`]'s strategy.
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), FilesError> {
+    let mut temp = path.as_os_str().to_os_string();
+    temp.push(".tmp");
+    let temp = PathBuf::from(temp);
+
+    std::fs::write(&temp, bytes)?;
+    match std::fs::rename(&temp, path) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            // Best-effort cleanup so a failed rename leaves no debris.
+            let _ = std::fs::remove_file(&temp);
+            Err(FilesError::Io(err))
+        }
+    }
+}
+
+/// Recursively collect `*.md`/`*.org` files under `dir` into `out`, skipping
+/// sidecar files (any other extension, including `.roammeta`). A missing
+/// directory yields no files rather than an error.
+fn collect_vault_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), FilesError> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(FilesError::Io(err)),
+    };
+
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            collect_vault_files(&path, out)?;
+        } else if is_vault_file(&path) {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+/// Whether `path` has a vault text extension (`md` or `org`, case-insensitive).
+fn is_vault_file(path: &Path) -> bool {
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some(ext) => {
+            let ext = ext.to_ascii_lowercase();
+            ext == "md" || ext == "org"
+        }
+        None => false,
     }
 }
 
@@ -326,5 +453,124 @@ mod tests {
         b.import_file(&a).unwrap();
         assert_eq!(b.store().text(&ca), "aaaZ");
         assert_eq!(b.store().text(&cc), "ccc");
+    }
+
+    #[test]
+    fn project_file_is_byte_stable_round_trip() {
+        let dir = tempdir().unwrap();
+        let mut b = bridge(dir.path());
+        let file = dir.path().join("vault").join("a.md");
+        // Multi-byte content with NO trailing newline.
+        let original = "# Title\ncafé — 世界";
+        std::fs::write(&file, original).unwrap();
+        let original_bytes = std::fs::read(&file).unwrap();
+
+        b.import_file(&file).unwrap();
+        std::fs::remove_file(&file).unwrap();
+
+        let outcome = b.project_file(&file).unwrap();
+        assert_eq!(outcome.ops_applied, 0);
+        assert!(outcome.changed);
+
+        // Byte-for-byte identical to the original file.
+        assert_eq!(std::fs::read(&file).unwrap(), original_bytes);
+    }
+
+    #[test]
+    fn project_then_import_is_a_no_op() {
+        let dir = tempdir().unwrap();
+        let mut b = bridge(dir.path());
+        let file = dir.path().join("vault").join("note.md");
+        std::fs::write(&file, "hello\n").unwrap();
+
+        b.import_file(&file).unwrap();
+        // Disk already matches the store and the sidecar records it: a no-op.
+        let projected = b.project_file(&file).unwrap();
+        assert!(!projected.changed);
+
+        let outcome = b.import_file(&file).unwrap();
+        assert_eq!(outcome.ops_applied, 0);
+        assert!(!outcome.changed);
+    }
+
+    #[test]
+    fn project_file_writes_store_text_when_disk_missing() {
+        let dir = tempdir().unwrap();
+        let mut b = bridge(dir.path());
+        let file = dir.path().join("vault").join("x.md");
+        std::fs::write(&file, "hello").unwrap();
+        b.import_file(&file).unwrap();
+
+        std::fs::remove_file(&file).unwrap();
+        let outcome = b.project_file(&file).unwrap();
+        assert!(outcome.changed);
+        assert_eq!(std::fs::read(&file).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn project_file_creates_parent_dirs() {
+        let dir = tempdir().unwrap();
+        let mut b = bridge(dir.path());
+        let deep = dir
+            .path()
+            .join("vault")
+            .join("sub")
+            .join("dir")
+            .join("deep.md");
+
+        let outcome = b.project_file(&deep).unwrap();
+        assert!(outcome.changed);
+        assert!(deep.exists());
+        // Empty container projects an empty file (byte-stable, no newline).
+        assert_eq!(std::fs::read(&deep).unwrap(), b"");
+    }
+
+    #[test]
+    fn scan_imports_md_and_org_ignoring_others() {
+        let dir = tempdir().unwrap();
+        let mut b = bridge(dir.path());
+        let vault = dir.path().join("vault");
+        let one = vault.join("one.md");
+        let two = vault.join("nested").join("two.org");
+        std::fs::create_dir_all(vault.join("nested")).unwrap();
+        std::fs::write(&one, "one body").unwrap();
+        std::fs::write(&two, "two body").unwrap();
+        std::fs::write(vault.join("ignore.txt"), "ignore me").unwrap();
+        // A stray but valid sidecar sitting beside one.md — scan must not treat
+        // it as an importable file.
+        Sidecar {
+            version: SIDECAR_VERSION,
+            doc_id: "one.md".to_string(),
+            last_synced_hash: text_hash(""),
+            last_synced_text: String::new(),
+        }
+        .store(&one)
+        .unwrap();
+
+        let outcomes = b.scan().unwrap();
+        assert_eq!(outcomes.len(), 2);
+        for (path, outcome) in &outcomes {
+            assert!(outcome.changed);
+            assert!(path == &one || path == &two);
+            let container = container_id(&vault, path).unwrap();
+            let expected = std::fs::read_to_string(path).unwrap();
+            assert_eq!(b.store().text(&container), expected);
+        }
+    }
+
+    #[test]
+    fn scan_skips_non_utf8_md_without_aborting() {
+        let dir = tempdir().unwrap();
+        let mut b = bridge(dir.path());
+        let vault = dir.path().join("vault");
+        let good = vault.join("good.md");
+        std::fs::write(&good, "good").unwrap();
+        std::fs::write(vault.join("bad.md"), [0xff, 0xff]).unwrap();
+
+        let outcomes = b.scan().unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].0, good);
+        let container = container_id(&vault, &good).unwrap();
+        assert_eq!(b.store().text(&container), "good");
     }
 }
