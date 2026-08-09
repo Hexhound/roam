@@ -9,6 +9,7 @@
 
 mod bridge;
 mod error;
+mod fileset;
 mod path;
 mod rebase;
 mod sidecar;
@@ -16,6 +17,7 @@ mod textdiff;
 
 pub use bridge::{FolderBridge, SyncOutcome};
 pub use error::FilesError;
+pub use fileset::{EntryKind, EntryStatus, FileEntry, FILESET_MAP_ID};
 // Re-exported so consumers can construct a `FolderBridge` without depending on
 // `roam-storage` directly.
 pub use roam_storage::Identity;

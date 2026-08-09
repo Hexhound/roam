@@ -23,6 +23,10 @@ pub enum FilesError {
     #[error("sidecar error: {0}")]
     Sidecar(String),
 
+    /// A file-set map entry value could not be parsed or serialized.
+    #[error("entry error: {0}")]
+    Entry(String),
+
     /// After applying computed ops to a container, the store's text did not
     /// match the file text — a symptom of an offset/diff bug. The message
     /// includes the affected container id.
