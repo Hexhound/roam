@@ -205,8 +205,17 @@ impl FolderBridge {
     pub fn delete_file(&mut self, file: &Path) -> Result<SyncOutcome, FilesError> {
         let container = container_id(&self.vault_root, file)?;
 
-        // Hash the content that existed at delete time (the current store text).
-        let hash = text_hash(&self.store.text(&container));
+        // Tombstone hash = the content THIS DEVICE last synced (the sidecar's
+        // last_synced_hash), NOT the current store text. A remote edit may have
+        // already merged into the container before this delete; hashing the
+        // current (post-merge) text would defeat the resurrection guard and
+        // silently delete the peer's concurrent edit. Fall back to the current
+        // store text only when no sidecar exists (file already gone / never
+        // synced), a degraded best-effort.
+        let hash = match Sidecar::load(file)? {
+            Some(sidecar) => sidecar.last_synced_hash,
+            None => text_hash(&self.store.text(&container)),
+        };
 
         self.store.set_entry(
             FILESET_MAP_ID,
@@ -363,6 +372,34 @@ impl FolderBridge {
             }
         }
 
+        // --- Step 1b: heal present files with NO file-set entry at all. ---
+        // `import_file` writes its Live entry AFTER the `ops.is_empty()` early
+        // return, so an unchanged present file that has no entry (pre-file-set
+        // migration, or a lost entry op) would stay entry-less forever and never
+        // propagate to peers. Heal ONLY a totally-absent entry: a `Tombstoned`
+        // entry is owned by Step 3 (delete-wins/resurrection) and a `Live` one
+        // is already fine — this must not disturb the "no-op import keeps a
+        // remote Tombstoned entry" behavior. Require a sidecar so a raw NotText
+        // file skipped in Step 1 (empty container) is never force-entried.
+        for key in &present {
+            if self.store.get_entry(FILESET_MAP_ID, key).is_some() {
+                continue;
+            }
+            if !sidecar_path(&self.vault_root.join(key)).exists() {
+                continue;
+            }
+            self.store.set_entry(
+                FILESET_MAP_ID,
+                key,
+                &FileEntry {
+                    kind: EntryKind::Text,
+                    status: EntryStatus::Live,
+                    content_hash: text_hash(&self.store.text(key)),
+                }
+                .to_value(),
+            )?;
+        }
+
         // --- Step 2: tombstone locally-deleted files. ---
         // Snapshot the entries so this is a single pass (import above may have
         // mutated them). An unchanged import in Step 1 is a no-op that does NOT
@@ -385,15 +422,23 @@ impl FolderBridge {
                 continue;
             }
             // Locally deleted: this device knew the file (sidecar present) and
-            // it is now gone. Tombstone at the container's current text, and
-            // drop the stale sidecar so a later remote re-create reads as new.
+            // it is now gone. The tombstone hash must be the content THIS DEVICE
+            // last synced (the sidecar's last_synced_hash), NOT the current
+            // store text — a remote edit may have merged in already, and hashing
+            // the post-merge text would defeat the resurrection guard (the
+            // concurrent edit would be silently deleted). Degrade to the current
+            // store text only if the sidecar is unreadable.
+            let content_hash = match Sidecar::load(&file) {
+                Ok(Some(sidecar)) => sidecar.last_synced_hash,
+                _ => text_hash(&self.store.text(&key)),
+            };
             self.store.set_entry(
                 FILESET_MAP_ID,
                 &key,
                 &FileEntry {
                     kind: entry.kind,
                     status: EntryStatus::Tombstoned,
-                    content_hash: text_hash(&self.store.text(&key)),
+                    content_hash,
                 }
                 .to_value(),
             )?;
@@ -423,9 +468,14 @@ impl FolderBridge {
                     }
                 }
                 EntryStatus::Tombstoned => {
-                    // Only a present file needs a decision; an absent tombstone
-                    // is already reconciled.
                     if !file_present {
+                        // An absent tombstone is reconciled EXCEPT for a leaked
+                        // sidecar: a remote tombstone can arrive for a file whose
+                        // local disk copy is already gone but whose sidecar
+                        // lingers. That orphan sidecar makes the Step-3 remote-new
+                        // gate (`Live + absent + !sidecar`) false forever, so the
+                        // path could never be re-materialized. Clean it here.
+                        remove_if_present(&sidecar_path(&file))?;
                         continue;
                     }
                     let current_hash = text_hash(&self.store.text(&key));
@@ -1487,6 +1537,173 @@ mod tests {
         let before = fileset_snapshot(&b);
         b.scan().unwrap();
         assert_eq!(fileset_snapshot(&b), before);
+        assert!(!file.exists());
+    }
+
+    #[test]
+    fn scan_tombstone_uses_last_synced_hash_not_current_store_text() {
+        // CRITICAL 1: a remote edit may merge into the container BEFORE this
+        // device's local delete is tombstoned. The tombstone must capture what
+        // this device last synced (sidecar.last_synced_hash), NOT the current
+        // (remote-merged) store text — otherwise the resurrection guard can
+        // never fire and the peer's concurrent edit is silently deleted.
+        let dir = tempdir().unwrap();
+        let mut b = bridge(dir.path());
+        let vault = dir.path().join("vault");
+        let file = vault.join("x.md");
+        std::fs::write(&file, "hello\n").unwrap();
+        b.import_file(&file).unwrap();
+        let container = container_id(&vault, &file).unwrap();
+
+        // A remote edit merges into the container after the last local sync.
+        b.store.edit_text(&container, 5, " world").unwrap();
+        assert_eq!(b.store().text(&container), "hello world\n");
+
+        // Local delete of the disk file (sidecar left behind).
+        std::fs::remove_file(&file).unwrap();
+
+        b.scan().unwrap();
+
+        let entry = fileset_entry(&b, &container).unwrap();
+        assert_eq!(entry.status, EntryStatus::Tombstoned);
+        // The OLD/last-synced hash, not the current merged store text.
+        assert_eq!(entry.content_hash, text_hash("hello\n"));
+        assert_ne!(entry.content_hash, text_hash("hello world\n"));
+    }
+
+    #[test]
+    fn delete_file_uses_last_synced_hash_not_current_store_text() {
+        // CRITICAL 1 (delete_file variant): same invariant via the explicit API.
+        let dir = tempdir().unwrap();
+        let mut b = bridge(dir.path());
+        let vault = dir.path().join("vault");
+        let file = vault.join("x.md");
+        std::fs::write(&file, "hello\n").unwrap();
+        b.import_file(&file).unwrap();
+        let container = container_id(&vault, &file).unwrap();
+
+        b.store.edit_text(&container, 5, " world").unwrap();
+        assert_eq!(b.store().text(&container), "hello world\n");
+
+        b.delete_file(&file).unwrap();
+
+        let entry = fileset_entry(&b, &container).unwrap();
+        assert_eq!(entry.status, EntryStatus::Tombstoned);
+        assert_eq!(entry.content_hash, text_hash("hello\n"));
+    }
+
+    #[test]
+    fn scan_cleans_orphan_sidecar_then_remote_new_reworks() {
+        // CRITICAL 2: a remote tombstone for a file already gone locally but
+        // whose sidecar lingers must clean the orphan sidecar, else the
+        // remote-new gate (Live + absent + !sidecar) stays false forever and
+        // the path can never be re-materialized.
+        let dir = tempdir().unwrap();
+        let mut b = bridge(dir.path());
+        let vault = dir.path().join("vault");
+        let file = vault.join("y.md");
+
+        // Orphan state: a lingering sidecar, no disk file, a Tombstoned entry.
+        Sidecar {
+            version: SIDECAR_VERSION,
+            doc_id: "y.md".to_string(),
+            last_synced_hash: text_hash("old\n"),
+            last_synced_text: "old\n".to_string(),
+        }
+        .store(&file)
+        .unwrap();
+        assert!(sidecar_path(&file).exists());
+        assert!(!file.exists());
+        b.store
+            .set_entry(FILESET_MAP_ID, "y.md", &tombstoned(text_hash("old\n")))
+            .unwrap();
+
+        b.scan().unwrap();
+        // The orphan sidecar is cleaned.
+        assert!(!sidecar_path(&file).exists());
+
+        // Now a remote re-create at the same path must materialize again.
+        b.store
+            .set_entry(FILESET_MAP_ID, "y.md", &live(text_hash("remote\n")))
+            .unwrap();
+        b.store.edit_text("y.md", 0, "remote\n").unwrap();
+
+        b.scan().unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"remote\n");
+        assert_eq!(fileset_entry(&b, "y.md").unwrap().status, EntryStatus::Live);
+
+        // Idempotent.
+        let before = fileset_snapshot(&b);
+        b.scan().unwrap();
+        assert_eq!(fileset_snapshot(&b), before);
+    }
+
+    #[test]
+    fn scan_heals_present_file_missing_fileset_entry() {
+        // IMPORTANT 3: a present file with a valid sidecar + populated container
+        // but NO file-set entry (pre-file-set migration or a lost entry op) must
+        // gain a Live entry, else peers never learn it exists.
+        let dir = tempdir().unwrap();
+        let mut b = bridge(dir.path());
+        let vault = dir.path().join("vault");
+        let file = vault.join("m.md");
+        std::fs::write(&file, "hello\n").unwrap();
+
+        // Populate the container to match the disk, and write a matching sidecar
+        // — but never import_file, so no file-set entry exists.
+        b.store.edit_text("m.md", 0, "hello\n").unwrap();
+        Sidecar {
+            version: SIDECAR_VERSION,
+            doc_id: "m.md".to_string(),
+            last_synced_hash: text_hash("hello\n"),
+            last_synced_text: "hello\n".to_string(),
+        }
+        .store(&file)
+        .unwrap();
+        assert!(fileset_entry(&b, "m.md").is_none());
+
+        b.scan().unwrap();
+
+        let entry = fileset_entry(&b, "m.md").unwrap();
+        assert_eq!(entry.status, EntryStatus::Live);
+        assert_eq!(entry.content_hash, text_hash("hello\n"));
+
+        // Idempotent.
+        let before = fileset_snapshot(&b);
+        b.scan().unwrap();
+        assert_eq!(fileset_snapshot(&b), before);
+    }
+
+    #[test]
+    fn scan_heal_does_not_force_live_a_tombstoned_present_file() {
+        // IMPORTANT 3 guard: the missing-entry heal must NOT touch a present
+        // file that already carries a Tombstoned entry — delete-wins must stay
+        // reachable (Step 3 owns it).
+        let dir = tempdir().unwrap();
+        let mut b = bridge(dir.path());
+        let vault = dir.path().join("vault");
+        let file = vault.join("c.md");
+        std::fs::write(&file, "x\n").unwrap();
+        b.import_file(&file).unwrap();
+        let container = container_id(&vault, &file).unwrap();
+
+        // Remote tombstone whose hash matches the current text (delete wins).
+        b.store
+            .set_entry(
+                FILESET_MAP_ID,
+                &container,
+                &tombstoned(text_hash(&b.store().text(&container))),
+            )
+            .unwrap();
+
+        b.scan().unwrap();
+
+        // Delete wins: the entry stays Tombstoned and the file is removed — the
+        // heal did NOT force it back to Live.
+        assert_eq!(
+            fileset_entry(&b, &container).unwrap().status,
+            EntryStatus::Tombstoned
+        );
         assert!(!file.exists());
     }
 
