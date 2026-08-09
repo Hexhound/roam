@@ -9,13 +9,14 @@
 //! # How "two devices + sync + scan" is driven through the public API
 //!
 //! Each [`Device`] is a vault + store_root + identity, and — exactly like the
-//! `roundtrip.rs` `Fixture` — opens a FRESH [`FolderBridge`] per operation
-//! (`Store::open` replays the persisted oplog, so all state lives on disk
-//! between operations, no long-lived handle required).
+//! `roundtrip.rs` `Fixture` — opens a FRESH caller-owned `Store` plus a
+//! stateless [`FolderBridge`] per operation (`Store::open` replays the persisted
+//! oplog, so all state lives on disk between operations, no long-lived handle
+//! required).
 //!
 //! A **sync `from` → `to`** is the real signed peer-merge path:
-//!   1. Export the sender's own signed log via `bridge.store().export_own_log()`
-//!      — a `&self` call, so reachable through the bridge's `&Store`.
+//!   1. Export the sender's own signed log via the sender's `Store`'s
+//!      `export_own_log()`.
 //!   2. Open a plain `Store` at the RECEIVER's own `store_root` (with the
 //!      receiver's identity — NOT a neutral third store, so the merged ops land
 //!      in the store the receiver's bridge itself reopens), ensure mutual roster
@@ -30,11 +31,11 @@
 //! received the other device's ops — the whole point of the task. This needs NO
 //! widening of the `roam-files` public API: `export_own_log`, `add_peer`,
 //! `apply_peer_ops` are all on the public `roam_storage::Store`, reached for the
-//! sender via `bridge.store()` and for the receiver by opening its own store
-//! root directly (the store root is the value the test itself supplied to
-//! `FolderBridge::open`).
+//! sender via its own caller-owned `Store` and for the receiver by opening its
+//! own store root directly (the store root is the value the test itself supplied
+//! to the device).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use roam_files::{
     container_id, sidecar_path, EntryStatus, FileEntry, FolderBridge, FILESET_MAP_ID,
@@ -64,26 +65,50 @@ impl Device {
         }
     }
 
-    /// Open a fresh bridge over this device's (persisted) vault + store.
-    fn open(&self) -> FolderBridge {
-        FolderBridge::open(&self.vault, &self.store, self.identity.clone()).unwrap()
+    /// Open a fresh caller-owned store plus a stateless bridge over this
+    /// device's (persisted) vault + store.
+    fn open(&self) -> (FolderBridge, Store) {
+        let bridge = FolderBridge::new(&self.vault);
+        let store = Store::open(&self.store, self.identity.clone()).unwrap();
+        (bridge, store)
     }
 
     fn vault_file(&self, rel: &str) -> PathBuf {
         self.vault.join(rel)
     }
 
+    /// Scan (reconcile) this device: open store + bridge for the op and thread
+    /// the `&mut Store` into `scan`.
+    fn scan(&self) {
+        let (bridge, mut store) = self.open();
+        bridge.scan(&mut store).unwrap();
+    }
+
+    /// Delete `file` on this device via the bridge (open store + bridge per op).
+    fn delete_file(&self, file: &Path) {
+        let (bridge, mut store) = self.open();
+        bridge.delete_file(&mut store, file).unwrap();
+    }
+
+    /// Rename `from` → `to` on this device via the bridge (open store + bridge
+    /// per op).
+    fn rename_file(&self, from: &Path, to: &Path) {
+        let (bridge, mut store) = self.open();
+        bridge.rename_file(&mut store, from, to).unwrap();
+    }
+
     /// The file-set entry for `container`, if the map holds one.
     fn entry(&self, container: &str) -> Option<FileEntry> {
-        self.open()
-            .store()
+        let (_bridge, store) = self.open();
+        store
             .get_entry(FILESET_MAP_ID, container)
             .map(|v| FileEntry::from_value(&v).unwrap())
     }
 
     /// The container's current CRDT text on this device.
     fn store_text(&self, container: &str) -> String {
-        self.open().store().text(container)
+        let (_bridge, store) = self.open();
+        store.text(container)
     }
 }
 
@@ -91,7 +116,8 @@ impl Device {
 /// `to`'s OWN store (so `to`'s next `open()` replays it). Establishes roster
 /// trust lazily the first time a given sender is seen.
 fn sync(from: &Device, to: &Device) {
-    let log = from.open().store().export_own_log().unwrap();
+    let (_from_bridge, from_store) = from.open();
+    let log = from_store.export_own_log().unwrap();
 
     let mut store = Store::open(&to.store, to.identity.clone()).unwrap();
     let from_key = from.identity.verifying_key();
@@ -114,8 +140,8 @@ fn sync(from: &Device, to: &Device) {
 fn round(a: &Device, b: &Device) {
     sync(a, b);
     sync(b, a);
-    a.open().scan().unwrap();
-    b.open().scan().unwrap();
+    a.scan();
+    b.scan();
 }
 
 /// Snapshot of a device's observable state for one file, for convergence /
@@ -144,7 +170,8 @@ fn state(device: &Device, rel: &str, container: &str) -> FileState {
 fn import(device: &Device, rel: &str, text: &str) {
     let file = device.vault_file(rel);
     std::fs::write(&file, text).unwrap();
-    device.open().import_file(&file).unwrap();
+    let (bridge, mut store) = device.open();
+    bridge.import_file(&mut store, &file).unwrap();
 }
 
 fn cid(device: &Device, rel: &str) -> String {
@@ -164,14 +191,14 @@ fn delete_propagates_a_to_b() {
     // A creates the file; sync to B; B materializes it on disk.
     import(&a, rel, "hello\n");
     sync(&a, &b);
-    b.open().scan().unwrap();
+    b.scan();
     assert_eq!(std::fs::read(b.vault_file(rel)).unwrap(), b"hello\n");
     assert!(sidecar_path(&b.vault_file(rel)).exists());
 
     // A deletes the file; sync to B; B applies the tombstone.
-    a.open().delete_file(&a.vault_file(rel)).unwrap();
+    a.delete_file(&a.vault_file(rel));
     sync(&a, &b);
-    b.open().scan().unwrap();
+    b.scan();
 
     // B's disk copy and sidecar are gone, and the entry is a tombstone.
     assert!(
@@ -179,7 +206,10 @@ fn delete_propagates_a_to_b() {
         "delete on A must remove the file on B"
     );
     assert!(!sidecar_path(&b.vault_file(rel)).exists());
-    assert_eq!(b.entry(&container).map(|e| e.status), Some(EntryStatus::Tombstoned));
+    assert_eq!(
+        b.entry(&container).map(|e| e.status),
+        Some(EntryStatus::Tombstoned)
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -194,17 +224,18 @@ fn rename_propagates_a_to_b() {
 
     import(&a, "old.md", "content\n");
     sync(&a, &b);
-    b.open().scan().unwrap();
+    b.scan();
     assert_eq!(std::fs::read(b.vault_file("old.md")).unwrap(), b"content\n");
 
-    a.open()
-        .rename_file(&a.vault_file("old.md"), &a.vault_file("new.md"))
-        .unwrap();
+    a.rename_file(&a.vault_file("old.md"), &a.vault_file("new.md"));
     sync(&a, &b);
-    b.open().scan().unwrap();
+    b.scan();
 
     // On B: old path gone, new path present with the moved content.
-    assert!(!b.vault_file("old.md").exists(), "rename must remove old path on B");
+    assert!(
+        !b.vault_file("old.md").exists(),
+        "rename must remove old path on B"
+    );
     assert_eq!(std::fs::read(b.vault_file("new.md")).unwrap(), b"content\n");
     assert_eq!(
         b.entry(&old_container).map(|e| e.status),
@@ -237,12 +268,12 @@ fn concurrent_edit_vs_delete_edit_wins_and_converges() {
     // Both devices start synced with x.md = "hello\n".
     import(&a, rel, "hello\n");
     sync(&a, &b);
-    b.open().scan().unwrap();
+    b.scan();
     assert_eq!(std::fs::read(b.vault_file(rel)).unwrap(), b"hello\n");
 
     // CONCURRENTLY (no sync between):
     //  - A deletes x.md (tombstones with the last-synced hash of "hello\n").
-    a.open().delete_file(&a.vault_file(rel)).unwrap();
+    a.delete_file(&a.vault_file(rel));
     //  - B edits its disk x.md and imports (container diverges; entry stays Live).
     import(&b, rel, "hello world\n");
 
@@ -258,7 +289,10 @@ fn concurrent_edit_vs_delete_edit_wins_and_converges() {
     // device is left with the file deleted.
     let final_a = state(&a, rel, &container);
     let final_b = state(&b, rel, &container);
-    assert_eq!(final_a, final_b, "both devices must converge to the same state");
+    assert_eq!(
+        final_a, final_b,
+        "both devices must converge to the same state"
+    );
     assert_eq!(
         final_a.disk.as_deref(),
         Some(&b"hello world\n"[..]),
@@ -273,9 +307,17 @@ fn concurrent_edit_vs_delete_edit_wins_and_converges() {
     let snapshot = |a: &Device, b: &Device| (state(a, rel, &container), state(b, rel, &container));
     let baseline = snapshot(&a, &b);
     round(&a, &b);
-    assert_eq!(snapshot(&a, &b), baseline, "state must be stable after one round");
+    assert_eq!(
+        snapshot(&a, &b),
+        baseline,
+        "state must be stable after one round"
+    );
     round(&a, &b);
-    assert_eq!(snapshot(&a, &b), baseline, "state must be stable after a second round");
+    assert_eq!(
+        snapshot(&a, &b),
+        baseline,
+        "state must be stable after a second round"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -304,9 +346,15 @@ fn forced_tombstone_wins_resurrection_converges_end_to_end() {
     // Both devices start synced with x.md = "hello\n".
     import(&a, rel, "hello\n");
     sync(&a, &b);
-    b.open().scan().unwrap();
-    assert_eq!(a.entry(&container).map(|e| e.status), Some(EntryStatus::Live));
-    assert_eq!(b.entry(&container).map(|e| e.status), Some(EntryStatus::Live));
+    b.scan();
+    assert_eq!(
+        a.entry(&container).map(|e| e.status),
+        Some(EntryStatus::Live)
+    );
+    assert_eq!(
+        b.entry(&container).map(|e| e.status),
+        Some(EntryStatus::Live)
+    );
 
     // CONCURRENTLY (no sync between):
     //  - On A: raise A's Lamport clock ABOVE B's coming edit with unrelated ops
@@ -315,7 +363,7 @@ fn forced_tombstone_wins_resurrection_converges_end_to_end() {
     import(&a, "z.md", "one\n");
     import(&a, "z.md", "one\ntwo\n");
     import(&a, "z.md", "one\ntwo\nthree\n");
-    a.open().delete_file(&a.vault_file(rel)).unwrap();
+    a.delete_file(&a.vault_file(rel));
     //  - On B: edit x.md and import (Live at a LOWER Lamport).
     import(&b, rel, "hello world\n");
 
@@ -338,8 +386,8 @@ fn forced_tombstone_wins_resurrection_converges_end_to_end() {
     // Round 1 reconcile (no further sync): B sees Tombstoned + container diverged
     // → resurrection flip to Live locally; A has no disk copy so it does nothing
     // yet. The flip has NOT reached A.
-    a.open().scan().unwrap();
-    b.open().scan().unwrap();
+    a.scan();
+    b.scan();
     assert_eq!(
         b.entry(&container).map(|e| e.status),
         Some(EntryStatus::Live),
@@ -364,8 +412,8 @@ fn forced_tombstone_wins_resurrection_converges_end_to_end() {
         Some(EntryStatus::Live),
         "B's resurrection flip must propagate to the deleter"
     );
-    a.open().scan().unwrap();
-    b.open().scan().unwrap();
+    a.scan();
+    b.scan();
     assert!(
         a.vault_file(rel).exists(),
         "deleter must RE-PROJECT x.md to disk after receiving B's fresh Live"
@@ -377,7 +425,10 @@ fn forced_tombstone_wins_resurrection_converges_end_to_end() {
     }
     let final_a = state(&a, rel, &container);
     let final_b = state(&b, rel, &container);
-    assert_eq!(final_a, final_b, "both devices must converge to the same state");
+    assert_eq!(
+        final_a, final_b,
+        "both devices must converge to the same state"
+    );
     assert_eq!(
         final_a.disk.as_deref(),
         Some(&b"hello world\n"[..]),
@@ -390,9 +441,17 @@ fn forced_tombstone_wins_resurrection_converges_end_to_end() {
     let snapshot = |a: &Device, b: &Device| (state(a, rel, &container), state(b, rel, &container));
     let baseline = snapshot(&a, &b);
     round(&a, &b);
-    assert_eq!(snapshot(&a, &b), baseline, "converged state stable after one round");
+    assert_eq!(
+        snapshot(&a, &b),
+        baseline,
+        "converged state stable after one round"
+    );
     round(&a, &b);
-    assert_eq!(snapshot(&a, &b), baseline, "converged state stable after a second round");
+    assert_eq!(
+        snapshot(&a, &b),
+        baseline,
+        "converged state stable after a second round"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -407,11 +466,11 @@ fn delete_without_concurrent_edit_delete_wins_and_converges() {
 
     import(&a, rel, "yes\n");
     sync(&a, &b);
-    b.open().scan().unwrap();
+    b.scan();
     assert_eq!(std::fs::read(b.vault_file(rel)).unwrap(), b"yes\n");
 
     // A deletes; NO concurrent edit on B.
-    a.open().delete_file(&a.vault_file(rel)).unwrap();
+    a.delete_file(&a.vault_file(rel));
 
     for _ in 0..3 {
         round(&a, &b);
@@ -420,7 +479,10 @@ fn delete_without_concurrent_edit_delete_wins_and_converges() {
     // Both converge to ABSENT + Tombstoned.
     let final_a = state(&a, rel, &container);
     let final_b = state(&b, rel, &container);
-    assert_eq!(final_a, final_b, "both devices must converge to the same state");
+    assert_eq!(
+        final_a, final_b,
+        "both devices must converge to the same state"
+    );
     assert_eq!(final_a.disk, None, "delete must win: file absent");
     assert!(!final_a.sidecar_exists);
     assert_eq!(final_a.status, Some(EntryStatus::Tombstoned));
@@ -452,10 +514,10 @@ fn edit_vs_delete_converges_regardless_of_sync_order() {
 
         import(&a, rel, "hello\n");
         sync(&a, &b);
-        b.open().scan().unwrap();
+        b.scan();
 
         // Concurrent divergence.
-        a.open().delete_file(&a.vault_file(rel)).unwrap();
+        a.delete_file(&a.vault_file(rel));
         import(&b, rel, "hello world\n");
 
         // First reconciling round with the chosen application order.
@@ -466,8 +528,8 @@ fn edit_vs_delete_converges_regardless_of_sync_order() {
             sync(&a, &b);
             sync(&b, &a);
         }
-        a.open().scan().unwrap();
-        b.open().scan().unwrap();
+        a.scan();
+        b.scan();
         // Settle.
         for _ in 0..3 {
             round(&a, &b);
@@ -481,7 +543,10 @@ fn edit_vs_delete_converges_regardless_of_sync_order() {
 
     let ab = run(false);
     let ba = run(true);
-    assert_eq!(ab, ba, "edit-wins convergence must be sync-order independent");
+    assert_eq!(
+        ab, ba,
+        "edit-wins convergence must be sync-order independent"
+    );
     assert_eq!(ab.0, b"hello world\n");
     assert_eq!(ab.1, EntryStatus::Live);
     assert_eq!(ab.2, "hello world\n");

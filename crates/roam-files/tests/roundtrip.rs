@@ -7,10 +7,9 @@
 //! cover the single-op happy paths and the sidecar-healing error paths.
 //!
 //! The tests use the public `roam_files` surface plus `roam_storage` — the
-//! latter is unavoidable because `FolderBridge::open` takes a
-//! `roam_storage::Identity` that `roam-files` does not re-export, and because
-//! the convergence test merges the oplogs that `FolderBridge::store()` exposes
-//! through the public `Store` API.
+//! latter is unavoidable because the caller owns the `roam_storage::Store` that
+//! the stateless `FolderBridge` operates on, and because the convergence test
+//! merges the oplogs those `Store` handles expose through the public API.
 
 use std::path::{Path, PathBuf};
 
@@ -41,8 +40,13 @@ impl Fixture {
         }
     }
 
-    fn open(&self) -> FolderBridge {
-        FolderBridge::open(&self.vault, &self.store, self.identity.clone()).unwrap()
+    /// Open the caller-owned store and a stateless bridge over this fixture's
+    /// (persisted) vault + store_root. The caller threads the `Store` into each
+    /// bridge operation.
+    fn open(&self) -> (FolderBridge, Store) {
+        let bridge = FolderBridge::new(&self.vault);
+        let store = Store::open(&self.store, self.identity.clone()).unwrap();
+        (bridge, store)
     }
 
     fn vault_file(&self, rel: &str) -> PathBuf {
@@ -52,13 +56,19 @@ impl Fixture {
 
 /// Rewrite `file` on disk, import it, and assert the container now reads back
 /// byte-identical to what is on disk — proving the disk→diff→ops→CRDT path.
-fn edit_and_assert(bridge: &mut FolderBridge, vault: &Path, file: &Path, new_text: &str) {
+fn edit_and_assert(
+    bridge: &FolderBridge,
+    store: &mut Store,
+    vault: &Path,
+    file: &Path,
+    new_text: &str,
+) {
     std::fs::write(file, new_text).unwrap();
-    bridge.import_file(file).unwrap();
+    bridge.import_file(store, file).unwrap();
     let container = container_id(vault, file).unwrap();
     let on_disk = std::fs::read_to_string(file).unwrap();
     assert_eq!(
-        bridge.store().text(&container),
+        store.text(&container),
         on_disk,
         "store text must equal disk text after importing {new_text:?}"
     );
@@ -71,7 +81,7 @@ fn edit_and_assert(bridge: &mut FolderBridge, vault: &Path, file: &Path, new_tex
 #[test]
 fn external_edit_sequence_reconciles_to_disk() {
     let fx = Fixture::new();
-    let mut bridge = fx.open();
+    let (bridge, mut store) = fx.open();
     let file = fx.vault_file("note.md");
 
     let sequence = [
@@ -87,7 +97,7 @@ fn external_edit_sequence_reconciles_to_disk() {
     ];
 
     for text in sequence {
-        edit_and_assert(&mut bridge, &fx.vault, &file, text);
+        edit_and_assert(&bridge, &mut store, &fx.vault, &file, text);
     }
 }
 
@@ -101,18 +111,18 @@ fn cold_reopen_replays_oplog() {
     let body = "line one\nline two\ncafé 世界\n";
 
     let container = {
-        let mut bridge = fx.open();
+        let (bridge, mut store) = fx.open();
         std::fs::write(&file, body).unwrap();
-        bridge.import_file(&file).unwrap();
+        bridge.import_file(&mut store, &file).unwrap();
         let container = container_id(&fx.vault, &file).unwrap();
-        assert_eq!(bridge.store().text(&container), body);
+        assert_eq!(store.text(&container), body);
         container
-    }; // bridge dropped: state is on disk only.
+    }; // store dropped: state is on disk only.
 
     // Reopen the SAME store_root with the SAME identity — no re-import.
-    let bridge2 = fx.open();
+    let (_bridge2, store2) = fx.open();
     assert_eq!(
-        bridge2.store().text(&container),
+        store2.text(&container),
         body,
         "reopened store must replay the oplog and recover the imported text"
     );
@@ -123,7 +133,7 @@ fn cold_reopen_replays_oplog() {
 #[test]
 fn byte_stable_roundtrip_over_tricky_files() {
     let fx = Fixture::new();
-    let mut bridge = fx.open();
+    let (bridge, mut store) = fx.open();
 
     // (relative path, raw bytes on disk)
     let cases: &[(&str, &[u8])] = &[
@@ -141,11 +151,11 @@ fn byte_stable_roundtrip_over_tricky_files() {
     for (rel, bytes) in cases {
         let file = fx.vault_file(rel);
         std::fs::write(&file, bytes).unwrap();
-        bridge.import_file(&file).unwrap();
+        bridge.import_file(&mut store, &file).unwrap();
 
         // Remove from disk, then rebuild from the CRDT.
         std::fs::remove_file(&file).unwrap();
-        bridge.project_file(&file).unwrap();
+        bridge.project_file(&mut store, &file).unwrap();
 
         assert_eq!(
             &std::fs::read(&file).unwrap(),
@@ -159,14 +169,11 @@ fn byte_stable_roundtrip_over_tricky_files() {
 /// import DIFFERENT edits to the SAME container id, then their exported oplogs
 /// are merged through the public `Store` API and converge with no data loss.
 ///
-/// WHY a neutral third store instead of merging INTO the bridges: the public
-/// bridge surface exposes only `&Store` (`FolderBridge::store()`), so the
-/// mutating merge calls (`add_peer`, `import_peer`) cannot be driven on a
-/// bridge's own store. We therefore export each bridge's own oplog (a `&self`
-/// call, so reachable) and merge both into a neutral `Store` we own. Importing
-/// in both orders and getting identical text that contains BOTH edits proves the
-/// real Loro CRDT merge is commutative and lossless — the property the task
-/// cares about, via genuine `Store` export/import (not a weaker stand-in).
+/// Each device's caller-owned `Store` exports its own oplog; both logs are then
+/// merged into two neutral `Store`s we own. Importing in both orders and getting
+/// identical text that contains BOTH edits proves the real Loro CRDT merge is
+/// commutative and lossless — the property the task cares about, via genuine
+/// `Store` export/import (not a weaker stand-in).
 #[test]
 fn two_bridges_converge_via_store_merge() {
     // Both vaults use the same relative path so both map to container "note.md".
@@ -183,16 +190,16 @@ fn two_bridges_converge_via_store_merge() {
     assert_eq!(container, container_id(&fx_b.vault, &file_b).unwrap());
 
     let log_a = {
-        let mut a = fx_a.open();
+        let (a, mut store_a) = fx_a.open();
         std::fs::write(&file_a, "alpha-edit\n").unwrap();
-        a.import_file(&file_a).unwrap();
-        a.store().export_own_log().unwrap()
+        a.import_file(&mut store_a, &file_a).unwrap();
+        store_a.export_own_log().unwrap()
     };
     let log_b = {
-        let mut b = fx_b.open();
+        let (b, mut store_b) = fx_b.open();
         std::fs::write(&file_b, "bravo-edit\n").unwrap();
-        b.import_file(&file_b).unwrap();
-        b.store().export_own_log().unwrap()
+        b.import_file(&mut store_b, &file_b).unwrap();
+        store_b.export_own_log().unwrap()
     };
 
     // Merge both exported logs into two neutral stores in opposite orders.
@@ -236,7 +243,7 @@ fn two_bridges_converge_via_store_merge() {
 #[test]
 fn nested_path_maps_and_roundtrips() {
     let fx = Fixture::new();
-    let mut bridge = fx.open();
+    let (bridge, mut store) = fx.open();
 
     let nested = fx.vault.join("a").join("b").join("c.md");
     std::fs::create_dir_all(nested.parent().unwrap()).unwrap();
@@ -245,18 +252,23 @@ fn nested_path_maps_and_roundtrips() {
     std::fs::write(&nested, &original).unwrap();
 
     let container = container_id(&fx.vault, &nested).unwrap();
-    assert_eq!(container, "a/b/c.md", "nested path maps with '/' separators");
+    assert_eq!(
+        container, "a/b/c.md",
+        "nested path maps with '/' separators"
+    );
 
     // scan discovers the nested file and imports it.
-    let outcomes = bridge.scan().unwrap();
+    let outcomes = bridge.scan(&mut store).unwrap();
     assert!(
-        outcomes.iter().any(|(path, outcome)| path == &nested && outcome.changed),
+        outcomes
+            .iter()
+            .any(|(path, outcome)| path == &nested && outcome.changed),
         "scan must pick up the nested file"
     );
-    assert_eq!(bridge.store().text(&container), body);
+    assert_eq!(store.text(&container), body);
 
     // Project back to the same path: byte-identical.
     std::fs::remove_file(&nested).unwrap();
-    bridge.project_file(&nested).unwrap();
+    bridge.project_file(&mut store, &nested).unwrap();
     assert_eq!(std::fs::read(&nested).unwrap(), original);
 }

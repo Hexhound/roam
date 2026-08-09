@@ -1,10 +1,10 @@
 //! Bridge between on-disk vault files and the CRDT [`Store`].
 //!
-//! A [`FolderBridge`] owns a [`Store`] (which persists the CRDT state) and the
-//! vault root where the user's text files live. [`FolderBridge::import_file`]
-//! reconciles a single file's on-disk text into its container, using the
-//! sidecar's last-synced text as the baseline so only the minimal delta is
-//! applied to the CRDT.
+//! A [`FolderBridge`] remembers the vault root where the user's text files live
+//! and takes the caller-owned [`Store`] (which persists the CRDT state) on every
+//! operation. [`FolderBridge::import_file`] reconciles a single file's on-disk
+//! text into its container, using the sidecar's last-synced text as the baseline
+//! so only the minimal delta is applied to the CRDT.
 //!
 //! # LIMITATIONS
 //!
@@ -47,7 +47,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use roam_storage::{Identity, Store};
+use roam_storage::Store;
 
 use crate::error::FilesError;
 use crate::fileset::{EntryKind, EntryStatus, FileEntry, FILESET_MAP_ID};
@@ -69,24 +69,23 @@ pub struct SyncOutcome {
 }
 
 /// Bridges a vault folder of text files into a CRDT [`Store`].
+///
+/// The bridge is STATELESS w.r.t. the store: it holds only the `vault_root` and
+/// takes the [`Store`] explicitly on every operation. This lets the caller (the
+/// sync engine) own a single `Store` instance and share it with the bridge,
+/// instead of the bridge owning a second, separate store handle.
 pub struct FolderBridge {
-    store: Store,
     vault_root: PathBuf,
 }
 
 impl FolderBridge {
-    /// Open the bridge: open the CRDT store at `store_root` for `identity`, and
-    /// remember `vault_root` (where the user's files live).
-    pub fn open(
-        vault_root: &Path,
-        store_root: &Path,
-        identity: Identity,
-    ) -> Result<Self, FilesError> {
-        let store = Store::open(store_root, identity)?;
-        Ok(Self {
-            store,
+    /// Create a bridge over a vault directory. Does NOT open a Store — the caller
+    /// owns the Store and passes it into each operation (so the engine and the
+    /// bridge can share one Store instance).
+    pub fn new(vault_root: &Path) -> Self {
+        Self {
             vault_root: vault_root.to_path_buf(),
-        })
+        }
     }
 
     /// Reconcile `file`'s on-disk text into its container (disk → CRDT).
@@ -95,14 +94,14 @@ impl FolderBridge {
     /// the current file text, applies it to the container, verifies the store
     /// now matches the file, and records the new sidecar. A file with no
     /// changes since the last sync is a no-op that leaves the sidecar untouched.
-    pub fn import_file(&mut self, file: &Path) -> Result<SyncOutcome, FilesError> {
+    pub fn import_file(&self, store: &mut Store, file: &Path) -> Result<SyncOutcome, FilesError> {
         let container = container_id(&self.vault_root, file)?;
 
         // Read bytes then decode so a non-UTF-8 file is a distinct error from
         // an IO failure.
         let bytes = std::fs::read(file)?;
-        let file_text = String::from_utf8(bytes)
-            .map_err(|_| FilesError::NotText(file.to_path_buf()))?;
+        let file_text =
+            String::from_utf8(bytes).map_err(|_| FilesError::NotText(file.to_path_buf()))?;
 
         // Baseline (`A`) for the diff: the sidecar's last-synced text when
         // present, otherwise the store's CURRENT text (NOT ""). Re-seeding
@@ -112,13 +111,13 @@ impl FolderBridge {
         let sidecar = Sidecar::load(file)?;
         let baseline = match &sidecar {
             Some(s) => s.last_synced_text.clone(),
-            None => self.store.text(&container),
+            None => store.text(&container),
         };
 
         // The store's CURRENT text (`R`). It equals `baseline` (`A`) only while
         // this device is the sole writer; once the sync engine merges a remote
         // peer's edits into the container, `R != A` (LIMITATION #1).
-        let remote_text = self.store.text(&container);
+        let remote_text = store.text(&container);
 
         // `expected` is the merged text the store must hold after this import.
         //
@@ -154,8 +153,8 @@ impl FolderBridge {
         let mut apply_err: Option<FilesError> = None;
         for op in &ops {
             let result = match op {
-                TextOp::Insert { pos, s } => self.store.edit_text(&container, *pos, s),
-                TextOp::Delete { pos, len } => self.store.delete_text(&container, *pos, *len),
+                TextOp::Insert { pos, s } => store.edit_text(&container, *pos, s),
+                TextOp::Delete { pos, len } => store.delete_text(&container, *pos, *len),
             };
             if let Err(err) = result {
                 apply_err = Some(err.into());
@@ -163,7 +162,7 @@ impl FolderBridge {
             }
         }
 
-        let actual = self.store.text(&container);
+        let actual = store.text(&container);
         // `reconcile_sidecar` returns `Ok` ONLY on the success path (no apply
         // error and `actual == expected`); every error/desync/DirtyFile path
         // returns `Err` and short-circuits the `?` below, so the file-set entry
@@ -181,7 +180,7 @@ impl FolderBridge {
         // Upsert the Live file-set entry. The hash is over the disk text `L`
         // (`file_text`), which is exactly the sidecar baseline recorded on
         // success — keeping the entry hash and the sidecar consistent.
-        self.store.set_entry(
+        store.set_entry(
             FILESET_MAP_ID,
             &container,
             &FileEntry {
@@ -202,7 +201,7 @@ impl FolderBridge {
     /// on-disk file and its sidecar are removed. The tombstone records the hash
     /// of the container's CURRENT store text so a later resurrection guard can
     /// tell whether the content changed after the delete.
-    pub fn delete_file(&mut self, file: &Path) -> Result<SyncOutcome, FilesError> {
+    pub fn delete_file(&self, store: &mut Store, file: &Path) -> Result<SyncOutcome, FilesError> {
         let container = container_id(&self.vault_root, file)?;
 
         // Tombstone hash = the content THIS DEVICE last synced (the sidecar's
@@ -214,10 +213,10 @@ impl FolderBridge {
         // synced), a degraded best-effort.
         let hash = match Sidecar::load(file)? {
             Some(sidecar) => sidecar.last_synced_hash,
-            None => text_hash(&self.store.text(&container)),
+            None => text_hash(&store.text(&container)),
         };
 
-        self.store.set_entry(
+        store.set_entry(
             FILESET_MAP_ID,
             &container,
             &FileEntry {
@@ -249,9 +248,9 @@ impl FolderBridge {
     ///
     /// `changed` reflects whether disk was written; `ops_applied` is always 0
     /// because projection never mutates the CRDT.
-    pub fn project_file(&mut self, file: &Path) -> Result<SyncOutcome, FilesError> {
+    pub fn project_file(&self, store: &mut Store, file: &Path) -> Result<SyncOutcome, FilesError> {
         let container = container_id(&self.vault_root, file)?;
-        let text = self.store.text(&container);
+        let text = store.text(&container);
 
         // Read the current on-disk text, if any. A missing file is "absent";
         // a non-UTF-8 file simply won't compare equal, so we fall through to a
@@ -350,7 +349,7 @@ impl FolderBridge {
     ///
     /// Only [`EntryKind::Text`] entries participate; the map holds no other kind
     /// this slice.
-    pub fn scan(&mut self) -> Result<Vec<(PathBuf, SyncOutcome)>, FilesError> {
+    pub fn scan(&self, store: &mut Store) -> Result<Vec<(PathBuf, SyncOutcome)>, FilesError> {
         // --- Step 1: flush local disk edits into the CRDT. ---
         let mut files = Vec::new();
         collect_vault_files(&self.vault_root, &mut files)?;
@@ -365,7 +364,7 @@ impl FolderBridge {
 
         let mut outcomes = Vec::new();
         for file in files {
-            match self.import_file(&file) {
+            match self.import_file(store, &file) {
                 Ok(outcome) => outcomes.push((file, outcome)),
                 Err(FilesError::NotText(_)) => continue,
                 Err(err) => return Err(err),
@@ -382,19 +381,19 @@ impl FolderBridge {
         // remote Tombstoned entry" behavior. Require a sidecar so a raw NotText
         // file skipped in Step 1 (empty container) is never force-entried.
         for key in &present {
-            if self.store.get_entry(FILESET_MAP_ID, key).is_some() {
+            if store.get_entry(FILESET_MAP_ID, key).is_some() {
                 continue;
             }
             if !sidecar_path(&self.vault_root.join(key)).exists() {
                 continue;
             }
-            self.store.set_entry(
+            store.set_entry(
                 FILESET_MAP_ID,
                 key,
                 &FileEntry {
                     kind: EntryKind::Text,
                     status: EntryStatus::Live,
-                    content_hash: text_hash(&self.store.text(key)),
+                    content_hash: text_hash(&store.text(key)),
                 }
                 .to_value(),
             )?;
@@ -405,7 +404,7 @@ impl FolderBridge {
         // mutated them). An unchanged import in Step 1 is a no-op that does NOT
         // rewrite its entry, so a remote tombstone on a present-but-unchanged
         // file survives Step 1 to be handled in Step 3.
-        for (key, value) in self.store.entries(FILESET_MAP_ID) {
+        for (key, value) in store.entries(FILESET_MAP_ID) {
             let entry = FileEntry::from_value(&value)?;
             if entry.status != EntryStatus::Live || present.contains(&key) {
                 continue;
@@ -430,9 +429,9 @@ impl FolderBridge {
             // store text only if the sidecar is unreadable.
             let content_hash = match Sidecar::load(&file) {
                 Ok(Some(sidecar)) => sidecar.last_synced_hash,
-                _ => text_hash(&self.store.text(&key)),
+                _ => text_hash(&store.text(&key)),
             };
-            self.store.set_entry(
+            store.set_entry(
                 FILESET_MAP_ID,
                 &key,
                 &FileEntry {
@@ -453,7 +452,7 @@ impl FolderBridge {
         }
 
         // --- Step 3: apply remote state onto disk. ---
-        for (key, value) in self.store.entries(FILESET_MAP_ID) {
+        for (key, value) in store.entries(FILESET_MAP_ID) {
             let entry = FileEntry::from_value(&value)?;
             let file = self.vault_root.join(&key);
             let file_present = present.contains(&key);
@@ -463,7 +462,7 @@ impl FolderBridge {
                     // (never seen here). Present files were handled in Step 1;
                     // absent-with-sidecar became a tombstone in Step 2.
                     if !file_present && !sidecar_path(&file).exists() {
-                        let outcome = self.project_file(&file)?;
+                        let outcome = self.project_file(store, &file)?;
                         outcomes.push((file, outcome));
                     }
                 }
@@ -478,7 +477,7 @@ impl FolderBridge {
                         remove_if_present(&sidecar_path(&file))?;
                         continue;
                     }
-                    let current_hash = text_hash(&self.store.text(&key));
+                    let current_hash = text_hash(&store.text(&key));
                     if current_hash == entry.content_hash {
                         // Delete wins: no edit landed after the tombstone.
                         remove_if_present(&file)?;
@@ -497,7 +496,7 @@ impl FolderBridge {
                         // container hash (so a later reconcile sees Live+matching
                         // and is stable), keep the file, and project so disk
                         // matches the edited container.
-                        self.store.set_entry(
+                        store.set_entry(
                             FILESET_MAP_ID,
                             &key,
                             &FileEntry {
@@ -507,7 +506,7 @@ impl FolderBridge {
                             }
                             .to_value(),
                         )?;
-                        match self.project_file(&file) {
+                        match self.project_file(store, &file) {
                             Ok(outcome) => outcomes.push((file, outcome)),
                             // A dirty disk file carries un-imported local edits —
                             // which ARE the edits the resurrection preserves. Keep
@@ -545,7 +544,12 @@ impl FolderBridge {
     /// `to` container → set the map entries → project `to` to disk → only THEN
     /// remove the `from` file + sidecar. A failure before `to` is written on
     /// disk therefore leaves the `from` file intact.
-    pub fn rename_file(&mut self, from: &Path, to: &Path) -> Result<SyncOutcome, FilesError> {
+    pub fn rename_file(
+        &self,
+        store: &mut Store,
+        from: &Path,
+        to: &Path,
+    ) -> Result<SyncOutcome, FilesError> {
         let from_container = container_id(&self.vault_root, from)?;
         let to_container = container_id(&self.vault_root, to)?;
 
@@ -561,15 +565,15 @@ impl FolderBridge {
         // reflects the LATEST disk content before we copy it. A missing `from`
         // file has nothing to flush; a NotText file propagates its error.
         if from.exists() {
-            self.import_file(from)?;
+            self.import_file(store, from)?;
         }
 
         // Copy the current container text into the (assumed fresh/empty) `to`
         // container. Seeding at pos 0 is correct for a new destination; an
         // empty source is a no-op insert we skip.
-        let text = self.store.text(&from_container);
+        let text = store.text(&from_container);
         if !text.is_empty() {
-            self.store.edit_text(&to_container, 0, &text)?;
+            store.edit_text(&to_container, 0, &text)?;
         }
         let hash = text_hash(&text);
 
@@ -577,7 +581,7 @@ impl FolderBridge {
         // is the MOVED content's hash — consistent with the resurrection guard:
         // absent a concurrent edit to `from` after the rename, the old container
         // still hashes to this and stays deleted.
-        self.store.set_entry(
+        store.set_entry(
             FILESET_MAP_ID,
             &to_container,
             &FileEntry {
@@ -587,7 +591,7 @@ impl FolderBridge {
             }
             .to_value(),
         )?;
-        self.store.set_entry(
+        store.set_entry(
             FILESET_MAP_ID,
             &from_container,
             &FileEntry {
@@ -601,7 +605,7 @@ impl FolderBridge {
         // Disk: write the destination FIRST (creates `to` file + sidecar,
         // byte-stable), then remove the source. Removing `from` only after `to`
         // is on disk means a failure partway never loses the content.
-        self.project_file(to)?;
+        self.project_file(store, to)?;
         remove_if_present(from)?;
         remove_if_present(&sidecar_path(from))?;
 
@@ -609,11 +613,6 @@ impl FolderBridge {
             ops_applied: 0,
             changed: true,
         })
-    }
-
-    /// Borrow the underlying [`Store`] (escape hatch for tests / engine wiring).
-    pub fn store(&self) -> &Store {
-        &self.store
     }
 }
 
@@ -767,29 +766,34 @@ fn reconcile_sidecar(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use roam_storage::Identity;
     use tempfile::tempdir;
 
-    /// Build a bridge over a `vault/` and `store/` subdir of one tempdir.
-    fn bridge(root: &Path) -> FolderBridge {
+    /// Build a bridge over a `vault/` subdir plus a separately-opened store
+    /// rooted at a `store/` subdir of one tempdir. The bridge is stateless; the
+    /// caller owns the returned `Store` and threads it into each operation.
+    fn bridge(root: &Path) -> (FolderBridge, Store) {
         let vault = root.join("vault");
-        let store = root.join("store");
+        let store_root = root.join("store");
         std::fs::create_dir_all(&vault).unwrap();
-        FolderBridge::open(&vault, &store, Identity::generate()).unwrap()
+        let bridge = FolderBridge::new(&vault);
+        let store = Store::open(&store_root, Identity::generate()).unwrap();
+        (bridge, store)
     }
 
     #[test]
     fn new_file_import_seeds_container_and_sidecar() {
         let dir = tempdir().unwrap();
-        let mut b = bridge(dir.path());
+        let (b, mut store) = bridge(dir.path());
         let file = dir.path().join("vault").join("note.md");
         std::fs::write(&file, "hello\n").unwrap();
 
-        let outcome = b.import_file(&file).unwrap();
+        let outcome = b.import_file(&mut store, &file).unwrap();
         assert!(outcome.ops_applied > 0);
         assert!(outcome.changed);
 
         let container = container_id(&dir.path().join("vault"), &file).unwrap();
-        assert_eq!(b.store().text(&container), "hello\n");
+        assert_eq!(store.text(&container), "hello\n");
 
         let sidecar = Sidecar::load(&file).unwrap().unwrap();
         assert_eq!(sidecar.last_synced_text, "hello\n");
@@ -800,14 +804,14 @@ mod tests {
     #[test]
     fn second_import_with_no_change_is_a_no_op() {
         let dir = tempdir().unwrap();
-        let mut b = bridge(dir.path());
+        let (b, mut store) = bridge(dir.path());
         let file = dir.path().join("vault").join("note.md");
         std::fs::write(&file, "hello\n").unwrap();
 
-        b.import_file(&file).unwrap();
+        b.import_file(&mut store, &file).unwrap();
         let sidecar_before = Sidecar::load(&file).unwrap().unwrap();
 
-        let outcome = b.import_file(&file).unwrap();
+        let outcome = b.import_file(&mut store, &file).unwrap();
         assert_eq!(outcome.ops_applied, 0);
         assert!(!outcome.changed);
 
@@ -818,36 +822,36 @@ mod tests {
     #[test]
     fn incremental_edit_applies_a_minimal_delta() {
         let dir = tempdir().unwrap();
-        let mut b = bridge(dir.path());
+        let (b, mut store) = bridge(dir.path());
         let file = dir.path().join("vault").join("note.md");
         std::fs::write(&file, "hello\n").unwrap();
-        b.import_file(&file).unwrap();
+        b.import_file(&mut store, &file).unwrap();
 
         // "hello\n" -> "hello world\n": a single insert of " world".
         std::fs::write(&file, "hello world\n").unwrap();
-        let outcome = b.import_file(&file).unwrap();
+        let outcome = b.import_file(&mut store, &file).unwrap();
         assert!(outcome.changed);
         // Minimal delta: exactly one insert op, not a full re-insert.
         assert_eq!(outcome.ops_applied, 1);
 
         let container = container_id(&dir.path().join("vault"), &file).unwrap();
-        assert_eq!(b.store().text(&container), "hello world\n");
+        assert_eq!(store.text(&container), "hello world\n");
     }
 
     #[test]
     fn multibyte_incremental_reconciles_via_char_offsets() {
         let dir = tempdir().unwrap();
-        let mut b = bridge(dir.path());
+        let (b, mut store) = bridge(dir.path());
         let file = dir.path().join("vault").join("cafe.md");
         std::fs::write(&file, "café\n").unwrap();
-        b.import_file(&file).unwrap();
+        b.import_file(&mut store, &file).unwrap();
 
         std::fs::write(&file, "cafés\n").unwrap();
-        let outcome = b.import_file(&file).unwrap();
+        let outcome = b.import_file(&mut store, &file).unwrap();
         assert!(outcome.changed);
 
         let container = container_id(&dir.path().join("vault"), &file).unwrap();
-        assert_eq!(b.store().text(&container), "cafés\n");
+        assert_eq!(store.text(&container), "cafés\n");
     }
 
     #[test]
@@ -857,22 +861,22 @@ mod tests {
         // to the store's current text (not ""), so an unchanged file is a
         // no-op rather than a full re-insert at pos 0.
         let dir = tempdir().unwrap();
-        let mut b = bridge(dir.path());
+        let (b, mut store) = bridge(dir.path());
         let file = dir.path().join("vault").join("note.md");
         std::fs::write(&file, "hello\n").unwrap();
-        b.import_file(&file).unwrap();
+        b.import_file(&mut store, &file).unwrap();
 
         // Delete the sidecar off disk (simulates a deleted/unsynced
         // `.roammeta` or a cold-reopen oplog replay with no sidecar yet).
         std::fs::remove_file(crate::sidecar::sidecar_path(&file)).unwrap();
 
         // Re-import the SAME unchanged file: must be a no-op, not a double.
-        let outcome = b.import_file(&file).unwrap();
+        let outcome = b.import_file(&mut store, &file).unwrap();
         assert_eq!(outcome.ops_applied, 0);
         assert!(!outcome.changed);
 
         let container = container_id(&dir.path().join("vault"), &file).unwrap();
-        assert_eq!(b.store().text(&container), "hello\n");
+        assert_eq!(store.text(&container), "hello\n");
     }
 
     #[test]
@@ -882,21 +886,21 @@ mod tests {
         // against the store's current text, ending at "hello world\n" (not
         // doubled, not re-seeded from empty).
         let dir = tempdir().unwrap();
-        let mut b = bridge(dir.path());
+        let (b, mut store) = bridge(dir.path());
         let file = dir.path().join("vault").join("note.md");
         std::fs::write(&file, "hello\n").unwrap();
-        b.import_file(&file).unwrap();
+        b.import_file(&mut store, &file).unwrap();
 
         std::fs::remove_file(crate::sidecar::sidecar_path(&file)).unwrap();
         std::fs::write(&file, "hello world\n").unwrap();
 
-        let outcome = b.import_file(&file).unwrap();
+        let outcome = b.import_file(&mut store, &file).unwrap();
         assert!(outcome.changed);
         // Minimal delta against the store: one insert, not a full re-seed.
         assert_eq!(outcome.ops_applied, 1);
 
         let container = container_id(&dir.path().join("vault"), &file).unwrap();
-        assert_eq!(b.store().text(&container), "hello world\n");
+        assert_eq!(store.text(&container), "hello world\n");
     }
 
     #[test]
@@ -905,15 +909,15 @@ mod tests {
         // imported yet. Projecting must NOT overwrite them; it returns
         // Err(DirtyFile) and leaves the file bytes untouched.
         let dir = tempdir().unwrap();
-        let mut b = bridge(dir.path());
+        let (b, mut store) = bridge(dir.path());
         let file = dir.path().join("vault").join("note.md");
         std::fs::write(&file, "hello\n").unwrap();
-        b.import_file(&file).unwrap();
+        b.import_file(&mut store, &file).unwrap();
 
         // Edit disk WITHOUT importing: now disk != baseline and disk != store.
         std::fs::write(&file, "local edit\n").unwrap();
 
-        let result = b.project_file(&file);
+        let result = b.project_file(&mut store, &file);
         assert!(matches!(result, Err(FilesError::DirtyFile(_))));
         // The user's local edit survives untouched.
         assert_eq!(std::fs::read(&file).unwrap(), b"local edit\n");
@@ -925,17 +929,17 @@ mod tests {
         // baseline (no un-imported local edit) but the store has advanced, so
         // overwriting disk with store text is safe.
         let dir = tempdir().unwrap();
-        let mut b = bridge(dir.path());
+        let (b, mut store) = bridge(dir.path());
         let file = dir.path().join("vault").join("note.md");
         std::fs::write(&file, "hello\n").unwrap();
-        b.import_file(&file).unwrap();
+        b.import_file(&mut store, &file).unwrap();
 
         // Advance the store only (disk stays at the baseline "hello\n").
         let container = container_id(&dir.path().join("vault"), &file).unwrap();
-        b.store.edit_text(&container, 5, " world").unwrap();
-        assert_eq!(b.store().text(&container), "hello world\n");
+        store.edit_text(&container, 5, " world").unwrap();
+        assert_eq!(store.text(&container), "hello world\n");
 
-        let outcome = b.project_file(&file).unwrap();
+        let outcome = b.project_file(&mut store, &file).unwrap();
         assert!(outcome.changed);
         assert_eq!(std::fs::read(&file).unwrap(), b"hello world\n");
     }
@@ -948,32 +952,32 @@ mod tests {
         // rebased into the store's coordinates or it lands at the wrong offset
         // and corrupts/desyncs.
         let dir = tempdir().unwrap();
-        let mut b = bridge(dir.path());
+        let (b, mut store) = bridge(dir.path());
         let vault = dir.path().join("vault");
         let file = vault.join("note.md");
         std::fs::write(&file, "hello world\n").unwrap();
-        b.import_file(&file).unwrap();
+        b.import_file(&mut store, &file).unwrap();
 
         let container = container_id(&vault, &file).unwrap();
-        assert_eq!(b.store().text(&container), "hello world\n");
+        assert_eq!(store.text(&container), "hello world\n");
 
         // Simulate a REMOTE merge: a peer inserted "XYZ " at the front of the
         // container. Inject it directly through the store (the same private
         // access `project_file_projects_when_disk_is_clean_but_stale` uses),
         // WITHOUT touching the sidecar — exactly what the sync engine does when
         // it merges a peer's ops into a container this device also syncs.
-        b.store.edit_text(&container, 0, "XYZ ").unwrap();
-        assert_eq!(b.store().text(&container), "XYZ hello world\n");
+        store.edit_text(&container, 0, "XYZ ").unwrap();
+        assert_eq!(store.text(&container), "XYZ hello world\n");
 
         // Local disk edit: insert " END" before the trailing newline.
         std::fs::write(&file, "hello world END\n").unwrap();
-        let outcome = b.import_file(&file).unwrap();
+        let outcome = b.import_file(&mut store, &file).unwrap();
         assert!(outcome.changed);
         assert!(outcome.ops_applied > 0);
 
         // The 3-way merge keeps BOTH the remote "XYZ " prefix AND the local
         // " END" suffix.
-        assert_eq!(b.store().text(&container), "XYZ hello world END\n");
+        assert_eq!(store.text(&container), "XYZ hello world END\n");
 
         // Sidecar baseline tracks the DISK text (L), not the merged store text.
         let sidecar = Sidecar::load(&file).unwrap().unwrap();
@@ -985,22 +989,22 @@ mod tests {
         // Test #2: remote deleted a region the local edit didn't touch; the
         // merge keeps the remote deletion AND the local insertion.
         let dir = tempdir().unwrap();
-        let mut b = bridge(dir.path());
+        let (b, mut store) = bridge(dir.path());
         let vault = dir.path().join("vault");
         let file = vault.join("note.md");
         std::fs::write(&file, "hello world\n").unwrap();
-        b.import_file(&file).unwrap();
+        b.import_file(&mut store, &file).unwrap();
         let container = container_id(&vault, &file).unwrap();
 
         // Remote deletes "world" → store reads "hello \n".
-        b.store.delete_text(&container, 6, 5).unwrap();
-        assert_eq!(b.store().text(&container), "hello \n");
+        store.delete_text(&container, 6, 5).unwrap();
+        assert_eq!(store.text(&container), "hello \n");
 
         // Local inserts " END" before the newline (untouched region).
         std::fs::write(&file, "hello world END\n").unwrap();
-        b.import_file(&file).unwrap();
+        b.import_file(&mut store, &file).unwrap();
 
-        assert_eq!(b.store().text(&container), "hello  END\n");
+        assert_eq!(store.text(&container), "hello  END\n");
     }
 
     #[test]
@@ -1008,24 +1012,24 @@ mod tests {
         // Test #3: local deletes a run remote already partially removed — only
         // the still-present chars are deleted; no out-of-bounds, no error.
         let dir = tempdir().unwrap();
-        let mut b = bridge(dir.path());
+        let (b, mut store) = bridge(dir.path());
         let vault = dir.path().join("vault");
         let file = vault.join("note.md");
         std::fs::write(&file, "hello world\n").unwrap();
-        b.import_file(&file).unwrap();
+        b.import_file(&mut store, &file).unwrap();
         let container = container_id(&vault, &file).unwrap();
 
         // Remote deletes "wor" (chars 6..9) → store reads "hello ld\n".
-        b.store.delete_text(&container, 6, 3).unwrap();
-        assert_eq!(b.store().text(&container), "hello ld\n");
+        store.delete_text(&container, 6, 3).unwrap();
+        assert_eq!(store.text(&container), "hello ld\n");
 
         // Local deletes the whole "world" run → disk "hello \n".
         std::fs::write(&file, "hello \n").unwrap();
-        let outcome = b.import_file(&file).unwrap();
+        let outcome = b.import_file(&mut store, &file).unwrap();
         assert!(outcome.changed);
 
         // Only the still-present "ld" is removed; result converges cleanly.
-        assert_eq!(b.store().text(&container), "hello \n");
+        assert_eq!(store.text(&container), "hello \n");
     }
 
     #[test]
@@ -1033,22 +1037,22 @@ mod tests {
         // Test #4: remote inserts a multi-byte (CJK + emoji) prefix, local edits
         // after it — offsets stay char-correct through the rebase.
         let dir = tempdir().unwrap();
-        let mut b = bridge(dir.path());
+        let (b, mut store) = bridge(dir.path());
         let vault = dir.path().join("vault");
         let file = vault.join("cafe.md");
         std::fs::write(&file, "café\n").unwrap();
-        b.import_file(&file).unwrap();
+        b.import_file(&mut store, &file).unwrap();
         let container = container_id(&vault, &file).unwrap();
 
         // Remote inserts "世界🚀 " at the front (4 chars).
-        b.store.edit_text(&container, 0, "世界🚀 ").unwrap();
-        assert_eq!(b.store().text(&container), "世界🚀 café\n");
+        store.edit_text(&container, 0, "世界🚀 ").unwrap();
+        assert_eq!(store.text(&container), "世界🚀 café\n");
 
         // Local appends " latte" before the newline.
         std::fs::write(&file, "café latte\n").unwrap();
-        b.import_file(&file).unwrap();
+        b.import_file(&mut store, &file).unwrap();
 
-        assert_eq!(b.store().text(&container), "世界🚀 café latte\n");
+        assert_eq!(store.text(&container), "世界🚀 café latte\n");
     }
 
     #[test]
@@ -1057,35 +1061,35 @@ mod tests {
         // import must reach the R == A fast path — stable, byte-stable disk, no
         // drift or re-corruption.
         let dir = tempdir().unwrap();
-        let mut b = bridge(dir.path());
+        let (b, mut store) = bridge(dir.path());
         let vault = dir.path().join("vault");
         let file = vault.join("note.md");
         std::fs::write(&file, "hello world\n").unwrap();
-        b.import_file(&file).unwrap();
+        b.import_file(&mut store, &file).unwrap();
         let container = container_id(&vault, &file).unwrap();
 
         // Concurrent remote merge + local edit, then import (rebase path).
-        b.store.edit_text(&container, 0, "XYZ ").unwrap();
+        store.edit_text(&container, 0, "XYZ ").unwrap();
         std::fs::write(&file, "hello world END\n").unwrap();
-        b.import_file(&file).unwrap();
-        assert_eq!(b.store().text(&container), "XYZ hello world END\n");
+        b.import_file(&mut store, &file).unwrap();
+        assert_eq!(store.text(&container), "XYZ hello world END\n");
 
         // After import the baseline tracks disk (L), not the merged store text.
         let sidecar = Sidecar::load(&file).unwrap().unwrap();
         assert_eq!(sidecar.last_synced_text, "hello world END\n");
 
         // Project the merged store text to disk: now disk == store == baseline.
-        let projected = b.project_file(&file).unwrap();
+        let projected = b.project_file(&mut store, &file).unwrap();
         assert!(projected.changed);
         assert_eq!(std::fs::read(&file).unwrap(), b"XYZ hello world END\n");
         let sidecar = Sidecar::load(&file).unwrap().unwrap();
         assert_eq!(sidecar.last_synced_text, "XYZ hello world END\n");
 
         // A second import now hits the fast path (R == A): a stable no-op.
-        let outcome = b.import_file(&file).unwrap();
+        let outcome = b.import_file(&mut store, &file).unwrap();
         assert_eq!(outcome.ops_applied, 0);
         assert!(!outcome.changed);
-        assert_eq!(b.store().text(&container), "XYZ hello world END\n");
+        assert_eq!(store.text(&container), "XYZ hello world END\n");
 
         // Disk is byte-stable across the whole cycle.
         assert_eq!(std::fs::read(&file).unwrap(), b"XYZ hello world END\n");
@@ -1098,39 +1102,39 @@ mod tests {
         // then advances the baseline to the store text, and the dirty-check
         // still works throughout.
         let dir = tempdir().unwrap();
-        let mut b = bridge(dir.path());
+        let (b, mut store) = bridge(dir.path());
         let vault = dir.path().join("vault");
         let file = vault.join("note.md");
         std::fs::write(&file, "hello world\n").unwrap();
-        b.import_file(&file).unwrap();
+        b.import_file(&mut store, &file).unwrap();
         let container = container_id(&vault, &file).unwrap();
 
-        b.store.edit_text(&container, 0, "XYZ ").unwrap();
+        store.edit_text(&container, 0, "XYZ ").unwrap();
         std::fs::write(&file, "hello world END\n").unwrap();
-        b.import_file(&file).unwrap();
+        b.import_file(&mut store, &file).unwrap();
 
         // Baseline == disk text L, NOT the merged store text.
         let sidecar = Sidecar::load(&file).unwrap().unwrap();
         assert_eq!(sidecar.last_synced_text, "hello world END\n");
-        assert_ne!(sidecar.last_synced_text, b.store().text(&container));
+        assert_ne!(sidecar.last_synced_text, store.text(&container));
 
         // Dirty-check still works: disk == baseline, so projection is allowed
         // (not treated as dirty) and advances the baseline to the store text.
-        b.project_file(&file).unwrap();
+        b.project_file(&mut store, &file).unwrap();
         let sidecar = Sidecar::load(&file).unwrap().unwrap();
-        assert_eq!(sidecar.last_synced_text, b.store().text(&container));
+        assert_eq!(sidecar.last_synced_text, store.text(&container));
         assert_eq!(sidecar.last_synced_text, "XYZ hello world END\n");
     }
 
     #[test]
     fn non_utf8_file_is_not_text() {
         let dir = tempdir().unwrap();
-        let mut b = bridge(dir.path());
+        let (b, mut store) = bridge(dir.path());
         let file = dir.path().join("vault").join("binary.md");
         std::fs::write(&file, [0xff, 0xfe]).unwrap();
 
         assert!(matches!(
-            b.import_file(&file),
+            b.import_file(&mut store, &file),
             Err(FilesError::NotText(_))
         ));
     }
@@ -1146,8 +1150,15 @@ mod tests {
 
         // expected == file_text here (a non-rebase desync): the store diverged
         // from what we intended, so it heals to the actual "partial".
-        let result =
-            reconcile_sidecar(&file, "note.md", "hello world", "hello world", "partial", 1, None);
+        let result = reconcile_sidecar(
+            &file,
+            "note.md",
+            "hello world",
+            "hello world",
+            "partial",
+            1,
+            None,
+        );
         assert!(matches!(result, Err(FilesError::Desync(_))));
 
         let sidecar = Sidecar::load(&file).unwrap().unwrap();
@@ -1200,43 +1211,43 @@ mod tests {
     #[test]
     fn two_files_map_to_independent_containers() {
         let dir = tempdir().unwrap();
-        let mut b = bridge(dir.path());
+        let (b, mut store) = bridge(dir.path());
         let vault = dir.path().join("vault");
         let a = vault.join("a.md");
         let c = vault.join("c.md");
         std::fs::write(&a, "aaa").unwrap();
         std::fs::write(&c, "ccc").unwrap();
 
-        b.import_file(&a).unwrap();
-        b.import_file(&c).unwrap();
+        b.import_file(&mut store, &a).unwrap();
+        b.import_file(&mut store, &c).unwrap();
 
         let ca = container_id(&vault, &a).unwrap();
         let cc = container_id(&vault, &c).unwrap();
         assert_ne!(ca, cc);
-        assert_eq!(b.store().text(&ca), "aaa");
-        assert_eq!(b.store().text(&cc), "ccc");
+        assert_eq!(store.text(&ca), "aaa");
+        assert_eq!(store.text(&cc), "ccc");
 
         // Editing one must not disturb the other.
         std::fs::write(&a, "aaaZ").unwrap();
-        b.import_file(&a).unwrap();
-        assert_eq!(b.store().text(&ca), "aaaZ");
-        assert_eq!(b.store().text(&cc), "ccc");
+        b.import_file(&mut store, &a).unwrap();
+        assert_eq!(store.text(&ca), "aaaZ");
+        assert_eq!(store.text(&cc), "ccc");
     }
 
     #[test]
     fn project_file_is_byte_stable_round_trip() {
         let dir = tempdir().unwrap();
-        let mut b = bridge(dir.path());
+        let (b, mut store) = bridge(dir.path());
         let file = dir.path().join("vault").join("a.md");
         // Multi-byte content with NO trailing newline.
         let original = "# Title\ncafé — 世界";
         std::fs::write(&file, original).unwrap();
         let original_bytes = std::fs::read(&file).unwrap();
 
-        b.import_file(&file).unwrap();
+        b.import_file(&mut store, &file).unwrap();
         std::fs::remove_file(&file).unwrap();
 
-        let outcome = b.project_file(&file).unwrap();
+        let outcome = b.project_file(&mut store, &file).unwrap();
         assert_eq!(outcome.ops_applied, 0);
         assert!(outcome.changed);
 
@@ -1247,16 +1258,16 @@ mod tests {
     #[test]
     fn project_then_import_is_a_no_op() {
         let dir = tempdir().unwrap();
-        let mut b = bridge(dir.path());
+        let (b, mut store) = bridge(dir.path());
         let file = dir.path().join("vault").join("note.md");
         std::fs::write(&file, "hello\n").unwrap();
 
-        b.import_file(&file).unwrap();
+        b.import_file(&mut store, &file).unwrap();
         // Disk already matches the store and the sidecar records it: a no-op.
-        let projected = b.project_file(&file).unwrap();
+        let projected = b.project_file(&mut store, &file).unwrap();
         assert!(!projected.changed);
 
-        let outcome = b.import_file(&file).unwrap();
+        let outcome = b.import_file(&mut store, &file).unwrap();
         assert_eq!(outcome.ops_applied, 0);
         assert!(!outcome.changed);
     }
@@ -1264,13 +1275,13 @@ mod tests {
     #[test]
     fn project_file_writes_store_text_when_disk_missing() {
         let dir = tempdir().unwrap();
-        let mut b = bridge(dir.path());
+        let (b, mut store) = bridge(dir.path());
         let file = dir.path().join("vault").join("x.md");
         std::fs::write(&file, "hello").unwrap();
-        b.import_file(&file).unwrap();
+        b.import_file(&mut store, &file).unwrap();
 
         std::fs::remove_file(&file).unwrap();
-        let outcome = b.project_file(&file).unwrap();
+        let outcome = b.project_file(&mut store, &file).unwrap();
         assert!(outcome.changed);
         assert_eq!(std::fs::read(&file).unwrap(), b"hello");
     }
@@ -1278,7 +1289,7 @@ mod tests {
     #[test]
     fn project_file_creates_parent_dirs() {
         let dir = tempdir().unwrap();
-        let mut b = bridge(dir.path());
+        let (b, mut store) = bridge(dir.path());
         let deep = dir
             .path()
             .join("vault")
@@ -1286,7 +1297,7 @@ mod tests {
             .join("dir")
             .join("deep.md");
 
-        let outcome = b.project_file(&deep).unwrap();
+        let outcome = b.project_file(&mut store, &deep).unwrap();
         assert!(outcome.changed);
         assert!(deep.exists());
         // Empty container projects an empty file (byte-stable, no newline).
@@ -1296,7 +1307,7 @@ mod tests {
     #[test]
     fn scan_imports_md_and_org_ignoring_others() {
         let dir = tempdir().unwrap();
-        let mut b = bridge(dir.path());
+        let (b, mut store) = bridge(dir.path());
         let vault = dir.path().join("vault");
         let one = vault.join("one.md");
         let two = vault.join("nested").join("two.org");
@@ -1315,38 +1326,38 @@ mod tests {
         .store(&one)
         .unwrap();
 
-        let outcomes = b.scan().unwrap();
+        let outcomes = b.scan(&mut store).unwrap();
         assert_eq!(outcomes.len(), 2);
         for (path, outcome) in &outcomes {
             assert!(outcome.changed);
             assert!(path == &one || path == &two);
             let container = container_id(&vault, path).unwrap();
             let expected = std::fs::read_to_string(path).unwrap();
-            assert_eq!(b.store().text(&container), expected);
+            assert_eq!(store.text(&container), expected);
         }
     }
 
     #[test]
     fn scan_skips_non_utf8_md_without_aborting() {
         let dir = tempdir().unwrap();
-        let mut b = bridge(dir.path());
+        let (b, mut store) = bridge(dir.path());
         let vault = dir.path().join("vault");
         let good = vault.join("good.md");
         std::fs::write(&good, "good").unwrap();
         std::fs::write(vault.join("bad.md"), [0xff, 0xff]).unwrap();
 
-        let outcomes = b.scan().unwrap();
+        let outcomes = b.scan(&mut store).unwrap();
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].0, good);
         let container = container_id(&vault, &good).unwrap();
-        assert_eq!(b.store().text(&container), "good");
+        assert_eq!(store.text(&container), "good");
     }
 
     #[cfg(unix)]
     #[test]
     fn scan_does_not_recurse_into_symlink_cycle() {
         let dir = tempdir().unwrap();
-        let mut b = bridge(dir.path());
+        let (b, mut store) = bridge(dir.path());
         let vault = dir.path().join("vault");
         let real = vault.join("real.md");
         std::fs::write(&real, "real body").unwrap();
@@ -1354,16 +1365,16 @@ mod tests {
         // loop forever. scan must terminate.
         std::os::unix::fs::symlink(&vault, vault.join("loop")).unwrap();
 
-        let outcomes = b.scan().unwrap();
+        let outcomes = b.scan(&mut store).unwrap();
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].0, real);
         let container = container_id(&vault, &real).unwrap();
-        assert_eq!(b.store().text(&container), "real body");
+        assert_eq!(store.text(&container), "real body");
     }
 
     /// Find the file-set entry for `container` in the map, if any.
-    fn fileset_entry(b: &FolderBridge, container: &str) -> Option<FileEntry> {
-        b.store()
+    fn fileset_entry(store: &Store, container: &str) -> Option<FileEntry> {
+        store
             .entries(FILESET_MAP_ID)
             .into_iter()
             .find(|(key, _)| key == container)
@@ -1373,14 +1384,14 @@ mod tests {
     #[test]
     fn import_upserts_live_fileset_entry() {
         let dir = tempdir().unwrap();
-        let mut b = bridge(dir.path());
+        let (b, mut store) = bridge(dir.path());
         let vault = dir.path().join("vault");
         let file = vault.join("note.md");
         std::fs::write(&file, "hello\n").unwrap();
-        b.import_file(&file).unwrap();
+        b.import_file(&mut store, &file).unwrap();
 
         let container = container_id(&vault, &file).unwrap();
-        let entry = fileset_entry(&b, &container).unwrap();
+        let entry = fileset_entry(&store, &container).unwrap();
         assert_eq!(
             entry,
             FileEntry {
@@ -1394,17 +1405,17 @@ mod tests {
     #[test]
     fn reimport_after_edit_updates_entry_hash_still_live() {
         let dir = tempdir().unwrap();
-        let mut b = bridge(dir.path());
+        let (b, mut store) = bridge(dir.path());
         let vault = dir.path().join("vault");
         let file = vault.join("note.md");
         std::fs::write(&file, "hello\n").unwrap();
-        b.import_file(&file).unwrap();
+        b.import_file(&mut store, &file).unwrap();
 
         std::fs::write(&file, "hello world\n").unwrap();
-        b.import_file(&file).unwrap();
+        b.import_file(&mut store, &file).unwrap();
 
         let container = container_id(&vault, &file).unwrap();
-        let entry = fileset_entry(&b, &container).unwrap();
+        let entry = fileset_entry(&store, &container).unwrap();
         assert_eq!(entry.status, EntryStatus::Live);
         assert_eq!(entry.content_hash, text_hash("hello world\n"));
     }
@@ -1414,34 +1425,37 @@ mod tests {
         // A NotText import errors before any ops/sidecar/entry write, so no
         // file-set entry must be created.
         let dir = tempdir().unwrap();
-        let mut b = bridge(dir.path());
+        let (b, mut store) = bridge(dir.path());
         let vault = dir.path().join("vault");
         let file = vault.join("binary.md");
         std::fs::write(&file, [0xff, 0xfe]).unwrap();
 
-        assert!(matches!(b.import_file(&file), Err(FilesError::NotText(_))));
+        assert!(matches!(
+            b.import_file(&mut store, &file),
+            Err(FilesError::NotText(_))
+        ));
 
         let container = container_id(&vault, &file).unwrap();
-        assert!(fileset_entry(&b, &container).is_none());
+        assert!(fileset_entry(&store, &container).is_none());
     }
 
     #[test]
     fn delete_file_tombstones_entry_removes_disk_keeps_container() {
         let dir = tempdir().unwrap();
-        let mut b = bridge(dir.path());
+        let (b, mut store) = bridge(dir.path());
         let vault = dir.path().join("vault");
         let file = vault.join("note.md");
         std::fs::write(&file, "hello\n").unwrap();
-        b.import_file(&file).unwrap();
+        b.import_file(&mut store, &file).unwrap();
         let container = container_id(&vault, &file).unwrap();
-        let store_text_before = b.store().text(&container);
+        let store_text_before = store.text(&container);
 
-        let outcome = b.delete_file(&file).unwrap();
+        let outcome = b.delete_file(&mut store, &file).unwrap();
         assert_eq!(outcome.ops_applied, 0);
         assert!(outcome.changed);
 
         // Entry tombstoned with hash == store text at delete time.
-        let entry = fileset_entry(&b, &container).unwrap();
+        let entry = fileset_entry(&store, &container).unwrap();
         assert_eq!(entry.status, EntryStatus::Tombstoned);
         assert_eq!(entry.kind, EntryKind::Text);
         assert_eq!(entry.content_hash, text_hash(&store_text_before));
@@ -1451,44 +1465,43 @@ mod tests {
         assert!(!crate::sidecar::sidecar_path(&file).exists());
 
         // Container text is intact (history / resurrection).
-        assert_eq!(b.store().text(&container), store_text_before);
+        assert_eq!(store.text(&container), store_text_before);
         assert_eq!(store_text_before, "hello\n");
     }
 
     #[test]
     fn delete_file_tolerates_already_absent_disk_file() {
         let dir = tempdir().unwrap();
-        let mut b = bridge(dir.path());
+        let (b, mut store) = bridge(dir.path());
         let vault = dir.path().join("vault");
         let file = vault.join("note.md");
         std::fs::write(&file, "hello\n").unwrap();
-        b.import_file(&file).unwrap();
+        b.import_file(&mut store, &file).unwrap();
         let container = container_id(&vault, &file).unwrap();
 
         // Remove disk file + sidecar out from under delete_file.
         std::fs::remove_file(&file).unwrap();
         std::fs::remove_file(crate::sidecar::sidecar_path(&file)).unwrap();
 
-        let outcome = b.delete_file(&file).unwrap();
+        let outcome = b.delete_file(&mut store, &file).unwrap();
         assert!(outcome.changed);
-        let entry = fileset_entry(&b, &container).unwrap();
+        let entry = fileset_entry(&store, &container).unwrap();
         assert_eq!(entry.status, EntryStatus::Tombstoned);
     }
 
     #[test]
     fn delete_file_leaves_exactly_one_tombstoned_entry_for_path() {
         let dir = tempdir().unwrap();
-        let mut b = bridge(dir.path());
+        let (b, mut store) = bridge(dir.path());
         let vault = dir.path().join("vault");
         let file = vault.join("note.md");
         std::fs::write(&file, "hello\n").unwrap();
-        b.import_file(&file).unwrap();
+        b.import_file(&mut store, &file).unwrap();
         let container = container_id(&vault, &file).unwrap();
 
-        b.delete_file(&file).unwrap();
+        b.delete_file(&mut store, &file).unwrap();
 
-        let matching: Vec<_> = b
-            .store()
+        let matching: Vec<_> = store
             .entries(FILESET_MAP_ID)
             .into_iter()
             .filter(|(key, _)| key == &container)
@@ -1499,8 +1512,8 @@ mod tests {
     }
 
     /// A stable, sorted snapshot of the whole file-set map for equality asserts.
-    fn fileset_snapshot(b: &FolderBridge) -> Vec<(String, String)> {
-        let mut entries = b.store().entries(FILESET_MAP_ID);
+    fn fileset_snapshot(store: &Store) -> Vec<(String, String)> {
+        let mut entries = store.entries(FILESET_MAP_ID);
         entries.sort();
         entries
     }
@@ -1526,11 +1539,11 @@ mod tests {
     #[test]
     fn scan_tombstones_locally_deleted_file() {
         let dir = tempdir().unwrap();
-        let mut b = bridge(dir.path());
+        let (b, mut store) = bridge(dir.path());
         let vault = dir.path().join("vault");
         let file = vault.join("a.md");
         std::fs::write(&file, "hello\n").unwrap();
-        b.import_file(&file).unwrap();
+        b.import_file(&mut store, &file).unwrap();
         let container = container_id(&vault, &file).unwrap();
 
         // Delete the disk file directly (NOT via delete_file); the sidecar is
@@ -1538,86 +1551,89 @@ mod tests {
         std::fs::remove_file(&file).unwrap();
         assert!(sidecar_path(&file).exists());
 
-        b.scan().unwrap();
+        b.scan(&mut store).unwrap();
 
-        let entry = fileset_entry(&b, &container).unwrap();
+        let entry = fileset_entry(&store, &container).unwrap();
         assert_eq!(entry.status, EntryStatus::Tombstoned);
         assert_eq!(entry.content_hash, text_hash("hello\n"));
         // The stale sidecar is dropped so a later remote re-create reads as new.
         assert!(!sidecar_path(&file).exists());
 
         // Idempotent: a second scan with no external change mutates nothing.
-        let before = fileset_snapshot(&b);
-        b.scan().unwrap();
-        assert_eq!(fileset_snapshot(&b), before);
+        let before = fileset_snapshot(&store);
+        b.scan(&mut store).unwrap();
+        assert_eq!(fileset_snapshot(&store), before);
         assert!(!file.exists());
     }
 
     #[test]
     fn scan_projects_remote_new_file() {
         let dir = tempdir().unwrap();
-        let mut b = bridge(dir.path());
+        let (b, mut store) = bridge(dir.path());
         let vault = dir.path().join("vault");
         let file = vault.join("b.md");
 
         // Inject a remote Live entry AND remote container content, with no disk
         // file and no sidecar — exactly what a synced-in peer create looks like.
-        b.store
+        store
             .set_entry(FILESET_MAP_ID, "b.md", &live(text_hash("remote\n")))
             .unwrap();
-        b.store.edit_text("b.md", 0, "remote\n").unwrap();
+        store.edit_text("b.md", 0, "remote\n").unwrap();
         assert!(!file.exists());
         assert!(!sidecar_path(&file).exists());
 
-        b.scan().unwrap();
+        b.scan(&mut store).unwrap();
 
         // The file is created on disk with the remote content and a sidecar.
         assert_eq!(std::fs::read(&file).unwrap(), b"remote\n");
         assert!(sidecar_path(&file).exists());
-        assert_eq!(fileset_entry(&b, "b.md").unwrap().status, EntryStatus::Live);
+        assert_eq!(
+            fileset_entry(&store, "b.md").unwrap().status,
+            EntryStatus::Live
+        );
 
         // Idempotent.
-        let before = fileset_snapshot(&b);
+        let before = fileset_snapshot(&store);
         let disk_before = std::fs::read(&file).unwrap();
-        b.scan().unwrap();
-        assert_eq!(fileset_snapshot(&b), before);
+        b.scan(&mut store).unwrap();
+        assert_eq!(fileset_snapshot(&store), before);
         assert_eq!(std::fs::read(&file).unwrap(), disk_before);
     }
 
     #[test]
     fn scan_applies_remote_tombstone_delete_wins() {
         let dir = tempdir().unwrap();
-        let mut b = bridge(dir.path());
+        let (b, mut store) = bridge(dir.path());
         let vault = dir.path().join("vault");
         let file = vault.join("c.md");
         std::fs::write(&file, "x\n").unwrap();
-        b.import_file(&file).unwrap();
+        b.import_file(&mut store, &file).unwrap();
         let container = container_id(&vault, &file).unwrap();
 
         // Simulate a synced-in remote tombstone whose hash matches the
         // container's CURRENT text: no edit landed after the delete.
-        b.store
+        store
             .set_entry(
                 FILESET_MAP_ID,
                 &container,
-                &tombstoned(text_hash(&b.store().text(&container))),
+                &tombstoned(text_hash(&store.text(&container))),
             )
             .unwrap();
 
-        b.scan().unwrap();
+        b.scan(&mut store).unwrap();
 
         // Delete wins: the disk file and its sidecar are removed.
         assert!(!file.exists());
         assert!(!sidecar_path(&file).exists());
         assert_eq!(
-            fileset_entry(&b, &container).unwrap().status,
+            fileset_entry(&store, &container).unwrap().status,
             EntryStatus::Tombstoned
         );
 
         // Idempotent.
-        let before = fileset_snapshot(&b);
-        b.scan().unwrap();
-        assert_eq!(fileset_snapshot(&b), before);
+        let before = fileset_snapshot(&store);
+        b.scan(&mut store).unwrap();
+        assert_eq!(fileset_snapshot(&store), before);
         assert!(!file.exists());
     }
 
@@ -1629,23 +1645,23 @@ mod tests {
         // (remote-merged) store text — otherwise the resurrection guard can
         // never fire and the peer's concurrent edit is silently deleted.
         let dir = tempdir().unwrap();
-        let mut b = bridge(dir.path());
+        let (b, mut store) = bridge(dir.path());
         let vault = dir.path().join("vault");
         let file = vault.join("x.md");
         std::fs::write(&file, "hello\n").unwrap();
-        b.import_file(&file).unwrap();
+        b.import_file(&mut store, &file).unwrap();
         let container = container_id(&vault, &file).unwrap();
 
         // A remote edit merges into the container after the last local sync.
-        b.store.edit_text(&container, 5, " world").unwrap();
-        assert_eq!(b.store().text(&container), "hello world\n");
+        store.edit_text(&container, 5, " world").unwrap();
+        assert_eq!(store.text(&container), "hello world\n");
 
         // Local delete of the disk file (sidecar left behind).
         std::fs::remove_file(&file).unwrap();
 
-        b.scan().unwrap();
+        b.scan(&mut store).unwrap();
 
-        let entry = fileset_entry(&b, &container).unwrap();
+        let entry = fileset_entry(&store, &container).unwrap();
         assert_eq!(entry.status, EntryStatus::Tombstoned);
         // The OLD/last-synced hash, not the current merged store text.
         assert_eq!(entry.content_hash, text_hash("hello\n"));
@@ -1656,19 +1672,19 @@ mod tests {
     fn delete_file_uses_last_synced_hash_not_current_store_text() {
         // CRITICAL 1 (delete_file variant): same invariant via the explicit API.
         let dir = tempdir().unwrap();
-        let mut b = bridge(dir.path());
+        let (b, mut store) = bridge(dir.path());
         let vault = dir.path().join("vault");
         let file = vault.join("x.md");
         std::fs::write(&file, "hello\n").unwrap();
-        b.import_file(&file).unwrap();
+        b.import_file(&mut store, &file).unwrap();
         let container = container_id(&vault, &file).unwrap();
 
-        b.store.edit_text(&container, 5, " world").unwrap();
-        assert_eq!(b.store().text(&container), "hello world\n");
+        store.edit_text(&container, 5, " world").unwrap();
+        assert_eq!(store.text(&container), "hello world\n");
 
-        b.delete_file(&file).unwrap();
+        b.delete_file(&mut store, &file).unwrap();
 
-        let entry = fileset_entry(&b, &container).unwrap();
+        let entry = fileset_entry(&store, &container).unwrap();
         assert_eq!(entry.status, EntryStatus::Tombstoned);
         assert_eq!(entry.content_hash, text_hash("hello\n"));
     }
@@ -1680,7 +1696,7 @@ mod tests {
         // remote-new gate (Live + absent + !sidecar) stays false forever and
         // the path can never be re-materialized.
         let dir = tempdir().unwrap();
-        let mut b = bridge(dir.path());
+        let (b, mut store) = bridge(dir.path());
         let vault = dir.path().join("vault");
         let file = vault.join("y.md");
 
@@ -1695,28 +1711,31 @@ mod tests {
         .unwrap();
         assert!(sidecar_path(&file).exists());
         assert!(!file.exists());
-        b.store
+        store
             .set_entry(FILESET_MAP_ID, "y.md", &tombstoned(text_hash("old\n")))
             .unwrap();
 
-        b.scan().unwrap();
+        b.scan(&mut store).unwrap();
         // The orphan sidecar is cleaned.
         assert!(!sidecar_path(&file).exists());
 
         // Now a remote re-create at the same path must materialize again.
-        b.store
+        store
             .set_entry(FILESET_MAP_ID, "y.md", &live(text_hash("remote\n")))
             .unwrap();
-        b.store.edit_text("y.md", 0, "remote\n").unwrap();
+        store.edit_text("y.md", 0, "remote\n").unwrap();
 
-        b.scan().unwrap();
+        b.scan(&mut store).unwrap();
         assert_eq!(std::fs::read(&file).unwrap(), b"remote\n");
-        assert_eq!(fileset_entry(&b, "y.md").unwrap().status, EntryStatus::Live);
+        assert_eq!(
+            fileset_entry(&store, "y.md").unwrap().status,
+            EntryStatus::Live
+        );
 
         // Idempotent.
-        let before = fileset_snapshot(&b);
-        b.scan().unwrap();
-        assert_eq!(fileset_snapshot(&b), before);
+        let before = fileset_snapshot(&store);
+        b.scan(&mut store).unwrap();
+        assert_eq!(fileset_snapshot(&store), before);
     }
 
     #[test]
@@ -1725,14 +1744,14 @@ mod tests {
         // but NO file-set entry (pre-file-set migration or a lost entry op) must
         // gain a Live entry, else peers never learn it exists.
         let dir = tempdir().unwrap();
-        let mut b = bridge(dir.path());
+        let (b, mut store) = bridge(dir.path());
         let vault = dir.path().join("vault");
         let file = vault.join("m.md");
         std::fs::write(&file, "hello\n").unwrap();
 
         // Populate the container to match the disk, and write a matching sidecar
         // — but never import_file, so no file-set entry exists.
-        b.store.edit_text("m.md", 0, "hello\n").unwrap();
+        store.edit_text("m.md", 0, "hello\n").unwrap();
         Sidecar {
             version: SIDECAR_VERSION,
             doc_id: "m.md".to_string(),
@@ -1741,18 +1760,18 @@ mod tests {
         }
         .store(&file)
         .unwrap();
-        assert!(fileset_entry(&b, "m.md").is_none());
+        assert!(fileset_entry(&store, "m.md").is_none());
 
-        b.scan().unwrap();
+        b.scan(&mut store).unwrap();
 
-        let entry = fileset_entry(&b, "m.md").unwrap();
+        let entry = fileset_entry(&store, "m.md").unwrap();
         assert_eq!(entry.status, EntryStatus::Live);
         assert_eq!(entry.content_hash, text_hash("hello\n"));
 
         // Idempotent.
-        let before = fileset_snapshot(&b);
-        b.scan().unwrap();
-        assert_eq!(fileset_snapshot(&b), before);
+        let before = fileset_snapshot(&store);
+        b.scan(&mut store).unwrap();
+        assert_eq!(fileset_snapshot(&store), before);
     }
 
     #[test]
@@ -1761,28 +1780,28 @@ mod tests {
         // file that already carries a Tombstoned entry — delete-wins must stay
         // reachable (Step 3 owns it).
         let dir = tempdir().unwrap();
-        let mut b = bridge(dir.path());
+        let (b, mut store) = bridge(dir.path());
         let vault = dir.path().join("vault");
         let file = vault.join("c.md");
         std::fs::write(&file, "x\n").unwrap();
-        b.import_file(&file).unwrap();
+        b.import_file(&mut store, &file).unwrap();
         let container = container_id(&vault, &file).unwrap();
 
         // Remote tombstone whose hash matches the current text (delete wins).
-        b.store
+        store
             .set_entry(
                 FILESET_MAP_ID,
                 &container,
-                &tombstoned(text_hash(&b.store().text(&container))),
+                &tombstoned(text_hash(&store.text(&container))),
             )
             .unwrap();
 
-        b.scan().unwrap();
+        b.scan(&mut store).unwrap();
 
         // Delete wins: the entry stays Tombstoned and the file is removed — the
         // heal did NOT force it back to Live.
         assert_eq!(
-            fileset_entry(&b, &container).unwrap().status,
+            fileset_entry(&store, &container).unwrap().status,
             EntryStatus::Tombstoned
         );
         assert!(!file.exists());
@@ -1791,59 +1810,59 @@ mod tests {
     #[test]
     fn scan_applies_remote_tombstone_resurrection_edit_wins() {
         let dir = tempdir().unwrap();
-        let mut b = bridge(dir.path());
+        let (b, mut store) = bridge(dir.path());
         let vault = dir.path().join("vault");
         let file = vault.join("d.md");
         std::fs::write(&file, "x\n").unwrap();
-        b.import_file(&file).unwrap();
+        b.import_file(&mut store, &file).unwrap();
         let container = container_id(&vault, &file).unwrap();
 
         // Remote tombstone with a STALE hash (the pre-edit text)...
-        b.store
+        store
             .set_entry(FILESET_MAP_ID, &container, &tombstoned(text_hash("x\n")))
             .unwrap();
         // ...then a concurrent edit merged into the container AFTER the delete,
         // so the container diverges from the tombstone hash.
-        let end = b.store().text(&container).chars().count();
-        b.store.edit_text(&container, end, "more\n").unwrap();
-        assert_eq!(b.store().text(&container), "x\nmore\n");
+        let end = store.text(&container).chars().count();
+        store.edit_text(&container, end, "more\n").unwrap();
+        assert_eq!(store.text(&container), "x\nmore\n");
 
-        b.scan().unwrap();
+        b.scan(&mut store).unwrap();
 
         // Edit wins: the file is kept, the entry flips back to Live with the NEW
         // hash, and disk matches the edited container.
         assert!(file.exists());
-        let entry = fileset_entry(&b, &container).unwrap();
+        let entry = fileset_entry(&store, &container).unwrap();
         assert_eq!(entry.status, EntryStatus::Live);
         assert_eq!(entry.content_hash, text_hash("x\nmore\n"));
         assert_eq!(std::fs::read(&file).unwrap(), b"x\nmore\n");
 
         // Idempotent.
-        let before = fileset_snapshot(&b);
+        let before = fileset_snapshot(&store);
         let disk_before = std::fs::read(&file).unwrap();
-        b.scan().unwrap();
-        assert_eq!(fileset_snapshot(&b), before);
+        b.scan(&mut store).unwrap();
+        assert_eq!(fileset_snapshot(&store), before);
         assert_eq!(std::fs::read(&file).unwrap(), disk_before);
     }
 
     #[test]
     fn rename_file_moves_content_disk_and_entries() {
         let dir = tempdir().unwrap();
-        let mut b = bridge(dir.path());
+        let (b, mut store) = bridge(dir.path());
         let vault = dir.path().join("vault");
         let old = vault.join("old.md");
         let new = vault.join("new.md");
         std::fs::write(&old, "content\n").unwrap();
-        b.import_file(&old).unwrap();
+        b.import_file(&mut store, &old).unwrap();
         let old_container = container_id(&vault, &old).unwrap();
         let new_container = container_id(&vault, &new).unwrap();
 
-        let outcome = b.rename_file(&old, &new).unwrap();
+        let outcome = b.rename_file(&mut store, &old, &new).unwrap();
         assert_eq!(outcome.ops_applied, 0);
         assert!(outcome.changed);
 
         // The content lives in the new container now.
-        assert_eq!(b.store().text(&new_container), "content\n");
+        assert_eq!(store.text(&new_container), "content\n");
 
         // The new file exists on disk with the content and a sidecar.
         assert_eq!(std::fs::read(&new).unwrap(), b"content\n");
@@ -1854,10 +1873,10 @@ mod tests {
         assert!(!sidecar_path(&old).exists());
 
         // Entries: new → Live, old → Tombstoned, both hashing the moved content.
-        let new_entry = fileset_entry(&b, &new_container).unwrap();
+        let new_entry = fileset_entry(&store, &new_container).unwrap();
         assert_eq!(new_entry.status, EntryStatus::Live);
         assert_eq!(new_entry.content_hash, text_hash("content\n"));
-        let old_entry = fileset_entry(&b, &old_container).unwrap();
+        let old_entry = fileset_entry(&store, &old_container).unwrap();
         assert_eq!(old_entry.status, EntryStatus::Tombstoned);
         assert_eq!(old_entry.content_hash, text_hash("content\n"));
     }
@@ -1865,14 +1884,14 @@ mod tests {
     #[test]
     fn rename_into_subdir_creates_parent_dir() {
         let dir = tempdir().unwrap();
-        let mut b = bridge(dir.path());
+        let (b, mut store) = bridge(dir.path());
         let vault = dir.path().join("vault");
         let old = vault.join("old.md");
         let new = vault.join("sub").join("new.md");
         std::fs::write(&old, "content\n").unwrap();
-        b.import_file(&old).unwrap();
+        b.import_file(&mut store, &old).unwrap();
 
-        b.rename_file(&old, &new).unwrap();
+        b.rename_file(&mut store, &old, &new).unwrap();
 
         assert!(new.exists());
         assert_eq!(std::fs::read(&new).unwrap(), b"content\n");
@@ -1882,42 +1901,42 @@ mod tests {
     #[test]
     fn rename_flushes_pending_disk_edits_before_moving() {
         let dir = tempdir().unwrap();
-        let mut b = bridge(dir.path());
+        let (b, mut store) = bridge(dir.path());
         let vault = dir.path().join("vault");
         let old = vault.join("old.md");
         let new = vault.join("new.md");
         std::fs::write(&old, "a\n").unwrap();
-        b.import_file(&old).unwrap();
+        b.import_file(&mut store, &old).unwrap();
 
         // Edit the disk file WITHOUT importing: the pending edit must be flushed
         // by rename so the LATEST disk content ("a b\n") is what moves.
         std::fs::write(&old, "a b\n").unwrap();
 
-        b.rename_file(&old, &new).unwrap();
+        b.rename_file(&mut store, &old, &new).unwrap();
 
         let new_container = container_id(&vault, &new).unwrap();
-        assert_eq!(b.store().text(&new_container), "a b\n");
+        assert_eq!(store.text(&new_container), "a b\n");
         assert_eq!(std::fs::read(&new).unwrap(), b"a b\n");
     }
 
     #[test]
     fn rename_then_scan_is_stable() {
         let dir = tempdir().unwrap();
-        let mut b = bridge(dir.path());
+        let (b, mut store) = bridge(dir.path());
         let vault = dir.path().join("vault");
         let old = vault.join("old.md");
         let new = vault.join("new.md");
         std::fs::write(&old, "content\n").unwrap();
-        b.import_file(&old).unwrap();
+        b.import_file(&mut store, &old).unwrap();
 
-        b.rename_file(&old, &new).unwrap();
+        b.rename_file(&mut store, &old, &new).unwrap();
 
         // A post-rename scan must not recreate old.md (Tombstoned + absent) nor
         // disturb new.md (Live + present): disk and entries stay stable.
-        let entries_before = fileset_snapshot(&b);
+        let entries_before = fileset_snapshot(&store);
         let new_disk_before = std::fs::read(&new).unwrap();
-        b.scan().unwrap();
-        assert_eq!(fileset_snapshot(&b), entries_before);
+        b.scan(&mut store).unwrap();
+        assert_eq!(fileset_snapshot(&store), entries_before);
         assert_eq!(std::fs::read(&new).unwrap(), new_disk_before);
         assert!(!old.exists());
         assert!(new.exists());
@@ -1926,23 +1945,23 @@ mod tests {
     #[test]
     fn rename_from_equals_to_is_a_no_op() {
         let dir = tempdir().unwrap();
-        let mut b = bridge(dir.path());
+        let (b, mut store) = bridge(dir.path());
         let vault = dir.path().join("vault");
         let file = vault.join("note.md");
         std::fs::write(&file, "content\n").unwrap();
-        b.import_file(&file).unwrap();
+        b.import_file(&mut store, &file).unwrap();
         let container = container_id(&vault, &file).unwrap();
 
-        let outcome = b.rename_file(&file, &file).unwrap();
+        let outcome = b.rename_file(&mut store, &file, &file).unwrap();
         assert_eq!(outcome.ops_applied, 0);
         assert!(!outcome.changed);
 
         // No data lost: file, sidecar, container, and the Live entry all survive.
         assert_eq!(std::fs::read(&file).unwrap(), b"content\n");
         assert!(sidecar_path(&file).exists());
-        assert_eq!(b.store().text(&container), "content\n");
+        assert_eq!(store.text(&container), "content\n");
         assert_eq!(
-            fileset_entry(&b, &container).unwrap().status,
+            fileset_entry(&store, &container).unwrap().status,
             EntryStatus::Live
         );
     }
