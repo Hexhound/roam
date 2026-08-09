@@ -6,32 +6,29 @@
 //! sidecar's last-synced text as the baseline so only the minimal delta is
 //! applied to the CRDT.
 //!
-//! # LIMITATIONS (resolve before wiring into the concurrent sync engine)
+//! # LIMITATIONS
 //!
-//! This crate is **single-writer-correct only**. Two known integration
-//! landmines MUST be resolved before it is driven by the concurrent sync
-//! engine (where a remote peer can mutate the same container). Both are
-//! out of scope for this crate as it stands; they are documented here (and
-//! in the architecture spec) so they are not silently inherited.
+//! ## #1 — Concurrent remote merges: handled via OT rebase (resolved)
 //!
-//! ## #1 — Baseline-relative offsets break under concurrent remote merges
+//! [`FolderBridge::import_file`] computes the local delta as char offsets
+//! relative to the sidecar baseline `A` (`last_synced_text`, the disk text at
+//! the last sync). Those offsets are only valid against the store while
+//! `store.text() == A` — i.e. while this device is the sole writer. Once the
+//! sync engine merges a remote peer's edits into the same container the store
+//! reads `R != A`, and the raw `A`-space offsets would land mid-remote-content
+//! or out of bounds, producing desync and persisted corruption.
 //!
-//! [`FolderBridge::import_file`] computes edit ops as **char offsets relative
-//! to the sidecar baseline** (or, absent a sidecar, `self.store.text()` at the
-//! moment of import), then applies those offsets to `self.store`. This is only
-//! correct while `store.text() == baseline` at apply time — i.e. while this
-//! device is the sole writer.
-//!
-//! Once the sync engine merges a remote peer's edits into the same container,
-//! `store.text() != baseline`, so the pre-computed offsets land at the wrong
-//! position — mid-remote-content or out of bounds — producing **Desync and
-//! persisted corruption** rather than a clean merge.
-//!
-//! Resolving it requires **content-anchored rebasing** of the diff against the
-//! live `store.text()` (anchor ops to surrounding content, not raw offsets),
-//! or at minimum an assertion that `store.text() == baseline` immediately
-//! before applying (fail loudly instead of corrupting). Do not wire this into
-//! a multi-writer path until one of those exists.
+//! `import_file` now **rebases** the local delta into the store's coordinates
+//! (see [`crate::rebase`]). When `R == A` it keeps the fast path (`A -> L`
+//! offsets applied directly). When `R != A` it re-expresses the local delta
+//! (`A -> L`) in `R`-space and layers it on top of the remote edits — a
+//! **lossless** 3-way merge that keeps both the remote and local edits — then
+//! derives the store op sequence from `diff_to_ops(R, merged)`. The desync
+//! guard compares the store's post-apply text against the independently
+//! computed merged text (not against `L`, since the store legitimately carries
+//! remote edits). On success the sidecar baseline is set to the disk text `L`;
+//! a later [`FolderBridge::project_file`] writes the merged store text to disk
+//! and advances the baseline to it, converging to `disk == store == baseline`.
 //!
 //! ## #4 — No delete/rename propagation
 //!
@@ -51,6 +48,7 @@ use roam_storage::{Identity, Store};
 
 use crate::error::FilesError;
 use crate::path::container_id;
+use crate::rebase::merge_local_onto_remote;
 use crate::sidecar::{text_hash, Sidecar};
 use crate::textdiff::{diff_to_ops, TextOp};
 
@@ -102,21 +100,40 @@ impl FolderBridge {
         let file_text = String::from_utf8(bytes)
             .map_err(|_| FilesError::NotText(file.to_path_buf()))?;
 
-        // Baseline for the diff: the sidecar's last-synced text when present,
-        // otherwise the store's CURRENT text (NOT ""). Re-seeding against ""
-        // when the container is already populated (cold-reopen oplog replay, or
-        // a deleted/unsynced `.roammeta`) would make an unchanged file diff as
-        // a full insert at pos 0 — DOUBLING the container. Diffing against the
-        // store's real text makes an unchanged file a no-op and a changed file
-        // apply only the real delta. See LIMITATION #1 for why this is only
-        // single-writer-correct.
+        // Baseline (`A`) for the diff: the sidecar's last-synced text when
+        // present, otherwise the store's CURRENT text (NOT ""). Re-seeding
+        // against "" when the container is already populated (cold-reopen oplog
+        // replay, or a deleted/unsynced `.roammeta`) would make an unchanged
+        // file diff as a full insert at pos 0 — DOUBLING the container.
         let sidecar = Sidecar::load(file)?;
         let baseline = match &sidecar {
             Some(s) => s.last_synced_text.clone(),
             None => self.store.text(&container),
         };
 
-        let ops = diff_to_ops(&baseline, &file_text);
+        // The store's CURRENT text (`R`). It equals `baseline` (`A`) only while
+        // this device is the sole writer; once the sync engine merges a remote
+        // peer's edits into the container, `R != A` (LIMITATION #1).
+        let remote_text = self.store.text(&container);
+
+        // `expected` is the merged text the store must hold after this import.
+        //
+        // - Fast path (`R == A`, no concurrent remote edits): the local delta's
+        //   `A`-space offsets are already valid against the store, so the merged
+        //   text is simply the disk text `L`.
+        // - Rebase path (`R != A`): re-express the local delta (`A -> L`) in the
+        //   store's `R`-coordinates via OT rebase and layer it on top of the
+        //   remote edits — LOSSLESS, keeping both sides.
+        let expected = if remote_text == baseline {
+            file_text.clone()
+        } else {
+            merge_local_onto_remote(&baseline, &file_text, &remote_text)
+        };
+
+        // Ops that carry the store from its CURRENT text to the merged text.
+        // Deriving them from `R -> expected` (rather than the raw `A -> L`
+        // offsets) is what makes the offsets correct regardless of remote merges.
+        let ops = diff_to_ops(&remote_text, &expected);
         if ops.is_empty() {
             return Ok(SyncOutcome {
                 ops_applied: 0,
@@ -143,7 +160,15 @@ impl FolderBridge {
         }
 
         let actual = self.store.text(&container);
-        reconcile_sidecar(file, &container, &file_text, &actual, ops.len(), apply_err)
+        reconcile_sidecar(
+            file,
+            &container,
+            &file_text,
+            &expected,
+            &actual,
+            ops.len(),
+            apply_err,
+        )
     }
 
     /// Project the container's current CRDT text onto disk (CRDT → disk).
@@ -318,31 +343,61 @@ fn is_vault_file(path: &Path) -> bool {
     }
 }
 
-/// Reconcile the sidecar to the store's ACTUAL post-apply state, then decide
-/// the result.
+/// Reconcile the sidecar after applying the import ops, then decide the result.
 ///
-/// This runs on every apply path — success, partial-apply failure, and desync.
-/// The sidecar is ALWAYS written with `last_synced_text = actual` (the store's
-/// real text), never the intended `file_text`. That guarantees the next
-/// `import_file` diffs `actual -> file_text` (only the remaining delta) so a
-/// retry converges instead of re-applying an already-partially-applied diff and
-/// escalating corruption.
+/// The baseline written to the sidecar depends on the outcome, because the
+/// sidecar tracks the **disk sync-point / merge ancestor** the next import will
+/// diff against:
 ///
-/// - On success (`actual == file_text`, no apply error) `actual` equals
-///   `file_text`, so the sidecar records the file text exactly as before.
-/// - If an op failed mid-sequence, its storage error is propagated AFTER the
-///   sidecar is healed.
-/// - Otherwise a mismatch is reported as [`FilesError::Desync`].
+/// - **Success** (no apply error, and the store's `actual` text matches the
+///   `expected` merged text): record `last_synced_text = file_text` — the
+///   current DISK text `L`. Under a concurrent remote merge the store also
+///   carries remote edits (`actual == expected != L`), so recording `actual`
+///   would wrongly mark the disk as dirty and re-diff on the next import.
+///   Recording `L` keeps `baseline == disk`, which the dirty-check and the next
+///   diff depend on. A later [`FolderBridge::project_file`] then writes the
+///   merged store text to disk and advances the baseline to it, so the cycle
+///   converges to `disk == store == baseline`.
+/// - **Error / desync** (an op failed mid-sequence, or `actual != expected`):
+///   heal `last_synced_text = actual` (the store's REAL text) so a retry diffs
+///   `actual -> file_text` (only the remaining delta) and CONVERGES instead of
+///   re-applying an already-partially-applied diff and escalating corruption.
+///   A mid-sequence storage error is propagated after healing; otherwise the
+///   mismatch is reported as [`FilesError::Desync`].
+///
+/// `expected` is the in-memory merged text derived by the OT rebase (or `L` on
+/// the fast path); comparing the store's `actual` against it — rather than
+/// against `L` — is the post-rebase desync invariant (the store legitimately
+/// carries remote edits, so `actual == L` no longer holds).
+#[allow(clippy::too_many_arguments)]
 fn reconcile_sidecar(
     file: &Path,
     container: &str,
     file_text: &str,
+    expected: &str,
     actual: &str,
     ops_applied: usize,
     apply_err: Option<FilesError>,
 ) -> Result<SyncOutcome, FilesError> {
-    // Heal FIRST so the store's real state is recorded even when we're about to
-    // return an error — convergence-to-disk beats preserving a rare remote edit.
+    // SUCCESS: baseline tracks the disk text `L`, not the (possibly
+    // remote-merged) store text.
+    if apply_err.is_none() && actual == expected {
+        Sidecar {
+            version: SIDECAR_VERSION,
+            doc_id: container.to_string(),
+            last_synced_hash: text_hash(file_text),
+            last_synced_text: file_text.to_string(),
+        }
+        .store(file)?;
+        return Ok(SyncOutcome {
+            ops_applied,
+            changed: true,
+        });
+    }
+
+    // ERROR / DESYNC: heal to the store's actual state so a retry converges.
+    // Heal FIRST so the real state is recorded even when we're about to return
+    // an error — convergence-to-disk beats preserving a rare remote edit.
     Sidecar {
         version: SIDECAR_VERSION,
         doc_id: container.to_string(),
@@ -354,15 +409,9 @@ fn reconcile_sidecar(
     if let Some(err) = apply_err {
         return Err(err);
     }
-    if actual != file_text {
-        return Err(FilesError::Desync(format!(
-            "container {container}: store text diverged from file text after import"
-        )));
-    }
-    Ok(SyncOutcome {
-        ops_applied,
-        changed: true,
-    })
+    Err(FilesError::Desync(format!(
+        "container {container}: store text diverged from expected merge after import"
+    )))
 }
 
 #[cfg(test)]
@@ -542,6 +591,188 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_remote_merge_import_rebases_local_edit() {
+        // LIMITATION #1 reproduction (fail-first before the OT-rebase fix):
+        // a remote peer's edit has already been merged into the container, so
+        // `store.text() != baseline`. The baseline-relative local diff must be
+        // rebased into the store's coordinates or it lands at the wrong offset
+        // and corrupts/desyncs.
+        let dir = tempdir().unwrap();
+        let mut b = bridge(dir.path());
+        let vault = dir.path().join("vault");
+        let file = vault.join("note.md");
+        std::fs::write(&file, "hello world\n").unwrap();
+        b.import_file(&file).unwrap();
+
+        let container = container_id(&vault, &file).unwrap();
+        assert_eq!(b.store().text(&container), "hello world\n");
+
+        // Simulate a REMOTE merge: a peer inserted "XYZ " at the front of the
+        // container. Inject it directly through the store (the same private
+        // access `project_file_projects_when_disk_is_clean_but_stale` uses),
+        // WITHOUT touching the sidecar — exactly what the sync engine does when
+        // it merges a peer's ops into a container this device also syncs.
+        b.store.edit_text(&container, 0, "XYZ ").unwrap();
+        assert_eq!(b.store().text(&container), "XYZ hello world\n");
+
+        // Local disk edit: insert " END" before the trailing newline.
+        std::fs::write(&file, "hello world END\n").unwrap();
+        let outcome = b.import_file(&file).unwrap();
+        assert!(outcome.changed);
+        assert!(outcome.ops_applied > 0);
+
+        // The 3-way merge keeps BOTH the remote "XYZ " prefix AND the local
+        // " END" suffix.
+        assert_eq!(b.store().text(&container), "XYZ hello world END\n");
+
+        // Sidecar baseline tracks the DISK text (L), not the merged store text.
+        let sidecar = Sidecar::load(&file).unwrap().unwrap();
+        assert_eq!(sidecar.last_synced_text, "hello world END\n");
+    }
+
+    #[test]
+    fn concurrent_remote_delete_local_insert_merges_both() {
+        // Test #2: remote deleted a region the local edit didn't touch; the
+        // merge keeps the remote deletion AND the local insertion.
+        let dir = tempdir().unwrap();
+        let mut b = bridge(dir.path());
+        let vault = dir.path().join("vault");
+        let file = vault.join("note.md");
+        std::fs::write(&file, "hello world\n").unwrap();
+        b.import_file(&file).unwrap();
+        let container = container_id(&vault, &file).unwrap();
+
+        // Remote deletes "world" → store reads "hello \n".
+        b.store.delete_text(&container, 6, 5).unwrap();
+        assert_eq!(b.store().text(&container), "hello \n");
+
+        // Local inserts " END" before the newline (untouched region).
+        std::fs::write(&file, "hello world END\n").unwrap();
+        b.import_file(&file).unwrap();
+
+        assert_eq!(b.store().text(&container), "hello  END\n");
+    }
+
+    #[test]
+    fn local_delete_of_partially_remote_deleted_region() {
+        // Test #3: local deletes a run remote already partially removed — only
+        // the still-present chars are deleted; no out-of-bounds, no error.
+        let dir = tempdir().unwrap();
+        let mut b = bridge(dir.path());
+        let vault = dir.path().join("vault");
+        let file = vault.join("note.md");
+        std::fs::write(&file, "hello world\n").unwrap();
+        b.import_file(&file).unwrap();
+        let container = container_id(&vault, &file).unwrap();
+
+        // Remote deletes "wor" (chars 6..9) → store reads "hello ld\n".
+        b.store.delete_text(&container, 6, 3).unwrap();
+        assert_eq!(b.store().text(&container), "hello ld\n");
+
+        // Local deletes the whole "world" run → disk "hello \n".
+        std::fs::write(&file, "hello \n").unwrap();
+        let outcome = b.import_file(&file).unwrap();
+        assert!(outcome.changed);
+
+        // Only the still-present "ld" is removed; result converges cleanly.
+        assert_eq!(b.store().text(&container), "hello \n");
+    }
+
+    #[test]
+    fn multibyte_rebase_stays_char_correct() {
+        // Test #4: remote inserts a multi-byte (CJK + emoji) prefix, local edits
+        // after it — offsets stay char-correct through the rebase.
+        let dir = tempdir().unwrap();
+        let mut b = bridge(dir.path());
+        let vault = dir.path().join("vault");
+        let file = vault.join("cafe.md");
+        std::fs::write(&file, "café\n").unwrap();
+        b.import_file(&file).unwrap();
+        let container = container_id(&vault, &file).unwrap();
+
+        // Remote inserts "世界🚀 " at the front (4 chars).
+        b.store.edit_text(&container, 0, "世界🚀 ").unwrap();
+        assert_eq!(b.store().text(&container), "世界🚀 café\n");
+
+        // Local appends " latte" before the newline.
+        std::fs::write(&file, "café latte\n").unwrap();
+        b.import_file(&file).unwrap();
+
+        assert_eq!(b.store().text(&container), "世界🚀 café latte\n");
+    }
+
+    #[test]
+    fn concurrent_merge_import_then_project_converges_to_fast_path() {
+        // Test #6: a concurrent-merge import, then project_file, then a second
+        // import must reach the R == A fast path — stable, byte-stable disk, no
+        // drift or re-corruption.
+        let dir = tempdir().unwrap();
+        let mut b = bridge(dir.path());
+        let vault = dir.path().join("vault");
+        let file = vault.join("note.md");
+        std::fs::write(&file, "hello world\n").unwrap();
+        b.import_file(&file).unwrap();
+        let container = container_id(&vault, &file).unwrap();
+
+        // Concurrent remote merge + local edit, then import (rebase path).
+        b.store.edit_text(&container, 0, "XYZ ").unwrap();
+        std::fs::write(&file, "hello world END\n").unwrap();
+        b.import_file(&file).unwrap();
+        assert_eq!(b.store().text(&container), "XYZ hello world END\n");
+
+        // After import the baseline tracks disk (L), not the merged store text.
+        let sidecar = Sidecar::load(&file).unwrap().unwrap();
+        assert_eq!(sidecar.last_synced_text, "hello world END\n");
+
+        // Project the merged store text to disk: now disk == store == baseline.
+        let projected = b.project_file(&file).unwrap();
+        assert!(projected.changed);
+        assert_eq!(std::fs::read(&file).unwrap(), b"XYZ hello world END\n");
+        let sidecar = Sidecar::load(&file).unwrap().unwrap();
+        assert_eq!(sidecar.last_synced_text, "XYZ hello world END\n");
+
+        // A second import now hits the fast path (R == A): a stable no-op.
+        let outcome = b.import_file(&file).unwrap();
+        assert_eq!(outcome.ops_applied, 0);
+        assert!(!outcome.changed);
+        assert_eq!(b.store().text(&container), "XYZ hello world END\n");
+
+        // Disk is byte-stable across the whole cycle.
+        assert_eq!(std::fs::read(&file).unwrap(), b"XYZ hello world END\n");
+    }
+
+    #[test]
+    fn concurrent_merge_baseline_tracks_disk_then_project_advances_it() {
+        // Test #7: after a concurrent-merge import, the sidecar baseline equals
+        // the DISK text L (not the merged store text); a subsequent project_file
+        // then advances the baseline to the store text, and the dirty-check
+        // still works throughout.
+        let dir = tempdir().unwrap();
+        let mut b = bridge(dir.path());
+        let vault = dir.path().join("vault");
+        let file = vault.join("note.md");
+        std::fs::write(&file, "hello world\n").unwrap();
+        b.import_file(&file).unwrap();
+        let container = container_id(&vault, &file).unwrap();
+
+        b.store.edit_text(&container, 0, "XYZ ").unwrap();
+        std::fs::write(&file, "hello world END\n").unwrap();
+        b.import_file(&file).unwrap();
+
+        // Baseline == disk text L, NOT the merged store text.
+        let sidecar = Sidecar::load(&file).unwrap().unwrap();
+        assert_eq!(sidecar.last_synced_text, "hello world END\n");
+        assert_ne!(sidecar.last_synced_text, b.store().text(&container));
+
+        // Dirty-check still works: disk == baseline, so projection is allowed
+        // (not treated as dirty) and advances the baseline to the store text.
+        b.project_file(&file).unwrap();
+        let sidecar = Sidecar::load(&file).unwrap().unwrap();
+        assert_eq!(sidecar.last_synced_text, b.store().text(&container));
+        assert_eq!(sidecar.last_synced_text, "XYZ hello world END\n");
+    }
+
+    #[test]
     fn non_utf8_file_is_not_text() {
         let dir = tempdir().unwrap();
         let mut b = bridge(dir.path());
@@ -563,7 +794,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let file = dir.path().join("note.md");
 
-        let result = reconcile_sidecar(&file, "note.md", "hello world", "partial", 1, None);
+        // expected == file_text here (a non-rebase desync): the store diverged
+        // from what we intended, so it heals to the actual "partial".
+        let result =
+            reconcile_sidecar(&file, "note.md", "hello world", "hello world", "partial", 1, None);
         assert!(matches!(result, Err(FilesError::Desync(_))));
 
         let sidecar = Sidecar::load(&file).unwrap().unwrap();
@@ -579,7 +813,15 @@ mod tests {
         // A simulated storage failure captured mid-sequence must still heal the
         // sidecar to the store's actual state before propagating.
         let err = FilesError::Sidecar("simulated storage failure".into());
-        let result = reconcile_sidecar(&file, "note.md", "hello world", "partial", 1, Some(err));
+        let result = reconcile_sidecar(
+            &file,
+            "note.md",
+            "hello world",
+            "hello world",
+            "partial",
+            1,
+            Some(err),
+        );
         assert!(result.is_err());
 
         let sidecar = Sidecar::load(&file).unwrap().unwrap();
@@ -591,7 +833,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let file = dir.path().join("note.md");
 
-        let outcome = reconcile_sidecar(&file, "note.md", "same", "same", 2, None).unwrap();
+        let outcome = reconcile_sidecar(&file, "note.md", "same", "same", "same", 2, None).unwrap();
         assert_eq!(
             outcome,
             SyncOutcome {

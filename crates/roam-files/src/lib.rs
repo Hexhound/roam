@@ -10,6 +10,7 @@
 mod bridge;
 mod error;
 mod path;
+mod rebase;
 mod sidecar;
 mod textdiff;
 
