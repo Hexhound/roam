@@ -1,6 +1,7 @@
 //! roam-storage — op-log-is-truth persistence for roam-crdt documents.
 
 mod blob;
+pub mod checkpoint;
 mod error;
 mod history;
 mod history_util;
