@@ -1,0 +1,11 @@
+[package]
+name = "roam-rbsr"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+negentropy = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

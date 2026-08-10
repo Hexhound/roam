@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/roam-crdt", "crates/roam-storage", "crates/roam-sync-core", "crates/roam-transport-iroh", "crates/roam-cli", "crates/roam-files", "crates/roam-backend-client"]
+members = ["crates/roam-crdt", "crates/roam-storage", "crates/roam-sync-core", "crates/roam-transport-iroh", "crates/roam-cli", "crates/roam-files", "crates/roam-backend-client", "crates/roam-rbsr"]
 
 [workspace.package]
 edition = "2021"
@@ -9,6 +9,7 @@ repository = "https://github.com/roam/roam-sync"
 
 [workspace.dependencies]
 loro = "1.13.9"
+negentropy = "0.5"
 ed25519-dalek = "2"
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }
