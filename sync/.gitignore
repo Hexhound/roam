@@ -35,3 +35,6 @@ sync-*.tar
 npm-debug.log
 /assets/node_modules/
 
+# Rustler-compiled NIF shared objects (rebuilt on `mix compile`).
+/priv/native/
+
