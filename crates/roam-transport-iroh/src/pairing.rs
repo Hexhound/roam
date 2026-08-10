@@ -71,6 +71,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::endpoint::{build_endpoint, PAIRING_ALPN};
 
+/// Derive the two vault subkeys from the raw 32-byte vault key. These labels
+/// MUST stay byte-identical to `roam_backend_client::crypto::VaultKey`'s
+/// `id_subkey`/`aead_subkey` derivations — the backend and the keychain must
+/// agree on epoch-0 and the id namespace. (Pairing needs them to publish the
+/// joiner's epoch wraps via `Store::backfill_wraps`.)
+fn vault_subkeys(vault_key: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
+    let id_key = blake3::derive_key("roam-backend-client id-derivation v1", vault_key);
+    let epoch0 = blake3::derive_key("roam-backend-client aead v1", vault_key);
+    (id_key, epoch0)
+}
+
 /// How long the host waits for the one inbound pairing connection before giving
 /// up. Pairing is an interactive, user-driven action, so this is generous.
 const ACCEPT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -144,6 +155,10 @@ pub struct JoinAccept {
     pub roster_author: u64,
     /// A's signed roster log, so B learns A's siblings (transitive mesh).
     pub roster_jsonl: Vec<u8>,
+    /// The host's signed key-log (author = `keylog_author`), so the joiner learns
+    /// the epoch DAG and any wraps addressed to it. Empty for an un-rotated vault.
+    pub keylog_author: u64,
+    pub keylog_jsonl: Vec<u8>,
 }
 
 /// The armed host side of a pairing exchange.
@@ -268,11 +283,20 @@ impl PairingHost<'_> {
         self.store
             .add_peer(req.peer_id, req.verifying_key)
             .context("add paired peer to roster")?;
+        // Wrap every epoch the host can open to the freshly-added joiner, so the
+        // newcomer starts Synced instead of WaitingKey. (No-op for an un-rotated
+        // vault: only epoch 0 exists and it is never wrapped.)
+        let (id_key, epoch0) = vault_subkeys(&self.vault_key);
+        self.store
+            .backfill_wraps(&id_key, &epoch0)
+            .context("wrap epochs to the new joiner")?;
         let accept = JoinAccept {
             vault: self.vault.0,
             vault_key: self.vault_key,
             roster_author: self.identity.peer_id(),
             roster_jsonl: self.store.export_own_roster().context("export own roster")?,
+            keylog_author: self.identity.peer_id(),
+            keylog_jsonl: self.store.export_own_keylog().context("export own keylog")?,
         };
         write_msg(&mut send, &accept)
             .await
@@ -360,6 +384,14 @@ async fn run_join(
     store
         .import_roster(accept.roster_author, &host_key, accept.roster_jsonl)
         .context("import host roster")?;
+    // Import the host's key-log so we learn the epoch DAG and any wraps addressed
+    // to us (the host published them via backfill during accept). Authenticated by
+    // the same host key as the roster.
+    if !accept.keylog_jsonl.is_empty() {
+        store
+            .import_keylog(accept.keylog_author, &host_key, accept.keylog_jsonl)
+            .context("import host keylog")?;
+    }
 
     conn.close(0u32.into(), b"paired");
     Ok(accept.vault_key)
@@ -472,6 +504,43 @@ mod tests {
                 .iter()
                 .any(|p| p.peer_id == ia.peer_id() && p.status == PeerStatus::Active),
             "B must trust A after pairing"
+        );
+    }
+
+    /// The host rotates BEFORE pairing; the joiner must come away able to open the
+    /// rotated epoch (the host wrapped it to the joiner during accept).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_joiner_receives_the_keylog_and_can_open_a_rotated_epoch() {
+        let da = tempdir().unwrap();
+        let db = tempdir().unwrap();
+        let ia = Identity::generate();
+        let ib = Identity::generate();
+        let vault = VaultId::generate();
+        let vault_key = [42u8; 32];
+        let (id_key, epoch0) = vault_subkeys(&vault_key);
+
+        let mut sa = Store::open(da.path(), ia.clone()).unwrap();
+        // Host rotates while alone -> mints epoch 1, wrapped to itself.
+        let rotated = sa.rotate_epoch(&id_key, &epoch0, None).unwrap();
+        assert!(sa.keychain(&id_key, &epoch0).unwrap().epoch_key(&rotated).is_some());
+
+        let (token, host) = host_pairing(&ia, vault, vault_key, &mut sa).await.unwrap();
+        let db_root = db.path().to_path_buf();
+        let join = tokio::spawn(join_pairing(ib.clone(), db_root, token));
+
+        host.accept_auto().await.unwrap();
+        let (sb, _vk) = join.await.unwrap().unwrap();
+
+        // The joiner can open the epoch the host minted before B existed.
+        let kc_b = sb.keychain(&id_key, &epoch0).unwrap();
+        assert!(
+            kc_b.epoch_key(&rotated).is_some(),
+            "joiner must recover the rotated epoch key via the seeded key-log + wrap"
+        );
+        assert_eq!(
+            kc_b.epoch_key(&rotated),
+            sa.keychain(&id_key, &epoch0).unwrap().epoch_key(&rotated),
+            "same epoch key on both sides"
         );
     }
 
