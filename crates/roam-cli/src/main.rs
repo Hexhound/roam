@@ -295,6 +295,12 @@ fn spawn_backend_sync(
             if let Err(err) = reconcile_once(&store, &backend, &vault_key).await {
                 eprintln!("backend sync error: {err}");
             }
+            // Opportunistic wrap-back-fill: publish any missing epoch wraps for
+            // members we can now see (convergent, idempotent). Best-effort; a
+            // failure here must not kill the sync loop.
+            if let Err(err) = store.lock().await.backfill_wraps(&vault_key.id_key(), &vault_key.epoch0_key()) {
+                eprintln!("backend sync backfill error: {err}");
+            }
         }
     });
     println!("backend sync enabled: {backend_url}");

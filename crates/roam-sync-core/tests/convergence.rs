@@ -58,6 +58,65 @@ async fn two_engines_converge_on_connect() {
     assert!(ta.contains('A') && ta.contains('B'), "no edit lost: {ta}");
 }
 
+#[tokio::test]
+async fn keylog_gossips_a_rotated_epoch_to_a_trusted_peer() {
+    // A rotates + wraps to B; gossip must carry A's key-log to B so B can
+    // open A's epoch. Mirrors the roster-gossip convergence test.
+    // id_key/epoch0 are arbitrary fixed test bytes, identical on both sides.
+    let id_key = [0x1au8; 32];
+    let epoch0 = [0x2bu8; 32];
+
+    let board = MemorySwitchboard::new();
+    let vault = VaultId::generate();
+    let da = tempdir().unwrap();
+    let db = tempdir().unwrap();
+    let ida = Identity::generate();
+    let idb = Identity::generate();
+
+    let mut sa = Store::open(da.path(), ida.clone()).unwrap();
+    let mut sb = Store::open(db.path(), idb.clone()).unwrap();
+    // Cross-vouch: each engine vouches for the other.
+    seed_pair(&mut sa, &ida, &idb);
+    seed_pair(&mut sb, &idb, &ida);
+
+    // A rotates to a fresh epoch and back-fills wraps to current members.
+    let epoch = sa.rotate_epoch(&id_key, &epoch0, None).unwrap();
+    sa.backfill_wraps(&id_key, &epoch0).unwrap();
+
+    let ea = Arc::new(Engine::new(
+        ida.clone(),
+        vault,
+        sa,
+        Arc::new(board.endpoint(ida.peer_id())),
+    ));
+    let eb = Arc::new(Engine::new(
+        idb.clone(),
+        vault,
+        sb,
+        Arc::new(board.endpoint(idb.peer_id())),
+    ));
+    tokio::spawn(ea.clone().run());
+    tokio::spawn(eb.clone().run());
+
+    // Drive the mesh so KeylogOps flows A -> B.
+    ea.connect(idb.peer_id()).await.unwrap();
+    eb.connect(ida.peer_id()).await.unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // B must now be able to open A's rotated epoch via the gossiped key-log.
+    let kc_b = eb
+        .store()
+        .lock()
+        .await
+        .keychain(&id_key, &epoch0)
+        .unwrap();
+    assert!(
+        kc_b.epoch_key(&epoch).is_some(),
+        "B must recover A's rotated epoch key via key-log gossip"
+    );
+}
+
 /// A single random edit: which of the three engines authors it, and the (unique,
 /// tracked) marker text inserted at the end of its "note".
 #[derive(Clone, Debug)]

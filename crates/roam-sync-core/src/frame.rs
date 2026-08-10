@@ -27,6 +27,10 @@ pub enum Frame {
     /// Whole-blob, single frame; the receiver re-hashes `bytes` and rejects any
     /// mismatch (a peer must not be able to poison a hash with wrong bytes).
     BlobData { hash: String, bytes: Vec<u8> },
+    /// Per key-log author, how many entries the sender holds (mirrors RosterHave).
+    KeylogHave { authors: Vec<(u64, u64)> },
+    /// Signed key-log lines authored by `author` (mirrors RosterOps).
+    KeylogOps { author: u64, jsonl: Vec<u8> },
 }
 
 impl Frame {
@@ -49,6 +53,8 @@ impl Frame {
             Frame::Ping => "Ping",
             Frame::BlobWant { .. } => "BlobWant",
             Frame::BlobData { .. } => "BlobData",
+            Frame::KeylogHave { .. } => "KeylogHave",
+            Frame::KeylogOps { .. } => "KeylogOps",
         }
     }
 }
@@ -73,5 +79,15 @@ mod tests {
             let bytes = f.encode();
             assert_eq!(Frame::decode(&bytes).unwrap(), f);
         }
+    }
+
+    #[test]
+    fn keylog_frames_roundtrip_through_postcard() {
+        let have = Frame::KeylogHave { authors: vec![(7, 3), (9, 1)] };
+        assert_eq!(Frame::decode(&have.encode()).unwrap(), have);
+        let ops = Frame::KeylogOps { author: 7, jsonl: vec![1, 2, 3] };
+        assert_eq!(Frame::decode(&ops.encode()).unwrap(), ops);
+        assert_eq!(have.kind(), "KeylogHave");
+        assert_eq!(ops.kind(), "KeylogOps");
     }
 }

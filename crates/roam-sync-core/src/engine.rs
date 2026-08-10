@@ -67,6 +67,9 @@ struct Offer {
     own_roster: Vec<u8>,
     /// Held third-party logs to relay: `(author, jsonl)`.
     peer_logs: Vec<(u64, Vec<u8>)>,
+    own_keylog: Vec<u8>,
+    /// Held third-party key-logs to relay: `(author, jsonl)`.
+    keylogs: Vec<(u64, Vec<u8>)>,
 }
 
 impl<T: Transport + 'static> Engine<T> {
@@ -542,6 +545,40 @@ impl<T: Transport + 'static> Engine<T> {
                 )
                 .await;
             }
+            Frame::KeylogOps { author, jsonl } => {
+                if author == self.peer_id() {
+                    return Ok(());
+                }
+                // Trust gate: only a roster-vouched author's key-log is accepted,
+                // exactly like RosterOps. An unknown author is dropped.
+                let Some(key) = self.key_for(author).await else {
+                    return Ok(());
+                };
+                let mut store = self.store.lock().await;
+                // Verify/shrink failures: drop the frame, never crash.
+                let _ = store.import_keylog(author, &key, jsonl);
+            }
+            Frame::KeylogHave { .. } => {
+                // Read-side revoke gate: a revoked peer must not pull our key-log.
+                if !self.is_active(peer).await {
+                    return Ok(());
+                }
+                let (own_keylog, keylogs) = {
+                    let store = self.store.lock().await;
+                    (
+                        store.export_own_keylog().unwrap_or_default(),
+                        Self::held_keylogs(&store, self.peer_id()),
+                    )
+                };
+                self.send(
+                    peer,
+                    Frame::KeylogOps { author: self.peer_id(), jsonl: own_keylog },
+                )
+                .await;
+                for (author, jsonl) in keylogs {
+                    self.send(peer, Frame::KeylogOps { author, jsonl }).await;
+                }
+            }
             Frame::BlobWant { hash } => {
                 // Read-side revoke gate: only ever serve a blob to a peer we
                 // currently vouch for as Active — identical to the Have/RosterHave
@@ -656,6 +693,22 @@ impl<T: Transport + 'static> Engine<T> {
             },
         )
         .await;
+
+        // Key-log gossip (mirrors the roster block above). Announce our per-author
+        // counts, then ship our own key-log and every held peer key-log; the
+        // receiver merges prefix-aware and length-guards the import.
+        let keylog_have: Vec<(u64, u64)> = std::iter::once((self.peer_id(), 0u64))
+            .chain(offer.keylogs.iter().map(|(a, _)| (*a, 0u64)))
+            .collect();
+        self.send(peer, Frame::KeylogHave { authors: keylog_have }).await;
+        self.send(
+            peer,
+            Frame::KeylogOps { author: self.peer_id(), jsonl: offer.own_keylog },
+        )
+        .await;
+        for (author, jsonl) in offer.keylogs {
+            self.send(peer, Frame::KeylogOps { author, jsonl }).await;
+        }
     }
 
     /// Push all logs we hold (own + held peer logs) to `peer` in response to a
@@ -691,6 +744,8 @@ impl<T: Transport + 'static> Engine<T> {
             own_log: store.export_own_log().unwrap_or_default(),
             own_roster: store.export_own_roster().unwrap_or_default(),
             peer_logs: Self::held_peer_logs(&store, self.peer_id()),
+            own_keylog: store.export_own_keylog().unwrap_or_default(),
+            keylogs: Self::held_keylogs(&store, self.peer_id()),
         }
     }
 
@@ -703,6 +758,19 @@ impl<T: Transport + 'static> Engine<T> {
             .filter_map(|p| {
                 let jsonl = store.export_peer_log(p.peer_id).ok()?;
                 (!jsonl.is_empty()).then_some((p.peer_id, jsonl))
+            })
+            .collect()
+    }
+
+    /// Every third-party (non-self) active peer key-log we currently hold.
+    fn held_keylogs(store: &Store, me: u64) -> Vec<(u64, Vec<u8>)> {
+        store
+            .roster()
+            .into_iter()
+            .filter(|p| p.status == PeerStatus::Active && p.peer_id != me)
+            .filter_map(|p| {
+                let jsonl = store.export_keylog(p.peer_id).ok()?;
+                if jsonl.is_empty() { None } else { Some((p.peer_id, jsonl)) }
             })
             .collect()
     }
