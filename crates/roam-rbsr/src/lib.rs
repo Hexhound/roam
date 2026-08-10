@@ -111,6 +111,8 @@ pub fn reconcile_server(items: &ItemSet, msg: &[u8]) -> Result<Vec<u8>, RbsrErro
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+    use std::collections::BTreeSet;
 
     fn id(n: u8) -> [u8; 32] {
         let mut b = [0u8; 32];
@@ -165,5 +167,31 @@ mod tests {
     fn equal_sets_transfer_nothing() {
         let (have, need) = run_session(&[id(1), id(2)], &[id(2), id(1)]);
         assert!(have.is_empty() && need.is_empty());
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(200))]
+
+        /// For ANY two id sets, a full session leaves the client with have == the
+        /// ids only it holds and need == the ids only the server holds (the exact
+        /// symmetric difference, split by side).
+        #[test]
+        fn convergence_equals_symmetric_difference(
+            client_raw in prop::collection::vec(any::<[u8; 32]>(), 0..40),
+            server_raw in prop::collection::vec(any::<[u8; 32]>(), 0..40),
+        ) {
+            let client: BTreeSet<[u8; 32]> = client_raw.into_iter().collect();
+            let server: BTreeSet<[u8; 32]> = server_raw.into_iter().collect();
+
+            let client_v: Vec<[u8; 32]> = client.iter().copied().collect();
+            let server_v: Vec<[u8; 32]> = server.iter().copied().collect();
+            let (have, need) = run_session(&client_v, &server_v);
+
+            let expect_have: BTreeSet<[u8; 32]> = client.difference(&server).copied().collect();
+            let expect_need: BTreeSet<[u8; 32]> = server.difference(&client).copied().collect();
+
+            prop_assert_eq!(have.into_iter().collect::<BTreeSet<_>>(), expect_have);
+            prop_assert_eq!(need.into_iter().collect::<BTreeSet<_>>(), expect_need);
+        }
     }
 }
