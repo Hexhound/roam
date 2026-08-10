@@ -70,6 +70,7 @@ impl Backend for HttpBackend {
         let resp = self
             .client
             .post(&url)
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
             .body(msg)
             .send()
             .await?
