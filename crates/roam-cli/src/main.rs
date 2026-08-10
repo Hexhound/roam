@@ -86,6 +86,27 @@ enum Command {
     Status {
         #[arg(long)]
         vault: PathBuf,
+        /// Identity keyfile. Optional: roster + doc read back without it, but the
+        /// key-rotation section needs the real identity to open this device's own
+        /// key-log and unwrap the epoch keys it holds.
+        #[arg(long)]
+        identity: Option<PathBuf>,
+    },
+    /// Rotate the payload key: mint a fresh epoch parented on the current
+    /// write-head, wrapping its key to every active member (and, with `--paper`,
+    /// a paper-recovery key). Existing backend data is NOT re-encrypted; only new
+    /// writes seal under the new epoch. Revoked peers are excluded, so they can
+    /// never read anything written after this rotation.
+    Rotate {
+        #[arg(long)]
+        vault: PathBuf,
+        #[arg(long)]
+        identity: PathBuf,
+        /// Also wrap the new epoch to a paper-recovery key derived from this
+        /// passphrase. Guard the passphrase: it recovers the epoch if every
+        /// device is lost.
+        #[arg(long)]
+        paper: Option<String>,
     },
 }
 
@@ -105,8 +126,23 @@ async fn main() -> Result<()> {
             folder,
             backend,
         } => sync(&vault, &identity, folder, backend).await,
-        Command::Status { vault } => status(&vault).await,
+        Command::Status { vault, identity } => status(&vault, identity).await,
+        Command::Rotate {
+            vault,
+            identity,
+            paper,
+        } => rotate(&vault, &identity, paper).await,
     }
+}
+
+/// Render a 32-byte epoch id for humans: the all-zero id is epoch 0 (the legacy
+/// scheme, written untagged); any other is a readable hex prefix.
+fn fmt_epoch(epoch: &[u8; 32]) -> String {
+    if *epoch == roam_storage::EPOCH0_ID {
+        return "epoch-0 (legacy)".to_string();
+    }
+    let hex: String = epoch.iter().take(8).map(|b| format!("{b:02x}")).collect();
+    format!("{hex}…")
 }
 
 /// `<vault>/vault-id` — the raw 32-byte vault id, persisted so later `sync` /
@@ -791,12 +827,18 @@ fn append_position(text: &str) -> usize {
     text.chars().count()
 }
 
-async fn status(vault: &Path) -> Result<()> {
-    // Read-only inspection still needs an identity to open the store; a status
-    // peek should not mint a durable one, so use an ephemeral generated id. The
-    // roster + doc are shared vault state and read back regardless of which
-    // identity opens them.
-    let store = Store::open(vault, Identity::generate()).context("open vault store")?;
+async fn status(vault: &Path, identity_path: Option<PathBuf>) -> Result<()> {
+    // Roster + doc are shared vault state, read back regardless of which identity
+    // opens the store. The key-rotation section, however, needs THIS device's
+    // real identity: only it can read the device's own key-log and unwrap the
+    // epoch keys wrapped to it. Absent `--identity`, we open with an ephemeral id
+    // (roster/doc still valid) and skip the epoch section.
+    let identity = match &identity_path {
+        Some(path) => Some(Identity::load(path).context("load identity")?),
+        None => None,
+    };
+    let store = Store::open(vault, identity.clone().unwrap_or_else(Identity::generate))
+        .context("open vault store")?;
     let roster = store.roster();
     println!("roster ({} peer(s)):", roster.len());
     for peer in &roster {
@@ -808,6 +850,91 @@ async fn status(vault: &Path) -> Result<()> {
     }
     println!("note: {} bytes", store.text("note").len());
     println!("doc version: {} bytes", store.doc_version_bytes().len());
+
+    // Key-rotation state needs BOTH the real identity (to open own key-log +
+    // unwrap epochs) and the vault key (to derive the id + epoch-0 keys). Missing
+    // either → skip the section rather than fail; status is a read-only peek.
+    match (identity.is_some(), load_vault_key(vault)) {
+        (false, _) => {
+            println!("epochs: (pass --identity to inspect key-rotation state)")
+        }
+        (true, Err(_)) => {
+            println!("epochs: (no vault-key present — init or pair to inspect key state)")
+        }
+        (true, Ok(raw)) => {
+            use roam_backend_client::crypto::VaultKey;
+            let vault_key = VaultKey(raw);
+            let keychain = store
+                .keychain(&vault_key.id_key(), &vault_key.epoch0_key())
+                .context("build keychain")?;
+            println!(
+                "epochs: {} (write-head {})",
+                keychain.epochs.len(),
+                fmt_epoch(&keychain.head)
+            );
+            let heads = keychain.dag_heads();
+            if heads.len() > 1 {
+                let rendered: Vec<String> = heads.iter().map(fmt_epoch).collect();
+                println!("  concurrent heads: {}", rendered.join(", "));
+            }
+            let issues = keychain.diagnose(&roster);
+            if issues.is_empty() {
+                println!("vault key state: synced");
+            } else {
+                println!("vault key state: {} issue(s):", issues.len());
+                for issue in &issues {
+                    println!("  {}", fmt_issue(issue));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One-line human rendering of a [`roam_storage::VaultIssue`].
+fn fmt_issue(issue: &roam_storage::VaultIssue) -> String {
+    use roam_storage::VaultIssue::*;
+    match issue {
+        WaitingKey { epoch, candidates } => format!(
+            "waiting for key to epoch {} (held by peer(s) {:?})",
+            fmt_epoch(epoch),
+            candidates
+        ),
+        KeyOrphaned { epoch } => format!(
+            "epoch {} ORPHANED — no current member nor paper key holds it",
+            fmt_epoch(epoch)
+        ),
+        KeyRedundancyLow { epoch, holders } => format!(
+            "epoch {} low redundancy — only peer(s) {:?} hold it (one loss from orphaned)",
+            fmt_epoch(epoch),
+            holders
+        ),
+    }
+}
+
+/// Mint a fresh epoch and wrap its key to every active member (+ optional paper
+/// key). Requires the real identity: the new key-log entries are signed by it.
+async fn rotate(vault: &Path, identity_path: &Path, paper: Option<String>) -> Result<()> {
+    use roam_backend_client::crypto::VaultKey;
+    use roam_storage::PaperKey;
+
+    let identity = Identity::load(identity_path).context("load identity")?;
+    let vault_key = VaultKey(load_vault_key(vault)?);
+    let mut store = Store::open(vault, identity).context("open vault store")?;
+
+    let paper_public = paper
+        .as_deref()
+        .map(|passphrase| PaperKey::from_passphrase(passphrase).public());
+
+    let epoch = store
+        .rotate_epoch(&vault_key.id_key(), &vault_key.epoch0_key(), paper_public)
+        .context("rotate epoch")?;
+
+    println!("rotated to epoch {}", fmt_epoch(&epoch));
+    if paper_public.is_some() {
+        println!("wrapped to paper-recovery key (keep the passphrase safe)");
+    }
+    println!("new writes seal under this epoch; existing data is unchanged.");
     Ok(())
 }
 
@@ -837,6 +964,16 @@ mod tests {
     #[test]
     fn coalesce_paths_empty_is_empty() {
         assert!(coalesce_paths(Vec::<PathBuf>::new()).is_empty());
+    }
+
+    #[test]
+    fn fmt_epoch_labels_legacy_and_hex_prefixes_others() {
+        // The all-zero id is epoch 0 (legacy, untagged ciphertext).
+        assert_eq!(super::fmt_epoch(&[0u8; 32]), "epoch-0 (legacy)");
+        // Anything else renders an 8-byte hex prefix with an ellipsis.
+        let rendered = super::fmt_epoch(&[0xab_u8; 32]);
+        assert!(rendered.starts_with("abababababababab"));
+        assert!(rendered.ends_with('…'));
     }
 
     #[test]
