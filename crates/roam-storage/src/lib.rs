@@ -2,6 +2,7 @@
 
 mod blob;
 mod error;
+mod history;
 mod identity;
 mod ids;
 mod keychain;
@@ -16,6 +17,7 @@ mod vault_key;
 
 pub use blob::BlobStore;
 pub use error::StorageError;
+pub use history::{HistoryIndex, Marker};
 pub use identity::{Identity, VerifyingKey};
 pub use ids::VaultId;
 pub use keychain::{compute_epoch_id, EpochNode, Keychain, ReadPlan, VaultIssue, EPOCH0_ID};
