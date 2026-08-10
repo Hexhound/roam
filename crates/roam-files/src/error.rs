@@ -23,6 +23,12 @@ pub enum FilesError {
     #[error("entry error: {0}")]
     Entry(String),
 
+    /// No file-set map entry exists for the requested path (e.g. attempting to
+    /// [`resurrect`](crate::FolderBridge::resurrect) a path that was never
+    /// tracked). Holds the affected path.
+    #[error("not found: {0}")]
+    NotFound(PathBuf),
+
     /// After applying computed ops to a container, the store's text did not
     /// match the file text — a symptom of an offset/diff bug. The message
     /// includes the affected container id.

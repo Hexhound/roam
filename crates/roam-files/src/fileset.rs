@@ -113,6 +113,16 @@ impl FileEntry {
         serde_json::from_str(s)
             .map_err(|err| FilesError::Entry(format!("failed to parse file-set entry: {err}")))
     }
+
+    /// A copy with status [`EntryStatus::Live`] and its tombstone checkpoint
+    /// cleared. Content hash + kind are preserved. Used to re-materialize a
+    /// tombstoned file (see [`FolderBridge::resurrect`](crate::FolderBridge::resurrect)).
+    pub fn to_live(&self) -> FileEntry {
+        let mut entry = self.clone();
+        entry.status = EntryStatus::Live;
+        entry.tombstoned_at = None;
+        entry
+    }
 }
 
 #[cfg(test)]
@@ -302,6 +312,28 @@ mod tests {
             entry.content_hash,
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
         );
+    }
+
+    #[test]
+    fn to_live_flips_status_and_clears_checkpoint() {
+        let tomb = FileEntry {
+            kind: EntryKind::Text,
+            status: EntryStatus::Tombstoned,
+            content_hash: "abc123".to_string(),
+            renamed_from: None,
+            tombstoned_at: Some("00ff13".to_string()),
+        };
+        let live = tomb.to_live();
+        assert_eq!(live.status, EntryStatus::Live);
+        assert_eq!(live.tombstoned_at, None);
+        assert_eq!(live.content_hash, "abc123");
+        assert_eq!(live.kind, EntryKind::Text);
+    }
+
+    #[test]
+    fn fileset_map_id_matches_storage_mirror() {
+        // roam-storage hardcodes this literal (store.rs) to avoid a dep cycle.
+        assert_eq!(FILESET_MAP_ID, "__roam_fileset__");
     }
 
     #[test]

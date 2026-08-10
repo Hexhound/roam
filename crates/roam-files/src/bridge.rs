@@ -40,25 +40,21 @@
 //! the tombstone). Renames ride this as a delete of the old path plus a
 //! create of the new one.
 //!
-//! ## #5 — Tombstone garbage collection: causally-stable GC (resolved)
+//! ## #5 — Tombstone retention: client-driven via `Store::checkpoint`
 //!
-//! Tombstones are no longer retained forever. [`FolderBridge::scan_gc`] runs an
-//! optional final sweep that DROPS a `Tombstoned` entry (a real, propagating
-//! CRDT map-delete via [`Store::remove_entry`]) once it is CAUSALLY STABLE —
-//! every trusted, non-revoked peer has acked a document version that dominates
-//! the tombstone's creation checkpoint ([`FileEntry::tombstoned_at`]). A peer
-//! that has not acked (e.g. was offline during the delete) keeps the tombstone
-//! alive, so no peer's stale `Live` entry can resurrect the file. The predicate
-//! and peer-version data arrive as a plain-data [`GcContext`] (no engine/tokio
-//! dependency); `scan`/`scan_hinted` pass `None` and skip the sweep entirely.
+//! The causally-stable tombstone REAPER that [`FolderBridge::scan_gc`] once ran
+//! has been RETIRED. Retention is now client-driven via [`Store::checkpoint`]:
+//! a `Tombstoned` entry is RETAINED (its history recoverable via
+//! [`FolderBridge::resurrect`]) rather than dropped by a sweep. Two properties
+//! are KEPT: (a) deletion PROPAGATION — a delete stays a normal op that syncs,
+//! so peers converge to the tombstone; and (b) the RESURRECTION GUARD — a stale
+//! peer's `Live` entry cannot resurrect a deleted file (see
+//! [`FolderBridge::scan_gc`], Step 3). The [`GcContext`] and its
+//! [`GcContext::tombstone_is_stable`] predicate remain defined for tests and
+//! potential engine callers, but no longer drive any sweep here.
 //!
-//! The sweep drops only the small MAP entry; the file's TEXT container is left
-//! intact (required for cross-device convergence — see [`FolderBridge::scan_gc`]).
-//!
-//! Remaining scope: reclaiming the orphaned text container is a space-only
-//! follow-up (the container is invisible to reconcile and to fresh peers once
-//! its map entry is gone); and only [`EntryKind::Text`] is handled —
-//! **binary/blob content is still deferred** to a later slice.
+//! [`FolderBridge::list_deleted`] enumerates the retained tombstones so a caller
+//! (e.g. a restore UI) can offer to [`resurrect`](FolderBridge::resurrect) them.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -171,6 +167,11 @@ impl GcContext {
     ///
     /// GC correctness depends on trusted peers honestly reporting their applied
     /// version in `Have` frames — see the [`GcContext`] TRUST DEPENDENCY note.
+    ///
+    /// Retained for tests and potential engine callers after the tombstone
+    /// reaper was retired (retention is now client-driven via
+    /// [`Store::checkpoint`]); no longer invoked by [`FolderBridge::scan_gc`].
+    #[allow(dead_code)]
     fn tombstone_is_stable(&self, entry: &FileEntry) -> bool {
         // Empty trusted set → never stable (defense-in-depth against an
         // incomplete/empty roster snapshot GC-ing every checkpointed tombstone).
@@ -650,32 +651,20 @@ impl FolderBridge {
         self.scan_gc(store, hint, None)
     }
 
-    /// Reconcile (as [`scan_hinted`](Self::scan_hinted)) and, when a
-    /// [`GcContext`] is supplied, run a causally-stable tombstone GC sweep as a
-    /// final step: every [`EntryStatus::Tombstoned`] entry that the context
-    /// deems stable (every trusted non-self peer has acked a version dominating
-    /// the tombstone's checkpoint) is DROPPED via [`Store::remove_entry`] — a
-    /// real CRDT map-delete that propagates so peers converge to the key being
-    /// absent.
+    /// Reconcile (as [`scan_hinted`](Self::scan_hinted)). The causally-stable
+    /// tombstone REAPER that this method once ran as a final step has been
+    /// RETIRED: retention is now client-driven via [`Store::checkpoint`], so a
+    /// tombstone entry is RETAINED rather than dropped. A delete still
+    /// PROPAGATES (it is a normal op), and the Step-3 resurrection guard still
+    /// prevents a stale peer from resurrecting a deleted file.
     ///
-    /// SAFETY: the sweep only removes the small file-set MAP entry; the file's
-    /// TEXT container is left intact. This is deliberate and load-bearing for
-    /// convergence — a device that has GC'd and one that has not must still agree
-    /// on the container's text, so we never `delete_root_container` here (that
-    /// would diverge `store.text(key)` across devices until the container-delete
-    /// op propagated). Reclaiming the orphaned text container is a separate,
-    /// space-only follow-up (see the module TODO), not a correctness concern:
-    /// with no map entry the container is invisible to reconcile and to fresh
-    /// peers bootstrapping from a snapshot.
-    ///
-    /// `gc: None` skips the sweep entirely (identical to
-    /// [`scan_hinted`](Self::scan_hinted) / [`scan`](Self::scan)), preserving
-    /// backward compatibility for callers with no peer-version data.
+    /// The `_gc` [`GcContext`] parameter is kept only for source-compatibility
+    /// with existing callers; it no longer drives any sweep.
     pub fn scan_gc(
         &self,
         store: &mut Store,
         hint: Option<&HashSet<PathBuf>>,
-        gc: Option<&GcContext>,
+        _gc: Option<&GcContext>,
     ) -> Result<Vec<(PathBuf, SyncOutcome)>, FilesError> {
         // --- Step 1: flush local disk edits into the CRDT. ---
         // The dir walk is ALWAYS done (correctness): Steps 2/3 need an accurate
@@ -942,59 +931,46 @@ impl FolderBridge {
             }
         }
 
-        // --- Step 4 (optional): causally-stable tombstone GC sweep. ---
-        // Runs ONLY when a GcContext is provided. Drops every Tombstoned entry
-        // that is provably stable (every trusted non-self peer has acked a
-        // version dominating the tombstone checkpoint) via a real, propagating
-        // CRDT map-delete. `entries` is an owned snapshot, so removing keys while
-        // iterating it is safe. Removal is idempotent — an already-absent key
-        // won't reappear in a later snapshot, so a second scan is a no-op.
-        if let Some(gc) = gc {
-            for (key, value) in store.entries(FILESET_MAP_ID) {
-                let entry = FileEntry::from_value(&value)?;
-                if entry.status != EntryStatus::Tombstoned {
-                    continue;
-                }
-                if gc.tombstone_is_stable(&entry) {
-                    // Real map-key removal (see `Store::remove_entry`). The text
-                    // container is intentionally left intact (see the doc above).
-                    store.remove_entry(FILESET_MAP_ID, &key)?;
-                    outcomes.push((
-                        key_to_path(&self.vault_root, &key),
-                        SyncOutcome::changed_no_ops(),
-                    ));
-                }
-            }
-
-            // --- Step 5 (optional): blob GC (D6). ---
-            // Reference-count the content-addressed blob store: a stored blob is
-            // collectible only when NO file-set entry references its hash — no
-            // Live Blob entry AND no not-yet-GC'd Tombstoned Blob entry. Since the
-            // tombstone sweep above just dropped every causally-stable tombstone,
-            // a blob whose only referencing entry was such a tombstone is now
-            // unreferenced and reclaimable in this same sweep. Be CONSERVATIVE:
-            // gather the referenced-hash set from EVERY remaining entry (any kind,
-            // any status) so a blob still referenced by any local entry is never
-            // removed. The set is rebuilt from the post-sweep snapshot.
-            let referenced: HashSet<String> = store
-                .entries(FILESET_MAP_ID)
-                .into_iter()
-                .filter_map(|(_, value)| FileEntry::from_value(&value).ok())
-                .map(|entry| entry.content_hash)
-                .collect();
-            for hash in store.blobs().list()? {
-                if referenced.contains(&hash) {
-                    continue;
-                }
-                // Unreferenced: reclaim. A remove error (invalid hash — impossible
-                // here since `list` yields only valid hashes — or a transient IO
-                // error) is benign: the blob simply lingers and a later sweep
-                // retries. Skip it rather than abort the whole reconcile.
-                let _ = store.blobs().remove(&hash);
-            }
-        }
+        // NOTE: the causally-stable tombstone REAPER (and its companion blob
+        // reference-count sweep) has been RETIRED. Tombstone/blob retention is
+        // now client-driven via [`Store::checkpoint`]: a tombstone stays a
+        // normal, propagating op (deletion PROPAGATION) and its entry is
+        // RETAINED so peers converge and history is recoverable via
+        // [`FolderBridge::resurrect`]. The resurrection guard above (Step 3)
+        // still prevents a stale peer from resurrecting a deleted file. The
+        // `_gc` parameter is kept for source-compatibility with callers that
+        // pass a [`GcContext`]; it no longer drives any sweep here.
 
         Ok(outcomes)
+    }
+
+    /// Paths of every currently-tombstoned file in the vault (recoverable via
+    /// [`FolderBridge::resurrect`] while their history is retained).
+    pub fn list_deleted(&self, store: &Store) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        for (key, value) in store.entries(FILESET_MAP_ID) {
+            if let Ok(entry) = FileEntry::from_value(&value) {
+                if entry.status == EntryStatus::Tombstoned {
+                    out.push(key_to_path(&self.vault_root, &key));
+                }
+            }
+        }
+        out
+    }
+
+    /// Re-materialize `file` from its last live content: flip the entry back to
+    /// [`EntryStatus::Live`] and re-project the bytes to disk. Produces normal
+    /// ops that propagate and heal the mesh. For a blob, the referenced bytes
+    /// must still be present.
+    pub fn resurrect(&self, store: &mut Store, file: &Path) -> Result<SyncOutcome, FilesError> {
+        let key = container_id(&self.vault_root, file)?;
+        let value = store
+            .get_entry(FILESET_MAP_ID, &key)
+            .ok_or_else(|| FilesError::NotFound(file.to_path_buf()))?;
+        let entry = FileEntry::from_value(&value)?;
+        let live = entry.to_live();
+        store.set_entry(FILESET_MAP_ID, &key, &live.to_value())?;
+        self.project_file(store, file)
     }
 
     /// Rename a file within the vault: move its content to the new path's
@@ -3329,6 +3305,77 @@ mod tests {
     }
 
     #[test]
+    fn scan_gc_no_longer_reaps_stable_tombstones() {
+        let dir = tempdir().unwrap();
+        let (bridge, mut store) = bridge(dir.path());
+        let vault = dir.path().join("vault");
+        let file = vault.join("gc.txt");
+        std::fs::write(&file, "content").unwrap();
+        bridge.import_file(&mut store, &file).unwrap();
+        std::fs::remove_file(&file).unwrap();
+        bridge.delete_file(&mut store, &file).unwrap();
+
+        // Even with a self-only (trivially stable) GcContext, the entry is RETAINED.
+        bridge.scan_gc(&mut store, None, Some(&self_only_gc())).unwrap();
+        let entries = store.entries(FILESET_MAP_ID);
+        let key = container_id(&vault, &file).unwrap();
+        assert!(
+            entries.iter().any(|(k, _)| *k == key),
+            "tombstone entry must survive GC now that the reaper is retired"
+        );
+    }
+
+    #[test]
+    fn list_deleted_reports_tombstoned_files() {
+        let dir = tempdir().unwrap();
+        let (bridge, mut store) = bridge(dir.path());
+        let vault = dir.path().join("vault");
+        let file = vault.join("doc.txt");
+        std::fs::write(&file, "hi").unwrap();
+        bridge.import_file(&mut store, &file).unwrap();
+        std::fs::remove_file(&file).unwrap();
+        bridge.delete_file(&mut store, &file).unwrap();
+
+        let deleted = bridge.list_deleted(&store);
+        assert_eq!(deleted, vec![file.clone()]);
+    }
+
+    #[test]
+    fn resurrect_flips_tombstone_to_live_and_reprojects() {
+        let dir = tempdir().unwrap();
+        let (bridge, mut store) = bridge(dir.path());
+        let vault = dir.path().join("vault");
+        let file = vault.join("doc.txt");
+        std::fs::write(&file, "hi").unwrap();
+        bridge.import_file(&mut store, &file).unwrap();
+        std::fs::remove_file(&file).unwrap();
+        bridge.delete_file(&mut store, &file).unwrap();
+
+        bridge.resurrect(&mut store, &file).unwrap();
+
+        let container = container_id(&vault, &file).unwrap();
+        assert_eq!(
+            fileset_entry(&store, &container).unwrap().status,
+            EntryStatus::Live,
+            "resurrect must flip the entry back to Live"
+        );
+        assert!(file.exists(), "resurrect must re-project the bytes to disk");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "hi");
+    }
+
+    #[test]
+    fn resurrect_unknown_path_is_not_found() {
+        let dir = tempdir().unwrap();
+        let (bridge, mut store) = bridge(dir.path());
+        let vault = dir.path().join("vault");
+        let file = vault.join("never.txt");
+        assert!(matches!(
+            bridge.resurrect(&mut store, &file),
+            Err(FilesError::NotFound(_))
+        ));
+    }
+
+    #[test]
     fn remote_blob_is_projected_to_disk_once_bytes_are_local() {
         let dir = tempdir().unwrap();
         let (b, mut store) = bridge(dir.path());
@@ -3443,7 +3490,7 @@ mod tests {
     // --- D6: reference-counting blob GC. ---
 
     #[test]
-    fn unreferenced_blob_is_collected_by_gc() {
+    fn unreferenced_blob_is_retained_by_scan_gc() {
         let dir = tempdir().unwrap();
         let (b, mut store) = bridge(dir.path());
 
@@ -3451,9 +3498,14 @@ mod tests {
         let hash = store.blobs().put(&[0x01, 0x02, 0x03, 0xff]).unwrap();
         assert!(store.blobs().has(&hash));
 
-        // A GC-enabled scan reclaims it (no entry keeps it alive).
+        // The reaper is retired: scan_gc no longer reclaims blobs. Reclaim now
+        // happens only via `Store::checkpoint` (out of this crate's tests), so
+        // the orphan blob is RETAINED here.
         b.scan_gc(&mut store, None, Some(&self_only_gc())).unwrap();
-        assert!(!store.blobs().has(&hash), "an unreferenced blob must be collected");
+        assert!(
+            store.blobs().has(&hash),
+            "scan_gc no longer collects blobs; the orphan must be retained"
+        );
     }
 
     #[test]
@@ -3476,7 +3528,7 @@ mod tests {
     }
 
     #[test]
-    fn blob_survives_until_its_tombstone_is_gc_stable_then_is_collected() {
+    fn tombstoned_blob_and_its_bytes_are_retained_by_scan_gc() {
         let dir = tempdir().unwrap();
         let (b, mut store) = bridge(dir.path());
         let vault = dir.path().join("vault");
@@ -3496,30 +3548,18 @@ mod tests {
         );
         assert!(store.blobs().has(&hash), "bytes still present while tombstoned");
 
-        // NOT yet stable (empty trusted set never stable): tombstone + blob kept.
-        let never_stable = GcContext {
-            self_peer: 1,
-            trusted_peers: Vec::new(),
-            acked_versions: HashMap::new(),
-        };
-        b.scan_gc(&mut store, None, Some(&never_stable)).unwrap();
+        // The reaper is retired: even a self-only (trivially stable) GcContext
+        // no longer drops the tombstone entry or reclaims its blob. Retention is
+        // now client-driven via `Store::checkpoint` (out of this crate's tests).
+        b.scan_gc(&mut store, None, Some(&self_only_gc())).unwrap();
         assert_eq!(
             fileset_entry(&store, &container).unwrap().status,
             EntryStatus::Tombstoned,
-            "an unstable tombstone must be retained"
-        );
-        assert!(store.blobs().has(&hash), "blob retained while tombstone unstable");
-
-        // Now stable (self-only): the tombstone is GC'd AND the now-unreferenced
-        // blob is reclaimed in the same sweep.
-        b.scan_gc(&mut store, None, Some(&self_only_gc())).unwrap();
-        assert!(
-            fileset_entry(&store, &container).is_none(),
-            "a stable tombstone entry must be removed"
+            "a stable tombstone entry must now be RETAINED (reaper retired)"
         );
         assert!(
-            !store.blobs().has(&hash),
-            "the blob must be collected once its tombstone is GC'd"
+            store.blobs().has(&hash),
+            "the blob must be RETAINED; reclaim now happens only via Store::checkpoint"
         );
     }
 }
