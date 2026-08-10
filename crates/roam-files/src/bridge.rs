@@ -486,19 +486,45 @@ impl FolderBridge {
     pub fn delete_file(&self, store: &mut Store, file: &Path) -> Result<SyncOutcome, FilesError> {
         let container = container_id(&self.vault_root, file)?;
 
-        // Tombstone hash = the content THIS DEVICE last synced (the sidecar's
-        // last_synced_hash), NOT the current store text. A remote edit may have
-        // already merged into the container before this delete; hashing the
-        // current (post-merge) text would defeat the resurrection guard and
-        // silently delete the peer's concurrent edit. Fall back to the current
-        // store text only when no sidecar exists (file already gone / never
-        // synced), a degraded best-effort.
-        let hash = match Sidecar::load(&self.meta_dir, &container)? {
-            Some(sidecar) => sidecar.last_synced_hash,
-            None => text_hash(&store.text(&container)),
-        };
+        // Preserve the EXISTING entry's kind: a tombstoned blob must stay
+        // `kind=Blob` (with its blob-ref as the tombstone hash) so `resurrect`
+        // can later project the bytes back — hardcoding `Text` here would erase
+        // that and recover a deleted binary as an empty text file. Default to
+        // `Text` only when there is no existing entry (never-tracked path).
+        let existing = store
+            .get_entry(FILESET_MAP_ID, &container)
+            .and_then(|v| FileEntry::from_value(&v).ok());
+        let kind = existing.as_ref().map(|e| e.kind).unwrap_or(EntryKind::Text);
 
-        write_tombstone(store, &container, EntryKind::Text, hash)?;
+        match kind {
+            EntryKind::Blob => {
+                // A blob has no sidecar and no text container: the tombstone hash
+                // is the blob's OWN content_hash (its blob-ref), so the Step-3
+                // resurrection guard compares like-for-like. Drop the presence
+                // marker (this device no longer has the file on disk), mirroring
+                // the scan blob-delete branch.
+                let hash = existing
+                    .map(|e| e.content_hash)
+                    .unwrap_or_else(|| text_hash(&store.text(&container)));
+                write_tombstone(store, &container, EntryKind::Blob, hash)?;
+                remove_if_present(&blob_marker_path(&self.meta_dir, &container))?;
+            }
+            EntryKind::Text => {
+                // Tombstone hash = the content THIS DEVICE last synced (the
+                // sidecar's last_synced_hash), NOT the current store text. A
+                // remote edit may have already merged into the container before
+                // this delete; hashing the current (post-merge) text would defeat
+                // the resurrection guard and silently delete the peer's concurrent
+                // edit. Fall back to the current store text only when no sidecar
+                // exists (file already gone / never synced), a degraded
+                // best-effort.
+                let hash = match Sidecar::load(&self.meta_dir, &container)? {
+                    Some(sidecar) => sidecar.last_synced_hash,
+                    None => text_hash(&store.text(&container)),
+                };
+                write_tombstone(store, &container, EntryKind::Text, hash)?;
+            }
+        }
 
         // Remove the disk file; already-gone is fine, other IO errors propagate.
         remove_if_present(file)?;
@@ -1011,7 +1037,13 @@ impl FolderBridge {
         let entry = FileEntry::from_value(&value)?;
         let live = entry.to_live();
         store.set_entry(FILESET_MAP_ID, &key, &live.to_value())?;
-        self.project_file(store, file)
+        // Dispatch by kind: a text container projects its CRDT text, but a blob
+        // has no text container — it must project its stored BYTES (via
+        // `project_blob`), or recovery would write an empty/wrong file.
+        match live.kind {
+            EntryKind::Blob => self.project_blob(store, file, &live.content_hash),
+            EntryKind::Text => self.project_file(store, file),
+        }
     }
 
     /// Selectively restore specific files (granularity C, selective). Each path is
@@ -1159,7 +1191,9 @@ impl FolderBridge {
         }
         let live = entry.to_live();
         store.set_entry(FILESET_MAP_ID, &key, &live.to_value())?;
-        self.project_file(store, file)
+        // Always a blob here (non-blob early-returned NoBlobHistory above), so
+        // project the stored bytes rather than the (empty) text container.
+        self.project_blob(store, file, &live.content_hash)
     }
 }
 
@@ -3758,5 +3792,26 @@ mod tests {
             .restore_blob_version(&mut store, &big, i64::MAX)
             .unwrap_err();
         assert!(matches!(err, FilesError::NoBlobHistory(_)));
+    }
+
+    #[test]
+    fn resurrect_recovers_a_deleted_blob_bytes_to_disk() {
+        let dir = tempdir().unwrap();
+        let (bridge, mut store) = bridge(dir.path());
+        let vault = dir.path().join("vault");
+        let file = vault.join("pic.bin");
+        let bytes = vec![0xFFu8, 0x00, 0xFF, 0x10, 0x20];
+        std::fs::write(&file, &bytes).unwrap();
+        bridge.import_file(&mut store, &file).unwrap();
+        std::fs::remove_file(&file).unwrap();
+        bridge.delete_file(&mut store, &file).unwrap();
+        assert!(!file.exists());
+
+        bridge.resurrect(&mut store, &file).unwrap();
+        assert_eq!(
+            std::fs::read(&file).unwrap(),
+            bytes,
+            "deleted blob bytes must be written back"
+        );
     }
 }
