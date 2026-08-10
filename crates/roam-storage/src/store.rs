@@ -1,6 +1,9 @@
 use crate::blob::BlobStore;
 use crate::error::StorageError;
 use crate::identity::{Identity, VerifyingKey};
+use crate::keychain::{compute_epoch_id, Keychain, VaultIssue};
+use crate::keylog::{KeyBody, KeyLog, KeyLogEntry, Recipient};
+use crate::keywrap;
 use crate::oplog::OpLog;
 use crate::roster::{merge_roster, PeerRecord, PeerStatus, RosterEntry, RosterLog, RosterOp};
 use crate::snapshot;
@@ -438,6 +441,157 @@ impl Store {
         roster_log.verify_bytes(key, &bytes)?;
         std::fs::write(&roster_path, &bytes)?;
         self.refresh_peers()
+    }
+
+    fn keylog_dir(&self) -> PathBuf {
+        self.root.join("keylog")
+    }
+
+    /// Replay every trusted author's key-log (verified against the key the roster
+    /// vouches for) into one merged, verified entry list. Untrusted/unkeyed
+    /// authors are skipped — same trust boundary as ops/roster replay.
+    fn merged_keylog(&self) -> Result<Vec<KeyLogEntry>, StorageError> {
+        let dir = self.keylog_dir();
+        let mut all = Vec::new();
+        let own = KeyLog::new(&dir, self.identity.peer_id());
+        all.extend(own.read_verified(&self.identity.verifying_key())?);
+        for peer in self.peers.iter() {
+            if peer.status != PeerStatus::Active || peer.peer_id == self.identity.peer_id() {
+                continue;
+            }
+            let Ok(pkey) = VerifyingKey::from_bytes(&peer.verifying_key) else { continue };
+            let log = KeyLog::new(&dir, peer.peer_id);
+            all.extend(log.read_verified(&pkey)?);
+        }
+        Ok(all)
+    }
+
+    /// Build this device's [`Keychain`] from the merged key-log. `id_key` and
+    /// `epoch0_key` are the two subkeys of the vault key (see
+    /// `roam_backend_client::crypto::VaultKey::{id_key,epoch0_key}`), passed in
+    /// because the Store deliberately never persists the vault secret.
+    pub fn keychain(&self, id_key: &[u8; 32], epoch0_key: &[u8; 32]) -> Result<Keychain, StorageError> {
+        let entries = self.merged_keylog()?;
+        Ok(Keychain::build(
+            *id_key,
+            *epoch0_key,
+            self.identity.peer_id(),
+            &self.identity.x25519_secret(),
+            &entries,
+        ))
+    }
+
+    /// The recovery state machine result (empty == `Synced`).
+    pub fn vault_state(&self, id_key: &[u8; 32], epoch0_key: &[u8; 32]) -> Result<Vec<VaultIssue>, StorageError> {
+        let kc = self.keychain(id_key, epoch0_key)?;
+        Ok(kc.diagnose(&self.peers))
+    }
+
+    /// Mint a new epoch: a fresh random key parented on the current DAG head(s),
+    /// wrapped to every current member and (optionally) the paper key. Appends a
+    /// `Rotate` + the `Wrap`s to our OWN key-log, signed. Returns the new
+    /// `epoch_id`.
+    pub fn rotate_epoch(
+        &mut self,
+        id_key: &[u8; 32],
+        epoch0_key: &[u8; 32],
+        paper_public: Option<[u8; 32]>,
+    ) -> Result<[u8; 32], StorageError> {
+        let kc = self.keychain(id_key, epoch0_key)?;
+        let parents = kc.dag_heads();
+        let mut nonce = [0u8; 32];
+        use rand::RngCore;
+        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        let mut new_key = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut new_key);
+        let epoch_id = compute_epoch_id(&parents, self.identity.peer_id(), &nonce);
+
+        let log = KeyLog::new(&self.keylog_dir(), self.identity.peer_id());
+        log.append(&self.identity, epoch_id, KeyBody::Rotate { parent_epochs: parents, nonce })?;
+        for peer in self.peers.iter().filter(|p| p.status == PeerStatus::Active) {
+            let pub_x = match VerifyingKey::from_bytes(&peer.verifying_key) {
+                Ok(k) => k.to_x25519(),
+                Err(_) => continue,
+            };
+            let blob = keywrap::wrap(&pub_x, &new_key);
+            log.append(&self.identity, epoch_id, KeyBody::Wrap { recipient: Recipient::Device(peer.peer_id), blob })?;
+        }
+        // Always wrap to self even if not yet in our own roster.
+        if !self.peers.iter().any(|p| p.peer_id == self.identity.peer_id()) {
+            let blob = keywrap::wrap(&self.identity.x25519_public(), &new_key);
+            log.append(&self.identity, epoch_id, KeyBody::Wrap { recipient: Recipient::Device(self.identity.peer_id()), blob })?;
+        }
+        if let Some(paper) = paper_public {
+            let blob = keywrap::wrap(&paper, &new_key);
+            log.append(&self.identity, epoch_id, KeyBody::Wrap { recipient: Recipient::Paper, blob })?;
+        }
+        Ok(epoch_id)
+    }
+
+    /// Wrap-back-fill: for every (epoch we can open, current member with no wrap),
+    /// append a `Wrap` to our OWN key-log. Convergent; safe to call on any
+    /// key-log/roster change. Returns how many wraps were published.
+    pub fn backfill_wraps(&mut self, id_key: &[u8; 32], epoch0_key: &[u8; 32]) -> Result<usize, StorageError> {
+        let kc = self.keychain(id_key, epoch0_key)?;
+        let targets = kc.backfill_targets(&self.peers);
+        if targets.is_empty() {
+            return Ok(0);
+        }
+        let log = KeyLog::new(&self.keylog_dir(), self.identity.peer_id());
+        let mut published = 0;
+        for (epoch, key, peer_id) in targets {
+            let pub_x = match self.peers.iter().find(|p| p.peer_id == peer_id) {
+                Some(p) => match VerifyingKey::from_bytes(&p.verifying_key) {
+                    Ok(k) => k.to_x25519(),
+                    Err(_) => continue,
+                },
+                None => continue,
+            };
+            let blob = keywrap::wrap(&pub_x, &key);
+            log.append(&self.identity, epoch, KeyBody::Wrap { recipient: Recipient::Device(peer_id), blob })?;
+            published += 1;
+        }
+        Ok(published)
+    }
+
+    /// The raw bytes of this device's own key-log (for copying to a peer).
+    pub fn export_own_keylog(&self) -> Result<Vec<u8>, StorageError> {
+        match std::fs::read(KeyLog::new(&self.keylog_dir(), self.identity.peer_id()).path()) {
+            Ok(b) => Ok(b),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// The raw bytes of `author`'s stored key-log (for relaying). NotFound ⇒ empty.
+    pub fn export_keylog(&self, author: u64) -> Result<Vec<u8>, StorageError> {
+        match std::fs::read(KeyLog::new(&self.keylog_dir(), author).path()) {
+            Ok(b) => Ok(b),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Import a peer's key-log bytes: verify against `key` before writing, refuse
+    /// a shorter/older resend, persist. Mirrors [`Store::import_roster`].
+    pub fn import_keylog(&mut self, author: u64, key: &VerifyingKey, bytes: Vec<u8>) -> Result<(), StorageError> {
+        if author == self.identity.peer_id() {
+            return Err(StorageError::Peer("cannot import a key-log under our own peer id".into()));
+        }
+        let dir = self.keylog_dir();
+        std::fs::create_dir_all(&dir)?;
+        let log = KeyLog::new(&dir, author);
+        let path = log.path();
+        if let Ok(existing) = std::fs::read(&path) {
+            if bytes.len() < existing.len() {
+                return Err(StorageError::Peer(format!(
+                    "refusing to shrink keylog {author} ({} < {} bytes)", bytes.len(), existing.len()
+                )));
+            }
+        }
+        log.verify_bytes(key, &bytes)?;
+        std::fs::write(&path, &bytes)?;
+        Ok(())
     }
 
     /// Import a peer's oplog bytes: write them to `ops/ops-<peer>.jsonl`,
@@ -1176,5 +1330,77 @@ mod tests {
             .join("ops")
             .join(format!("ops-{}.jsonl", id_b.peer_id()));
         assert!(!peer_log.exists(), "forged peer log must not be persisted");
+    }
+
+    use crate::keychain::EPOCH0_ID;
+
+    // Test vault-key subkeys: the Store keychain API takes id_key + epoch0_key as
+    // raw bytes (the backend-client derives them from VaultKey).
+    fn keys() -> ([u8; 32], [u8; 32]) {
+        ([0x1au8; 32], [0x2bu8; 32])
+    }
+
+    #[test]
+    fn fresh_vault_keychain_is_epoch0_only_and_synced() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(dir.path(), Identity::generate()).unwrap();
+        let (id_key, epoch0) = keys();
+        let kc = store.keychain(&id_key, &epoch0).unwrap();
+        assert_eq!(kc.head, EPOCH0_ID);
+        assert!(store.vault_state(&id_key, &epoch0).unwrap().is_empty(), "epoch-0-only vault is Synced");
+    }
+
+    #[test]
+    fn rotate_epoch_mints_a_new_head_the_device_can_open() {
+        let dir = tempdir().unwrap();
+        let id = Identity::generate();
+        let mut store = Store::open(dir.path(), id).unwrap();
+        let (id_key, epoch0) = keys();
+
+        let new_epoch = store.rotate_epoch(&id_key, &epoch0, None).unwrap();
+        let kc = store.keychain(&id_key, &epoch0).unwrap();
+        assert_eq!(kc.head, new_epoch);
+        assert!(kc.epoch_key(&new_epoch).is_some(), "minter can open its own new epoch");
+        assert_ne!(kc.epoch_key(&new_epoch), Some(epoch0), "epoch key is fresh random");
+    }
+
+    #[test]
+    fn rotation_survives_reopen() {
+        let dir = tempdir().unwrap();
+        let vault = dir.path().join("v");
+        let id = Identity::generate();
+        let (id_key, epoch0) = keys();
+        let minted = {
+            let mut store = Store::open(&vault, id.clone()).unwrap();
+            store.rotate_epoch(&id_key, &epoch0, None).unwrap()
+        };
+        let reopened = Store::open(&vault, id).unwrap();
+        let kc = reopened.keychain(&id_key, &epoch0).unwrap();
+        assert_eq!(kc.head, minted);
+        assert!(kc.epoch_key(&minted).is_some(), "epoch key recovered from own key-log wrap after reopen");
+    }
+
+    #[test]
+    fn a_peer_added_after_rotation_gets_backfilled() {
+        let dir_a = tempdir().unwrap();
+        let dir_b = tempdir().unwrap();
+        let id_a = Identity::generate();
+        let id_b = Identity::generate();
+        let (id_key, epoch0) = keys();
+
+        let mut a = Store::open(dir_a.path(), id_a.clone()).unwrap();
+        let mut b = Store::open(dir_b.path(), id_b.clone()).unwrap();
+
+        let epoch = a.rotate_epoch(&id_key, &epoch0, None).unwrap();
+        a.add_peer(id_b.peer_id(), id_b.verifying_key().to_bytes()).unwrap();
+        a.backfill_wraps(&id_key, &epoch0).unwrap();
+
+        b.add_peer(id_a.peer_id(), id_a.verifying_key().to_bytes()).unwrap();
+        b.import_roster(id_a.peer_id(), &id_a.verifying_key(), a.export_own_roster().unwrap()).unwrap();
+        b.import_keylog(id_a.peer_id(), &id_a.verifying_key(), a.export_own_keylog().unwrap()).unwrap();
+
+        let kc_b = b.keychain(&id_key, &epoch0).unwrap();
+        assert_eq!(kc_b.epoch_key(&epoch), a.keychain(&id_key, &epoch0).unwrap().epoch_key(&epoch),
+            "B recovered the same epoch key A minted, via back-fill");
     }
 }

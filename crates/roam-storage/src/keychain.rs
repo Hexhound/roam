@@ -211,6 +211,23 @@ impl Keychain {
         }
         out
     }
+
+    /// All DAG leaves (epochs that are no other epoch's parent). The single
+    /// deterministic write-`head` is `min` of these; a rotation parents on ALL of
+    /// them so concurrent siblings merge into one child.
+    pub fn dag_heads(&self) -> Vec<[u8; 32]> {
+        let mut is_parent: std::collections::BTreeSet<[u8; 32]> = std::collections::BTreeSet::new();
+        for node in self.epochs.values() {
+            for p in &node.parents {
+                is_parent.insert(*p);
+            }
+        }
+        let mut heads: Vec<[u8; 32]> = self.epochs.keys().filter(|id| !is_parent.contains(*id)).copied().collect();
+        if heads.is_empty() {
+            heads.push(EPOCH0_ID);
+        }
+        heads
+    }
 }
 
 #[cfg(test)]
