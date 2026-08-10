@@ -1,4 +1,4 @@
-//! End-to-end: a real roam-backend server process + two stores, wired only through
+//! End-to-end: the real sync Phoenix backend process + two stores, wired only through
 //! the backend (no iroh). B must converge purely from the backend, and re-running
 //! reconcile after a hypothetical iroh delivery of the same ops must be a no-op.
 
@@ -27,17 +27,19 @@ const PORT: u16 = 4577;
 // internally, which panics ("Cannot start a runtime from within a runtime")
 // when called from inside the #[tokio::test] runtime that this fn runs under.
 async fn start_server(root: &std::path::Path) -> Server {
-    let child = Command::new("elixir")
-        .arg("server.exs")
-        .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../../roam-backend"))
+    let child = Command::new("mix")
+        .arg("phx.server")
+        .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../../sync"))
         .env("PORT", PORT.to_string())
-        .env("ROAM_BACKEND_ROOT", root)
+        .env("ROAM_BACKEND_DATA", root)
+        .env("MIX_ENV", "dev")
+        .env("PHX_SERVER", "true")
         .spawn()
-        .expect("start elixir server (is elixir installed?)");
+        .expect("start sync phx server (is mix on PATH?)");
     let client = reqwest::Client::new();
-    // First-ever run: Mix.install compiles deps (plug, bandit, jason), which
-    // can take 30-60s. Poll generously.
-    for _ in 0..300 {
+    // First boot compiles/boots the full Phoenix app, which can take a while.
+    // Poll generously (up to 120s).
+    for _ in 0..600 {
         if client
             .get(format!("http://127.0.0.1:{PORT}/b/probe/manifest"))
             .send()
@@ -53,7 +55,7 @@ async fn start_server(root: &std::path::Path) -> Server {
 }
 
 #[tokio::test]
-#[ignore = "requires elixir on PATH; run with --ignored"]
+#[ignore = "requires mix on PATH and the sync Phoenix backend; run with --ignored"]
 async fn b_converges_via_backend_only_then_race_is_noop() {
     let data_root = tempfile::tempdir().unwrap();
     let _server = start_server(data_root.path()).await;
