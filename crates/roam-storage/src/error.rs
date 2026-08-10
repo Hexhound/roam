@@ -20,4 +20,6 @@ pub enum StorageError {
     Blob(String),
     #[error(transparent)]
     Crdt(#[from] roam_crdt::CrdtError),
+    #[error("key unwrap failed")]
+    Keywrap,
 }
