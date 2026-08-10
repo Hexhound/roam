@@ -131,6 +131,30 @@ fn load_vault_id(vault: &Path) -> Result<VaultId> {
     Ok(VaultId(raw))
 }
 
+/// `<vault>/vault-key` — the raw 32-byte shared vault key (backend decryption
+/// secret). Minted at `init`, delivered to joiners over the proven pairing
+/// stream, and persisted next to the vault so `sync --backend` can load it.
+fn vault_key_path(vault: &Path) -> PathBuf {
+    vault.join("vault-key")
+}
+
+/// Persist the raw 32-byte vault key next to the vault. This is a SECRET; it
+/// lives in the vault dir alongside the store (same trust boundary).
+fn save_vault_key(vault: &Path, key: &[u8; 32]) -> Result<()> {
+    std::fs::create_dir_all(vault).context("create vault dir")?;
+    std::fs::write(vault_key_path(vault), key).context("write vault-key")
+}
+
+/// Reload the raw 32-byte vault key previously written by [`save_vault_key`].
+fn load_vault_key(vault: &Path) -> Result<[u8; 32]> {
+    let bytes = std::fs::read(vault_key_path(vault))
+        .context("read vault-key (run `roam init`, or re-pair to receive it)")?;
+    bytes
+        .as_slice()
+        .try_into()
+        .context("vault-key file is not 32 bytes")
+}
+
 async fn init(vault: &Path, identity_path: &Path) -> Result<()> {
     // Refuse to re-init: overwriting `vault-id` would orphan already-paired
     // peers (their roster + ops are keyed to the original vault).
@@ -143,6 +167,13 @@ async fn init(vault: &Path, identity_path: &Path) -> Result<()> {
     Store::open(vault, identity.clone()).context("open vault store")?;
     let vault_id = VaultId::generate();
     save_vault_id(vault, &vault_id)?;
+    // Mint the shared vault key (backend decryption secret). Reuse
+    // `VaultId::generate` as a 32-byte OS-random source — the value is an opaque
+    // key, not a vault id. Delivered to every paired device over the pairing
+    // stream so all devices agree on it (retires the old blake3(vault_id)
+    // placeholder that could not be shared across independently-init'd devices).
+    let vault_key = VaultId::generate().0;
+    save_vault_key(vault, &vault_key)?;
     println!("initialized vault at {}", vault.display());
     println!("peer_id: {}", identity.peer_id());
     Ok(())
@@ -151,9 +182,10 @@ async fn init(vault: &Path, identity_path: &Path) -> Result<()> {
 async fn pair_token(vault: &Path, identity_path: &Path) -> Result<()> {
     let identity = Identity::load(identity_path).context("load identity")?;
     let vault_id = load_vault_id(vault)?;
+    let vault_key = load_vault_key(vault)?;
     let mut store = Store::open(vault, identity.clone()).context("open vault store")?;
 
-    let (token, host) = host_pairing(&identity, vault_id, &mut store)
+    let (token, host) = host_pairing(&identity, vault_id, vault_key, &mut store)
         .await
         .context("start pairing host")?;
     println!("pairing token (share out of band):\n{token}");
@@ -184,10 +216,13 @@ async fn pair(vault: &Path, identity_path: &Path, token: String) -> Result<()> {
     let host_peer = decoded.peer_id;
     let vault_id = VaultId(decoded.vault);
 
-    join_pairing(identity, vault.to_path_buf(), token)
+    let (_store, vault_key) = join_pairing(identity, vault.to_path_buf(), token)
         .await
         .context("join pairing")?;
     save_vault_id(vault, &vault_id)?;
+    // Persist the shared vault key the host delivered over the proven pairing
+    // stream, so this device can decrypt the backend store on `sync --backend`.
+    save_vault_key(vault, &vault_key)?;
     println!("paired with host peer: {host_peer}");
     Ok(())
 }
@@ -205,7 +240,7 @@ async fn sync(
     // long-running dial/scan inside the select loop (see `spawn_ctrl_c_exit`).
     spawn_ctrl_c_exit();
     let engine = setup_engine(vault, identity_path).await?;
-    spawn_backend_sync(&engine, backend);
+    spawn_backend_sync(&engine, backend, vault)?;
     match folder {
         Some(folder) => sync_folder(engine, vault, folder).await,
         None => sync_repl(engine).await,
@@ -218,18 +253,25 @@ async fn sync(
 /// iroh-apply paths serialize on one lock (spec §8.1). Runs regardless of
 /// whether `--folder` is set, so it covers both the folder-sync and REPL
 /// paths (both are dispatched from `sync` right after this call).
-fn spawn_backend_sync(engine: &Arc<Engine<IrohTransport>>, backend: Option<String>) {
+fn spawn_backend_sync(
+    engine: &Arc<Engine<IrohTransport>>,
+    backend: Option<String>,
+    vault: &Path,
+) -> Result<()> {
     let Some(backend_url) = backend else {
-        return;
+        return Ok(());
     };
     use roam_backend_client::crypto::VaultKey;
     use roam_backend_client::http::HttpBackend;
     use roam_backend_client::sync::reconcile_once;
 
-    // TODO(pairing slice): replace with the vault key delivered over the
-    // proven pairing stream. For now, derive deterministically from the vault
-    // id so a single vault's devices agree on bucket/entry ids.
-    let vault_key = VaultKey(blake3::hash(engine.vault_id_bytes().as_slice()).into());
+    // The shared vault key delivered over the proven pairing stream (minted at
+    // `init`, received in `pair`). All devices of a vault hold the SAME key, so
+    // their bucket/entry/blob ids agree — the requirement the old
+    // blake3(vault_id) placeholder could not meet across separately-init'd
+    // devices. A hard error here is correct: `--backend` was explicitly asked
+    // for, so a missing key must not silently fall back to an unshared one.
+    let vault_key = VaultKey(load_vault_key(vault)?);
     let backend = Arc::new(HttpBackend::new(&backend_url));
     let store = engine.store();
     let flushed = engine.local_flushed();
@@ -256,6 +298,7 @@ fn spawn_backend_sync(engine: &Arc<Engine<IrohTransport>>, backend: Option<Strin
         }
     });
     println!("backend sync enabled: {backend_url}");
+    Ok(())
 }
 
 /// Build the transport + engine, spawn its receive loop, and connect to every

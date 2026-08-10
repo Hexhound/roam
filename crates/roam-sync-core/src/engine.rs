@@ -99,11 +99,6 @@ impl<T: Transport + 'static> Engine<T> {
         self.store.clone()
     }
 
-    /// This vault's 256-bit id bytes (used to derive the placeholder vault key).
-    pub fn vault_id_bytes(&self) -> [u8; 32] {
-        self.vault.0
-    }
-
     /// A handle to the remote-change signal. Fired via `notify_waiters` after a
     /// successful inbound `Frame::Ops` apply that advanced the document, so a
     /// consumer can `.notified().await` to learn when remote data landed.

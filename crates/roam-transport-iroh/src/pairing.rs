@@ -23,8 +23,18 @@
 //!   signature over `token.secret`), then *reads* [`JoinAccept`].
 //! - **Host (A)**: accepts the stream, *reads* the [`JoinRequest`] first,
 //!   **verifies the proof**, and only then adds B and *writes* [`JoinAccept`]
-//!   (its vault + a snapshot of A's signed roster, so B learns A's siblings
-//!   transitively).
+//!   (its vault, the shared **vault key**, and a snapshot of A's signed roster,
+//!   so B learns A's siblings transitively).
+//!
+//! ## Vault key (backend decryption secret)
+//!
+//! The vault key is the symmetric secret every device needs to decrypt the
+//! zero-knowledge backend store. It travels ONLY inside [`JoinAccept`] — which
+//! the host writes exclusively after the joiner's proof verifies, over the
+//! QUIC-encrypted+authenticated pairing stream. It is deliberately NOT placed in
+//! the [`PairingToken`]: the token is shown out of band (copy-paste, QR, chat)
+//! and could be logged or screenshotted, so it must never carry a long-lived
+//! decryption secret.
 //!
 //! ## Security properties (all enforced + tested)
 //!
@@ -121,11 +131,15 @@ pub struct JoinRequest {
     pub proof: Vec<u8>,
 }
 
-/// A → B: accepted; here is the vault + A's signed roster snapshot.
+/// A → B: accepted; here is the vault, the shared vault key, and A's signed
+/// roster snapshot.
 #[derive(Serialize, Deserialize)]
 pub struct JoinAccept {
     /// The vault B is joining (B re-validates it against its token).
     pub vault: [u8; 32],
+    /// The shared vault key (backend decryption secret). Only ever sent here,
+    /// after the joiner's proof verifies, over the encrypted pairing stream.
+    pub vault_key: [u8; 32],
     /// The author of `roster_jsonl` (A's peer id).
     pub roster_author: u64,
     /// A's signed roster log, so B learns A's siblings (transitive mesh).
@@ -143,6 +157,8 @@ pub struct PairingHost<'a> {
     secret: [u8; 32],
     identity: &'a Identity,
     vault: VaultId,
+    /// The shared vault key, handed to every proven joiner via [`JoinAccept`].
+    vault_key: [u8; 32],
     store: &'a mut Store,
 }
 
@@ -154,6 +170,7 @@ pub struct PairingHost<'a> {
 pub async fn host_pairing<'a>(
     identity: &'a Identity,
     vault: VaultId,
+    vault_key: [u8; 32],
     store: &'a mut Store,
 ) -> Result<(String, PairingHost<'a>)> {
     let endpoint = build_endpoint(identity)
@@ -183,6 +200,7 @@ pub async fn host_pairing<'a>(
             secret,
             identity,
             vault,
+            vault_key,
             store,
         },
     ))
@@ -252,6 +270,7 @@ impl PairingHost<'_> {
             .context("add paired peer to roster")?;
         let accept = JoinAccept {
             vault: self.vault.0,
+            vault_key: self.vault_key,
             roster_author: self.identity.peer_id(),
             roster_jsonl: self.store.export_own_roster().context("export own roster")?,
         };
@@ -269,14 +288,16 @@ impl PairingHost<'_> {
 /// Decodes the token, opens the joiner's store at `vault_root`, connects to the
 /// host on [`PAIRING_ALPN`], proves it saw the token, adds the host to its own
 /// roster, and imports the host's roster (learning the host's siblings). Returns
-/// the store. Closes the one-shot endpoint before returning.
+/// the store and the shared vault key delivered in the host's [`JoinAccept`]
+/// (the caller persists it for backend sync). Closes the one-shot endpoint
+/// before returning.
 ///
 /// Takes owned args (not borrows) so callers can `tokio::spawn` it.
 pub async fn join_pairing(
     identity: Identity,
     vault_root: PathBuf,
     token_str: String,
-) -> Result<Store> {
+) -> Result<(Store, [u8; 32])> {
     let token = PairingToken::decode(&token_str).context("decode pairing token")?;
 
     let mut store =
@@ -288,8 +309,8 @@ pub async fn join_pairing(
 
     let result = run_join(&endpoint, &identity, &token, &mut store).await;
     endpoint.close().await;
-    result?;
-    Ok(store)
+    let vault_key = result?;
+    Ok((store, vault_key))
 }
 
 /// The joiner half of the handshake, dialing out over `endpoint`. Split out so
@@ -299,7 +320,7 @@ async fn run_join(
     identity: &Identity,
     token: &PairingToken,
     store: &mut Store,
-) -> Result<()> {
+) -> Result<[u8; 32]> {
     let conn = endpoint
         .connect(token.addr.clone(), PAIRING_ALPN)
         .await
@@ -341,7 +362,7 @@ async fn run_join(
         .context("import host roster")?;
 
     conn.close(0u32.into(), b"paired");
-    Ok(())
+    Ok(accept.vault_key)
 }
 
 /// Snapshot a dialable [`EndpointAddr`], waiting (bounded) for a direct address
@@ -426,14 +447,19 @@ mod tests {
         let mut sa = Store::open(da.path(), ia.clone()).unwrap();
 
         // Host A: create a token, then accept one join (auto-approve).
-        let (token, host) = host_pairing(&ia, vault, &mut sa).await.unwrap();
+        let vault_key = [42u8; 32];
+        let (token, host) = host_pairing(&ia, vault, vault_key, &mut sa).await.unwrap();
         let db_root = db.path().to_path_buf();
         let join = tokio::spawn(join_pairing(ib.clone(), db_root, token));
 
         let approved = host.accept_auto().await.unwrap();
         assert_eq!(approved, ib.peer_id(), "host approves B's peer id");
 
-        let sb = join.await.unwrap().unwrap();
+        let (sb, joiner_vault_key) = join.await.unwrap().unwrap();
+        assert_eq!(
+            joiner_vault_key, vault_key,
+            "the joiner must receive the host's shared vault key"
+        );
 
         assert!(
             sa.roster()
@@ -459,7 +485,7 @@ mod tests {
         let vault = VaultId::generate();
 
         let mut sa = Store::open(da.path(), ia.clone()).unwrap();
-        let (token, host) = host_pairing(&ia, vault, &mut sa).await.unwrap();
+        let (token, host) = host_pairing(&ia, vault, [0u8; 32], &mut sa).await.unwrap();
         let token_decoded = PairingToken::decode(&token).unwrap();
         let b_peer = ib.peer_id();
 
@@ -509,7 +535,7 @@ mod tests {
         let vault = VaultId::generate();
 
         let mut sa = Store::open(da.path(), ia.clone()).unwrap();
-        let (token, host) = host_pairing(&ia, vault, &mut sa).await.unwrap();
+        let (token, host) = host_pairing(&ia, vault, [0u8; 32], &mut sa).await.unwrap();
         let token_decoded = PairingToken::decode(&token).unwrap();
         // A peer_id that does NOT match ib's key.
         let bad_peer_id = ib.peer_id().wrapping_add(1);
