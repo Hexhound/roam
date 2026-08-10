@@ -23,6 +23,12 @@ pub enum FilesError {
     #[error("entry error: {0}")]
     Entry(String),
 
+    /// No file-set map entry exists for the requested path (e.g. attempting to
+    /// [`resurrect`](crate::FolderBridge::resurrect) a path that was never
+    /// tracked). Holds the affected path.
+    #[error("not found: {0}")]
+    NotFound(PathBuf),
+
     /// After applying computed ops to a container, the store's text did not
     /// match the file text — a symptom of an offset/diff bug. The message
     /// includes the affected container id.
@@ -62,4 +68,19 @@ pub enum FilesError {
     /// [`FILESET_MAP_ID`]: crate::FILESET_MAP_ID
     #[error("reserved container id cannot be used as a vault file: {0}")]
     ReservedName(String),
+
+    /// A blob file was rolled back to a prior version, but that version's bytes
+    /// are not recoverable: either the blob opted OUT of edit history
+    /// (single-version mode released the superseded bytes on the next edit), or
+    /// the requested point is below the retained history base. Returned instead
+    /// of ever projecting wrong/empty bytes. Holds the affected path.
+    #[error("no blob history for {0}")]
+    NoBlobHistory(PathBuf),
+
+    /// This device has no write role, so it may not author or propagate content
+    /// ops. Every write path (edit, restore, resurrect) checks
+    /// [`Store::may_write`](roam_storage::Store::may_write) and refuses with this
+    /// error when it returns `false`.
+    #[error("device is read-only (no write role)")]
+    ReadOnly,
 }

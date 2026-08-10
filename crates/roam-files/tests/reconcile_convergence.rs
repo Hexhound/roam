@@ -1070,33 +1070,39 @@ fn tombstone_retained_until_all_trusted_peers_ack() {
 }
 
 // ---------------------------------------------------------------------------
-// C4.2 — once ALL trusted peers have acked, the tombstone IS GC'd, the delete
-// propagates, and the file stays deleted everywhere (no resurrection).
+// C4.2 — the reaper is RETIRED: even once ALL trusted peers have acked, the
+// tombstone entry is RETAINED (recoverable history). The delete still
+// propagates and the file stays deleted everywhere (no resurrection).
 // ---------------------------------------------------------------------------
 #[test]
-fn tombstone_gcd_once_all_acked_and_stays_deleted() {
+fn stable_tombstone_is_retained_and_stays_deleted() {
     let rel = "note.md";
     let (a, b, c, container) = deleted_and_synced(rel);
 
-    // All trusted peers have acked (both current versions dominate the
-    // checkpoint) → A drops the tombstone entirely.
+    // All trusted peers have acked, but the reaper no longer runs: A KEEPS the
+    // tombstone entry (retention is now client-driven via Store::checkpoint).
     gc_scan(&a, &[&b, &c], &[(&b, peer_version(&b)), (&c, peer_version(&c))]);
     assert_eq!(
-        a.entry(&container),
-        None,
-        "a causally-stable tombstone must be GC'd (map entry removed)"
+        a.entry(&container).map(|e| e.status),
+        Some(EntryStatus::Tombstoned),
+        "a stable tombstone must be RETAINED now that the reaper is retired"
     );
 
-    // Propagate the map-delete to B and C and reconcile everywhere.
+    // Reconcile everywhere.
     for _ in 0..2 {
         round3(&a, &b, &c);
     }
 
-    // No resurrection: the file is absent on ALL three and no entry lingers.
+    // No resurrection: the file is absent on ALL three and the tombstone entry
+    // is retained everywhere (deletion propagated).
     for d in [&a, &b, &c] {
-        assert!(!d.vault_file(rel).exists(), "file must stay deleted after GC");
+        assert!(!d.vault_file(rel).exists(), "file must stay deleted");
         assert!(!scpath(d, rel).exists());
-        assert_eq!(d.entry(&container), None, "the GC'd entry must be gone everywhere");
+        assert_eq!(
+            d.entry(&container).map(|e| e.status),
+            Some(EntryStatus::Tombstoned),
+            "the tombstone entry must be retained everywhere"
+        );
     }
 
     // Convergence + stability across an extra round.
@@ -1105,17 +1111,18 @@ fn tombstone_gcd_once_all_acked_and_stays_deleted() {
     assert_eq!(
         converged3(&a, &b, &c, rel, &container),
         baseline,
-        "post-GC state must be stable across an extra round"
+        "post-delete state must be stable across an extra round"
     );
 }
 
 // ---------------------------------------------------------------------------
 // C4.3 — OFFLINE-PEER SAFETY (the critical test). C is offline during A's
-// delete; A and B hold the tombstone but MUST NOT GC it. When C reconnects it
-// converges to deleted; only AFTER C acks may GC happen.
+// delete; A and B hold the tombstone. When C reconnects it converges to
+// deleted. With the reaper retired the tombstone is retained throughout — the
+// resurrection guard, not GC, keeps the delete safe against the stale peer.
 // ---------------------------------------------------------------------------
 #[test]
-fn offline_peer_blocks_gc_until_it_reconnects_and_acks() {
+fn offline_peer_converges_to_deleted_and_tombstone_is_retained() {
     let a = Device::new();
     let b = Device::new();
     let c = Device::new(); // trusted but OFFLINE during the whole create+delete.
@@ -1157,56 +1164,69 @@ fn offline_peer_blocks_gc_until_it_reconnects_and_acks() {
     assert!(!c.vault_file(rel).exists(), "reconnected C must converge to deleted");
     assert_eq!(c.entry(&container).map(|e| e.status), Some(EntryStatus::Tombstoned));
 
-    // NOW C has acked (its current version dominates the tombstone). A may GC.
+    // Even now that C has acked, the reaper is retired: A RETAINS the tombstone
+    // entry (the resurrection guard, not GC, is what keeps the delete safe).
     gc_scan(&a, &[&b, &c], &[(&b, peer_version(&b)), (&c, peer_version(&c))]);
     assert_eq!(
-        a.entry(&container),
-        None,
-        "GC is allowed only AFTER the formerly-offline peer has acked"
+        a.entry(&container).map(|e| e.status),
+        Some(EntryStatus::Tombstoned),
+        "the tombstone is retained; the reaper no longer drops it"
     );
 
-    // The map-delete propagates and everyone converges to file-absent, no entry.
+    // Everyone converges to file-absent with the tombstone entry retained.
     for _ in 0..2 {
         round3(&a, &b, &c);
     }
     for d in [&a, &b, &c] {
         assert!(!d.vault_file(rel).exists());
-        assert_eq!(d.entry(&container), None);
+        assert_eq!(d.entry(&container).map(|e| e.status), Some(EntryStatus::Tombstoned));
     }
 }
 
 // ---------------------------------------------------------------------------
-// C4.4 — GC must not cause divergence: a peer that has already GC'd and one
-// that has not both still converge to "file absent".
+// C4.4 — with the reaper retired, a gc_scan is a no-op on the tombstone entry:
+// every device retains it and all converge to "file absent" with the entry
+// present. (Formerly asserted GC-induced transient divergence.)
 // ---------------------------------------------------------------------------
 #[test]
-fn gc_does_not_diverge_a_peer_that_gcd_from_one_that_has_not() {
+fn gc_scan_is_a_noop_and_all_peers_retain_the_tombstone() {
     let rel = "note.md";
     let (a, b, c, container) = deleted_and_synced(rel);
 
-    // Only A GCs; B and C still hold the tombstone entry.
+    // A runs a gc_scan with all peers acked; the reaper is retired so the entry
+    // is RETAINED, matching B and C which never GC'd.
     gc_scan(&a, &[&b, &c], &[(&b, peer_version(&b)), (&c, peer_version(&c))]);
-    assert_eq!(a.entry(&container), None, "A dropped the entry");
+    assert_eq!(
+        a.entry(&container).map(|e| e.status),
+        Some(EntryStatus::Tombstoned),
+        "A retains the tombstone (reaper retired)"
+    );
     assert_eq!(
         b.entry(&container).map(|e| e.status),
         Some(EntryStatus::Tombstoned),
-        "B still holds the tombstone (transiently divergent entry state)"
+        "B holds the tombstone"
     );
 
-    // Despite the transient entry-state difference, the OBSERVABLE file state is
-    // identical NOW (file absent on all), and after propagation the entries also
-    // converge (B and C receive A's map-delete).
+    // The OBSERVABLE file state is identical (file absent on all), and the entry
+    // state is already convergent (all Tombstoned).
     for d in [&a, &b, &c] {
-        assert!(!d.vault_file(rel).exists(), "file absent on all regardless of GC state");
+        assert!(!d.vault_file(rel).exists(), "file absent on all");
     }
     for _ in 0..2 {
         round3(&a, &b, &c);
     }
     let converged = converged3(&a, &b, &c, rel, &container);
-    assert_eq!(converged.status, None, "all converge to no entry after the map-delete propagates");
+    assert_eq!(
+        converged.status,
+        Some(EntryStatus::Tombstoned),
+        "all converge to the retained tombstone entry"
+    );
     assert!(converged.disk.is_none(), "all converge to file-absent");
 
     // Stable across an extra round (idempotent).
     round3(&a, &b, &c);
-    assert_eq!(converged3(&a, &b, &c, rel, &container).status, None);
+    assert_eq!(
+        converged3(&a, &b, &c, rel, &container).status,
+        Some(EntryStatus::Tombstoned)
+    );
 }

@@ -108,6 +108,39 @@ enum Command {
         #[arg(long)]
         paper: Option<String>,
     },
+    /// List recoverable history: retained markers (time points) and currently
+    /// deleted files that `restore` can bring back.
+    History {
+        #[arg(long)]
+        vault: PathBuf,
+        #[arg(long)]
+        identity: PathBuf,
+    },
+    /// Reclaim space by compacting local history: shallow-snapshot at the newest
+    /// point at/before `--before` (`latest` or epoch-millis), truncate op-logs to
+    /// the retained tail, drop blobs unreferenced in the retained range. Local
+    /// only. `--dry-run` reports bytes without changing anything.
+    Checkpoint {
+        #[arg(long)]
+        vault: PathBuf,
+        #[arg(long)]
+        identity: PathBuf,
+        #[arg(long, default_value = "latest")]
+        before: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Recover deleted data from retained history. No paths => restore every
+    /// deleted file (whole-vault); with paths => restore just those.
+    Restore {
+        #[arg(long)]
+        vault: PathBuf,
+        #[arg(long)]
+        identity: PathBuf,
+        #[arg(long)]
+        folder: PathBuf,
+        paths: Vec<PathBuf>,
+    },
 }
 
 #[tokio::main]
@@ -132,6 +165,19 @@ async fn main() -> Result<()> {
             identity,
             paper,
         } => rotate(&vault, &identity, paper).await,
+        Command::History { vault, identity } => history(&vault, &identity).await,
+        Command::Checkpoint {
+            vault,
+            identity,
+            before,
+            dry_run,
+        } => checkpoint(&vault, &identity, &before, dry_run).await,
+        Command::Restore {
+            vault,
+            identity,
+            folder,
+            paths,
+        } => restore(&vault, &identity, &folder, paths).await,
     }
 }
 
@@ -935,6 +981,80 @@ async fn rotate(vault: &Path, identity_path: &Path, paper: Option<String>) -> Re
         println!("wrapped to paper-recovery key (keep the passphrase safe)");
     }
     println!("new writes seal under this epoch; existing data is unchanged.");
+    Ok(())
+}
+
+/// Resolve `--before` to an epoch-millis cutoff. `latest` => i64::MAX; an integer
+/// => epoch millis.
+fn parse_before(before: &str) -> anyhow::Result<i64> {
+    if before == "latest" {
+        return Ok(i64::MAX);
+    }
+    before
+        .parse::<i64>()
+        .map_err(|_| anyhow::anyhow!("--before must be 'latest' or epoch-millis, got {before:?}"))
+}
+
+/// List recoverable history for a vault (read-only): the retained history markers
+/// (time points a checkpoint could land on) and the currently-deleted files that
+/// `restore` can bring back. The bridge's folder root is the `--vault` dir (the
+/// working root `list_deleted` maps stored keys back onto); internal sidecars live
+/// under `<vault>/filemeta`, the same meta-dir convention `sync` uses.
+async fn history(vault: &Path, identity_path: &Path) -> Result<()> {
+    let identity = Identity::load(identity_path).context("load identity")?;
+    let store = Store::open(vault, identity).context("open vault store")?;
+    let idx = roam_storage::HistoryIndex::new(&vault.join("history"));
+    let markers = idx.markers().context("read history")?;
+    println!("retained history points: {}", markers.len());
+    for m in &markers {
+        println!("  ts={} peers={}", m.ts_ms, m.log_lens.len());
+    }
+    let bridge = FolderBridge::new(vault, &vault.join("filemeta"));
+    let deleted = bridge.list_deleted(&store);
+    println!("recoverable deleted files: {}", deleted.len());
+    for p in &deleted {
+        println!("  {}", p.display());
+    }
+    Ok(())
+}
+
+/// Compact local history to reclaim space. Local-only: shallow-snapshots at the
+/// newest point at/before `--before`, truncates op-logs, and drops blobs
+/// unreferenced in the retained range. `--dry-run` reports the freeable bytes
+/// without touching anything.
+async fn checkpoint(vault: &Path, identity_path: &Path, before: &str, dry_run: bool) -> Result<()> {
+    let cutoff = parse_before(before)?;
+    let identity = Identity::load(identity_path).context("load identity")?;
+    let mut store = Store::open(vault, identity).context("open vault store")?;
+    if dry_run {
+        let bytes = store.checkpoint_dry_run(cutoff).context("dry-run")?;
+        println!("checkpoint --before {before}: would free {bytes} bytes (blobs). No changes made.");
+    } else {
+        let freed = store.checkpoint(cutoff).context("checkpoint")?;
+        println!("checkpoint done: freed {freed} bytes; op history compacted. Local only.");
+    }
+    Ok(())
+}
+
+/// Recover deleted data from retained history into `--folder`. No paths => restore
+/// every currently-deleted file (whole-vault); with paths => restore just those.
+/// The bridge uses `--folder` as its working root and `<vault>/filemeta` as its
+/// meta-dir, matching `sync`. The restored projection is persisted with
+/// `write_snapshot` before returning.
+async fn restore(vault: &Path, identity_path: &Path, folder: &Path, paths: Vec<PathBuf>) -> Result<()> {
+    let identity = Identity::load(identity_path).context("load identity")?;
+    let mut store = Store::open(vault, identity).context("open vault store")?;
+    let bridge = FolderBridge::new(folder, &vault.join("filemeta"));
+    let outcomes = if paths.is_empty() {
+        bridge.restore_all(&mut store).context("restore all")?
+    } else {
+        bridge.restore_paths(&mut store, &paths).context("restore paths")?
+    };
+    store.write_snapshot().context("persist after restore")?;
+    println!("restored {} file(s):", outcomes.len());
+    for (p, _) in &outcomes {
+        println!("  {}", p.display());
+    }
     Ok(())
 }
 

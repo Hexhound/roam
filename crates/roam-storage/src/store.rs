@@ -1,5 +1,7 @@
 use crate::blob::BlobStore;
 use crate::error::StorageError;
+use crate::history::{HistoryIndex, Marker};
+use crate::history_util::count_log_lines;
 use crate::identity::{Identity, VerifyingKey};
 use crate::keychain::{compute_epoch_id, Keychain, VaultIssue};
 use crate::keylog::{KeyBody, KeyLog, KeyLogEntry, Recipient};
@@ -7,9 +9,16 @@ use crate::keywrap;
 use crate::oplog::OpLog;
 use crate::roster::{merge_roster, PeerRecord, PeerStatus, RosterEntry, RosterLog, RosterOp};
 use crate::snapshot;
+use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use roam_crdt::{Document, Version};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+
+/// Base64-encode bytes for storage in a history marker (same STANDARD engine
+/// the op-log uses for its signed lines).
+fn b64(bytes: &[u8]) -> String {
+    B64.encode(bytes)
+}
 
 /// The `peer_id` a verifying key MUST map to: the first 8 little-endian bytes of
 /// the key (see `Identity::generate`). The roster binds every peer to this so op
@@ -61,6 +70,10 @@ pub struct Store {
     /// bridge (and later blob-transfer/projection slices) reach the blobs
     /// through the one shared store handle.
     blobs: BlobStore,
+    /// Append-only local history index (`<root>/history/history.jsonl`). A
+    /// marker is recorded on every `write_snapshot`, capturing the op-log
+    /// frontier + per-peer log lengths for later checkpoint compaction.
+    history: HistoryIndex,
 }
 
 impl Store {
@@ -114,6 +127,7 @@ impl Store {
         // it here (creating the dir if absent) means every caller sharing this
         // Store reaches the same blob store via `blobs()`.
         let blobs = BlobStore::open(&root.join("assets"))?;
+        let history = HistoryIndex::new(&root.join("history"));
         let store = Self {
             root: root.to_path_buf(),
             identity,
@@ -123,6 +137,7 @@ impl Store {
             own_roster,
             peers,
             blobs,
+            history,
         };
         store.write_peers_cache()?;
         Ok(store)
@@ -246,10 +261,40 @@ impl Store {
         Ok(())
     }
 
-    /// Write a fast-load snapshot of the current state.
+    /// Whether THIS device may author/propagate content ops. Always true today;
+    /// the future roles slice overrides this for Reader-role devices, and all write
+    /// paths (edit, restore, resurrect) route through it.
+    pub fn may_write(&self) -> bool {
+        true
+    }
+
+    /// Write a fast-load snapshot of the current state, then record a history
+    /// marker pinning this moment: the op-log frontier (base64) and every
+    /// peer's op-log line count. Later checkpoint compaction keys off these.
     pub fn write_snapshot(&self) -> Result<(), StorageError> {
         let path = self.root.join("snapshots").join("snapshot.loro");
-        snapshot::save(&path, &self.doc.snapshot()?)
+        snapshot::save(&path, &self.doc.snapshot()?)?;
+
+        let frontier = self.doc.oplog_frontier();
+        let mut log_lens = std::collections::BTreeMap::new();
+        log_lens.insert(self.peer_id(), count_log_lines(&self.own_log.path()));
+        for peer in &self.peers {
+            let path = self
+                .root
+                .join("ops")
+                .join(format!("ops-{}.jsonl", peer.peer_id));
+            log_lens.insert(peer.peer_id, count_log_lines(&path));
+        }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        self.history.append(&Marker {
+            ts_ms: now_ms,
+            frontier: b64(&frontier.to_bytes()),
+            log_lens,
+        })?;
+        Ok(())
     }
 
     /// The raw bytes of this device's own oplog file (for copying to a peer).
@@ -683,6 +728,185 @@ impl Store {
         std::fs::rename(&tmp, &path)?;
         Ok(())
     }
+
+    /// Every blob hash referenced by the fileset map across the retained marker
+    /// frontiers (base64) in `retained`, plus the current live/tombstoned set.
+    /// Walks history via checkout, then returns to latest.
+    fn referenced_hashes(&self, retained: &[String]) -> Result<HashSet<String>, StorageError> {
+        use roam_crdt::Frontier;
+        let mut refs = HashSet::new();
+        for f_b64 in retained {
+            let bytes = B64
+                .decode(f_b64.as_bytes())
+                .map_err(|e| StorageError::Base64(e.to_string()))?;
+            let frontier = Frontier::from_bytes(&bytes)?;
+            self.doc.checkout(&frontier)?;
+            for (_k, v) in self.doc.entries(FILESET_MAP_ID) {
+                if let Some(h) = extract_content_hash(&v) {
+                    refs.insert(h);
+                }
+            }
+        }
+        self.doc.checkout_latest();
+        for (_k, v) in self.doc.entries(FILESET_MAP_ID) {
+            if let Some(h) = extract_content_hash(&v) {
+                refs.insert(h);
+            }
+        }
+        Ok(refs)
+    }
+
+    /// Bytes a checkpoint at `before_ts` would free (blobs). No mutation.
+    pub fn checkpoint_dry_run(&self, before_ts: i64) -> Result<u64, StorageError> {
+        let idx = HistoryIndex::new(&self.root.join("history"));
+        let target = match idx.marker_before(before_ts)? {
+            Some(m) => m,
+            None => return Ok(0),
+        };
+        let retained: Vec<String> = idx
+            .markers()?
+            .into_iter()
+            .filter(|m| m.ts_ms >= target.ts_ms)
+            .map(|m| m.frontier)
+            .collect();
+        let referenced = self.referenced_hashes(&retained)?;
+        let mut on_disk = Vec::new();
+        for h in self.blobs.list()? {
+            let sz = self.blobs.size(&h)?.unwrap_or(0);
+            on_disk.push((h, sz));
+        }
+        Ok(crate::checkpoint::reclaimable_blob_bytes(&on_disk, &referenced))
+    }
+
+    /// Execute a checkpoint keeping history at/after the newest marker with
+    /// `ts_ms <= before_ts`. Shallow-snapshots at that frontier, truncates each
+    /// peer op-log to its retained tail, reclaims unreferenced blobs. Local-only;
+    /// emits no ops. Returns bytes freed. `i64::MAX` = checkpoint to latest.
+    pub fn checkpoint(&mut self, before_ts: i64) -> Result<u64, StorageError> {
+        use roam_crdt::Frontier;
+        let idx = HistoryIndex::new(&self.root.join("history"));
+        let target = match idx.marker_before(before_ts)? {
+            Some(m) => m,
+            None => return Ok(0),
+        };
+        let all = idx.markers()?;
+        let retained: Vec<String> = all
+            .iter()
+            .filter(|m| m.ts_ms >= target.ts_ms)
+            .map(|m| m.frontier.clone())
+            .collect();
+
+        // 1. Referenced hashes BEFORE mutating (needs full history present).
+        let referenced = self.referenced_hashes(&retained)?;
+
+        // 2. Shallow snapshot at the target frontier -> overwrite the snapshot base.
+        let fbytes = B64
+            .decode(target.frontier.as_bytes())
+            .map_err(|e| StorageError::Base64(e.to_string()))?;
+        let frontier = Frontier::from_bytes(&fbytes)?;
+        let shallow = self.doc.shallow_snapshot(&frontier)?;
+        crate::snapshot::save(
+            &self.root.join("snapshots").join("snapshot.loro"),
+            &shallow,
+        )?;
+
+        // 3. Truncate each peer op-log to its retained tail.
+        let plan = crate::checkpoint::plan_from_marker(&target);
+        for (peer, drop) in &plan.drop_lines {
+            let path = if *peer == self.peer_id() {
+                self.own_log.path()
+            } else {
+                self.root.join("ops").join(format!("ops-{peer}.jsonl"))
+            };
+            truncate_leading_lines(&path, *drop as usize)?;
+        }
+
+        // 4. Reclaim unreferenced blobs.
+        let mut freed = 0u64;
+        for h in self.blobs.list()? {
+            if !referenced.contains(&h) {
+                freed += self.blobs.size(&h)?.unwrap_or(0);
+                self.blobs.remove(&h)?;
+            }
+        }
+
+        // 5. Compact history to the retained markers.
+        rewrite_history(&self.root.join("history"), &all, target.ts_ms)?;
+        Ok(freed)
+    }
+
+    /// The serialized entry value for `key` in `map_id` as of the newest retained
+    /// marker at/before `before_ts`, or `None` if no such marker exists or that
+    /// point can't be checked out (already compacted below the shallow base).
+    /// Checks out the historical frontier, reads, and returns to latest.
+    pub fn historical_entry(
+        &self,
+        map_id: &str,
+        key: &str,
+        before_ts: i64,
+    ) -> Result<Option<String>, StorageError> {
+        use roam_crdt::Frontier;
+        let idx = HistoryIndex::new(&self.root.join("history"));
+        let marker = match idx.marker_before(before_ts)? {
+            Some(m) => m,
+            None => return Ok(None),
+        };
+        let fbytes = B64
+            .decode(marker.frontier.as_bytes())
+            .map_err(|e| StorageError::Base64(e.to_string()))?;
+        let frontier = Frontier::from_bytes(&fbytes)?;
+        if self.doc.checkout(&frontier).is_err() {
+            // Re-attach to latest even on the error branch so a failed checkout
+            // never leaves the doc pinned at a partial/old frontier.
+            self.doc.checkout_latest();
+            return Ok(None);
+        }
+        let value = self.doc.get_entry(map_id, key);
+        self.doc.checkout_latest();
+        Ok(value)
+    }
+}
+
+/// Mirrors `roam_files::fileset::FILESET_MAP_ID`. Kept as a literal to avoid a
+/// storage->files dependency cycle; a roam-files test asserts they stay equal.
+const FILESET_MAP_ID: &str = "__roam_fileset__";
+
+/// Extract the `content_hash` string from a serialized `FileEntry` JSON value.
+fn extract_content_hash(value: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(value).ok()?;
+    v.get("content_hash")?.as_str().map(|s| s.to_string())
+}
+
+/// Drop the first `n` non-empty lines from a JSONL file, rewriting atomically.
+fn truncate_leading_lines(path: &std::path::Path, n: usize) -> Result<(), StorageError> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    let kept: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).skip(n).collect();
+    let mut out = kept.join("\n");
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    let tmp = path.with_extension("jsonl.tmp");
+    std::fs::write(&tmp, out.as_bytes())?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Rewrite history.jsonl keeping only markers with `ts_ms >= keep_from`.
+fn rewrite_history(dir: &std::path::Path, all: &[Marker], keep_from: i64) -> Result<(), StorageError> {
+    let path = dir.join("history.jsonl");
+    let mut out = String::new();
+    for m in all.iter().filter(|m| m.ts_ms >= keep_from) {
+        out.push_str(&serde_json::to_string(m)?);
+        out.push('\n');
+    }
+    let tmp = path.with_extension("jsonl.tmp");
+    std::fs::write(&tmp, out.as_bytes())?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -703,6 +927,32 @@ mod tests {
         assert_eq!(store.blobs().get(&hash).unwrap(), Some(vec![0x00, 0xff, 0x7f]));
         // Bytes landed under the assets dir beside the CRDT state.
         assert!(dir.path().join("assets").join(&hash).exists());
+    }
+
+    #[test]
+    fn may_write_is_true_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), Identity::generate()).unwrap();
+        assert!(store.may_write());
+    }
+
+    #[test]
+    fn write_snapshot_records_a_history_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path(), Identity::generate()).unwrap();
+        store.edit_text("note", 0, "alpha").unwrap();
+        store.write_snapshot().unwrap();
+
+        let idx = crate::history::HistoryIndex::new(&dir.path().join("history"));
+        let markers = idx.markers().unwrap();
+        assert_eq!(markers.len(), 1, "one marker recorded on write_snapshot");
+        let m = &markers[0];
+        assert!(!m.frontier.is_empty(), "frontier bytes captured");
+        assert_eq!(
+            m.log_lens.get(&store.peer_id()).copied(),
+            Some(1),
+            "own op-log had one line at snapshot time"
+        );
     }
 
     #[test]
@@ -1402,5 +1652,48 @@ mod tests {
         let kc_b = b.keychain(&id_key, &epoch0).unwrap();
         assert_eq!(kc_b.epoch_key(&epoch), a.keychain(&id_key, &epoch0).unwrap().epoch_key(&epoch),
             "B recovered the same epoch key A minted, via back-fill");
+    }
+
+    #[test]
+    fn checkpoint_compacts_ops_and_reopens_to_same_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = Identity::generate();
+        {
+            let mut store = Store::open(dir.path(), id.clone()).unwrap();
+            store.edit_text("note", 0, "one").unwrap();
+            store.write_snapshot().unwrap();
+            store.edit_text("note", 3, "-two").unwrap();
+            store.write_snapshot().unwrap();
+            let _freed = store.checkpoint(i64::MAX).unwrap();
+            assert_eq!(store.text("note"), "one-two", "state preserved across checkpoint");
+        }
+        let store = Store::open(dir.path(), id).unwrap();
+        assert_eq!(store.text("note"), "one-two", "reopen after checkpoint is identical");
+    }
+
+    #[test]
+    fn checkpoint_dry_run_reports_without_mutating() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path(), Identity::generate()).unwrap();
+        store.edit_text("note", 0, "data").unwrap();
+        store.write_snapshot().unwrap();
+        let before = store.text("note");
+        let markers_before = crate::history::HistoryIndex::new(&dir.path().join("history")).markers().unwrap().len();
+        let _bytes = store.checkpoint_dry_run(i64::MAX).unwrap();
+        assert_eq!(store.text("note"), before, "dry run does not mutate state");
+        let markers_after = crate::history::HistoryIndex::new(&dir.path().join("history")).markers().unwrap().len();
+        assert_eq!(markers_before, markers_after, "dry run does not rewrite history");
+    }
+
+    #[test]
+    fn historical_entry_none_when_no_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), Identity::generate()).unwrap();
+        assert_eq!(
+            store
+                .historical_entry("__roam_fileset__", "x", i64::MAX)
+                .unwrap(),
+            None
+        );
     }
 }

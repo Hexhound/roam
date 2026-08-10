@@ -34,6 +34,22 @@ impl Version {
     }
 }
 
+/// An opaque handle to a specific point in the op-DAG (a set of leaf op-ids).
+/// Wraps loro's `Frontiers`; `to_bytes`/`from_bytes` give a persistable byte
+/// form used by the storage-layer history index.
+#[derive(Clone)]
+pub struct Frontier(pub(crate) loro::Frontiers);
+
+impl Frontier {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        self.0.encode()
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, CrdtError> {
+        Ok(Frontier(loro::Frontiers::decode(bytes)?))
+    }
+}
+
 /// A CRDT document: a set of named text containers backed by a single
 /// `LoroDoc`. `peer_id` must be unique per device.
 pub struct Document {
@@ -142,6 +158,31 @@ impl Document {
     pub fn import(&self, bytes: &[u8]) -> Result<(), CrdtError> {
         self.doc.import(bytes)?;
         Ok(())
+    }
+
+    /// The current op-log frontier (leaf op-ids of everything committed).
+    pub fn oplog_frontier(&self) -> Frontier {
+        Frontier(self.doc.oplog_frontiers())
+    }
+
+    /// Export a shallow snapshot whose retained history starts at `frontier`.
+    /// State is preserved in full; op history older than `frontier` is dropped.
+    pub fn shallow_snapshot(&self, frontier: &Frontier) -> Result<Vec<u8>, CrdtError> {
+        Ok(self
+            .doc
+            .export(loro::ExportMode::shallow_snapshot(&frontier.0))?)
+    }
+
+    /// Move the document's readable state back to `frontier` (detached read).
+    /// Call `checkout_latest` to return to the newest state before authoring.
+    pub fn checkout(&self, frontier: &Frontier) -> Result<(), CrdtError> {
+        self.doc.checkout(&frontier.0)?;
+        Ok(())
+    }
+
+    /// Re-attach to the latest state after a `checkout`.
+    pub fn checkout_latest(&self) {
+        self.doc.checkout_to_latest();
     }
 }
 
@@ -382,6 +423,34 @@ mod tests {
         // that a's OWN delete op exists and propagates; convergence of a↔b LWW is
         // covered by the storage/bridge layers. Here assert a stays absent.
         assert_eq!(a.get_entry("m", "k"), None);
+    }
+
+    #[test]
+    fn shallow_snapshot_at_current_frontier_reimports_to_same_state() {
+        let doc = Document::new(1).unwrap();
+        doc.insert_text("note", 0, "hello").unwrap();
+        doc.commit();
+        let f_after_hello = doc.oplog_frontier();
+        doc.insert_text("note", 5, " world").unwrap();
+        doc.commit();
+        let shallow = doc.shallow_snapshot(&f_after_hello).unwrap();
+        let restored = Document::from_snapshot(2, &shallow).unwrap();
+        assert_eq!(restored.text("note"), "hello world");
+    }
+
+    #[test]
+    fn checkout_reads_past_then_returns_to_latest() {
+        let doc = Document::new(1).unwrap();
+        doc.insert_text("note", 0, "v1").unwrap();
+        doc.commit();
+        let f_v1 = doc.oplog_frontier();
+        doc.insert_text("note", 2, "-v2").unwrap();
+        doc.commit();
+        assert_eq!(doc.text("note"), "v1-v2");
+        doc.checkout(&f_v1).unwrap();
+        assert_eq!(doc.text("note"), "v1", "checked-out state is the past");
+        doc.checkout_latest();
+        assert_eq!(doc.text("note"), "v1-v2", "returned to latest");
     }
 
     #[test]

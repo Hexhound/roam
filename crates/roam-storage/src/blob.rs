@@ -125,6 +125,17 @@ impl BlobStore {
         Ok(hashes)
     }
 
+    /// Byte length of the blob for `hash`, or `Ok(None)` if absent. Used for
+    /// checkpoint reclaim accounting without reading the whole file.
+    pub fn size(&self, hash: &str) -> Result<Option<u64>, StorageError> {
+        let path = self.blob_path(hash)?;
+        match std::fs::metadata(&path) {
+            Ok(m) => Ok(Some(m.len())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => return Err(e.into()),
+        }
+    }
+
     /// Resolve `hash` to its on-disk path, rejecting anything that is not a
     /// valid blake3 hex digest.
     ///
@@ -287,5 +298,14 @@ mod tests {
         let payload: Vec<u8> = vec![0x00, 0xff, 0x00, 0x01, 0xfe, 0x80, 0x7f, 0x00];
         let hash = store.put(&payload).unwrap();
         assert_eq!(store.get(&hash).unwrap(), Some(payload));
+    }
+
+    #[test]
+    fn size_reports_byte_length_and_none_when_absent() {
+        let dir = tempdir().unwrap();
+        let store = open(&dir);
+        let hash = store.put(b"12345").unwrap();
+        assert_eq!(store.size(&hash).unwrap(), Some(5));
+        assert_eq!(store.size(&BlobStore::hash(b"absent")).unwrap(), None);
     }
 }
