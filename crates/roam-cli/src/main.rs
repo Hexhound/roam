@@ -232,11 +232,24 @@ fn spawn_backend_sync(engine: &Arc<Engine<IrohTransport>>, backend: Option<Strin
     let vault_key = VaultKey(blake3::hash(engine.vault_id_bytes().as_slice()).into());
     let backend = Arc::new(HttpBackend::new(&backend_url));
     let store = engine.store();
+    let flushed = engine.local_flushed();
 
     tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_secs(5));
+        // Poll every 2s to PULL remote changes; additionally wake immediately on
+        // a local flush to PUSH local changes without waiting for the next tick.
+        let mut tick = tokio::time::interval(Duration::from_secs(2));
         loop {
-            tick.tick().await;
+            // Register the local-flush waiter BEFORE reconciling, so a flush that
+            // races this pass still wakes the next one (notify_waiters stores no
+            // permit; `enable()` registers the waiter eagerly, now).
+            let wake = flushed.notified();
+            tokio::pin!(wake);
+            wake.as_mut().enable();
+
+            tokio::select! {
+                _ = tick.tick() => {}
+                _ = &mut wake => {}
+            }
             if let Err(err) = reconcile_once(&store, &backend, &vault_key).await {
                 eprintln!("backend sync error: {err}");
             }
@@ -271,12 +284,22 @@ async fn setup_engine(vault: &Path, identity_path: &Path) -> Result<Arc<Engine<I
     let engine = Arc::new(Engine::new(identity, vault_id, store, Arc::new(transport)));
     tokio::spawn(engine.clone().run());
 
-    println!("syncing {} active peer(s)...", active.len());
-    for peer in &active {
-        match engine.connect(*peer).await {
-            Ok(()) => println!("connected to peer {peer}"),
-            Err(e) => println!("connect to peer {peer} failed: {e}"),
-        }
+    // Connect in the BACKGROUND: an unreachable peer's dial blocks ~15s (iroh's
+    // default connect timeout), and awaiting it here would stall startup — and,
+    // more importantly, delay the backend sync task and folder loop that the
+    // caller spawns right after. The periodic reconnect task (spawned by the
+    // folder loop) keeps retrying, so a peer that is not up yet still connects.
+    println!("connecting to {} active peer(s) in background...", active.len());
+    {
+        let engine = engine.clone();
+        tokio::spawn(async move {
+            for peer in active {
+                match engine.connect(peer).await {
+                    Ok(()) => println!("connected to peer {peer}"),
+                    Err(e) => println!("connect to peer {peer} failed: {e}"),
+                }
+            }
+        });
     }
     Ok(engine)
 }
@@ -419,13 +442,26 @@ async fn sync_folder(
         folder.display()
     );
     let mut interval = tokio::time::interval(Duration::from_millis(500));
-    // Self-healing reconnect: a peer unreachable at startup (discovery lag, the
-    // other side not up yet) or a connection that later drops is retried here.
-    // `reconnect_active` re-dials + re-offers every active peer; it is a cheap
-    // no-op for a live connection and reconnects an evicted/dead one.
-    let mut reconnect = tokio::time::interval(Duration::from_secs(5));
-    // Skip the immediate first tick: setup_engine already connected once.
-    reconnect.reset();
+
+    // Self-healing reconnect runs in its OWN task, NOT in the select loop below.
+    // `reconnect_active` dials each unreachable peer sequentially, and each dial
+    // blocks ~15s on iroh's connect timeout; running it inline would stall local
+    // scans + disk projection for that whole time (a file created mid-dial would
+    // not sync until the dial gave up). Isolated here, dial latency never touches
+    // the local sync path. Cheap no-op for live connections; reconnects dead ones.
+    {
+        let engine = engine.clone();
+        tokio::spawn(async move {
+            let mut reconnect = tokio::time::interval(Duration::from_secs(5));
+            // Skip the immediate first tick: setup_engine already kicked off a connect.
+            reconnect.reset();
+            loop {
+                reconnect.tick().await;
+                roam_sync_core::dlog!("cli: reconnect tick");
+                engine.reconnect_active().await;
+            }
+        });
+    }
 
     loop {
         // Re-acquire the Notify handle and build a FRESH `Notified` future each
@@ -453,11 +489,6 @@ async fn sync_folder(
             // (editor atomic-rename quirks, inotify overflow) is always caught.
             _ = interval.tick() => {
                 scan_and_maybe_flush(&engine, &bridge, None).await;
-            }
-            // Periodic self-healing reconnect to any active peer (see above).
-            _ = reconnect.tick() => {
-                roam_sync_core::dlog!("cli: reconnect tick");
-                engine.reconnect_active().await;
             }
             // Inbound remote change: project remote state to disk promptly.
             _ = &mut notified => {
@@ -503,10 +534,29 @@ async fn scan_and_maybe_flush(
     bridge: &FolderBridge,
     hint: Option<HashSet<PathBuf>>,
 ) {
+    let hint_dbg = hint
+        .as_ref()
+        .map(|h| format!("hinted {:?}", h.iter().map(|p| p.display().to_string()).collect::<Vec<_>>()))
+        .unwrap_or_else(|| "full-poll".to_string());
     match run_scan(engine, bridge, hint).await {
         Ok(outcomes) => {
+            let changed = outcomes.iter().filter(|(_, o)| o.changed).count();
+            roam_sync_core::dlog!(
+                "cli: scan ({hint_dbg}) → {} outcome(s), {changed} changed",
+                outcomes.len(),
+            );
             report_scan(&outcomes);
             if outcomes.iter().any(|(_, outcome)| outcome.changed) {
+                let changed_paths: Vec<_> = outcomes
+                    .iter()
+                    .filter(|(_, o)| o.changed)
+                    .map(|(p, _)| p.display().to_string())
+                    .collect();
+                roam_sync_core::dlog!(
+                    "cli: local scan changed {} file(s) {:?} → flush_local",
+                    changed_paths.len(),
+                    changed_paths,
+                );
                 // A remote-driven scan that only projected to disk still calls
                 // this; `flush_local` is idempotent (no unsent suffix -> no-op),
                 // so the harmless extra flush is fine.

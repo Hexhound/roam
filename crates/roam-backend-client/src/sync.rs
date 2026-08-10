@@ -18,6 +18,9 @@ pub async fn reconcile_once<B: Backend>(
     backend: &Arc<B>,
     key: &VaultKey,
 ) -> anyhow::Result<()> {
+    // Opt-in tracing (set ROAM_DEBUG) — the sync engine's `dlog!` lives in
+    // roam-sync-core, so this crate does its own env check.
+    let debug = std::env::var_os("ROAM_DEBUG").is_some();
     let bucket = key.bucket_id();
 
     // `local_entries_vec` is ordered by (peer, ascending index); keep it ordered
@@ -25,30 +28,60 @@ pub async fn reconcile_once<B: Backend>(
     // contiguous prefix per peer (never a hole that would strand later entries
     // behind the reader's GET-until-404 walk). `local_entry_ids` is only for the
     // set-membership `has_missing` check.
-    let (local_entries_vec, local_blobs_vec, self_peer) = {
+    let (local_entries_vec, local_blobs_vec, self_peer, own_log_len, roster_peers) = {
         let guard = store.lock().await;
+        let roster_peers: Vec<(u64, roam_storage::PeerStatus)> = guard
+            .roster()
+            .into_iter()
+            .map(|r| (r.peer_id, r.status))
+            .collect();
         (
             local_entries(&guard, key)?,
             local_blobs(&guard, key)?,
             guard.peer_id(),
+            guard.export_own_log().map(|b| b.len()).unwrap_or(0),
+            roster_peers,
         )
     };
     let local_entry_ids: BTreeSet<String> =
         local_entries_vec.iter().map(|(id, _)| id.clone()).collect();
     let local_blob_ids: BTreeMap<String, String> = local_blobs_vec.into_iter().collect();
 
+    if debug {
+        eprintln!(
+            "[be-sync] tick self_peer={self_peer} own_log={own_log_len}B \
+             local_entries={} local_blobs={} roster={:?}",
+            local_entries_vec.len(),
+            local_blob_ids.len(),
+            roster_peers,
+        );
+    }
+
     let manifest = backend.manifest(&bucket).await?;
     let remote_entry_ids: BTreeSet<String> = manifest.entry_ids.into_iter().collect();
     let remote_blob_ids: BTreeSet<String> = manifest.blob_ids.into_iter().collect();
 
+    if debug {
+        eprintln!(
+            "[be-sync]   remote_entries={} remote_blobs={}",
+            remote_entry_ids.len(),
+            remote_blob_ids.len(),
+        );
+    }
+
     // Upload entries the backend lacks, in strict (peer, index) order (encrypt
     // the line bytes). Ascending order also self-heals any pre-existing gap by
     // filling it from the bottom.
+    let mut uploaded_entries = 0usize;
     for (id, line) in &local_entries_vec {
         if !remote_entry_ids.contains(id) {
             let ct = key.seal(line);
             backend.put_entry(&bucket, id, ct).await?;
+            uploaded_entries += 1;
         }
+    }
+    if debug {
+        eprintln!("[be-sync]   uploaded_entries={uploaded_entries}");
     }
     // Upload blobs the backend lacks (encrypt the plaintext bytes). Order is
     // irrelevant — blobs are independent, self-identifying by content hash.
@@ -85,8 +118,11 @@ pub async fn reconcile_once<B: Backend>(
     let has_missing = remote_entry_ids
         .iter()
         .any(|id| !local_entry_ids.contains(id));
+    if debug {
+        eprintln!("[be-sync]   has_missing_entries={has_missing}");
+    }
     if has_missing {
-        import_missing_entries(store, backend, key, &bucket, self_peer).await?;
+        import_missing_entries(store, backend, key, &bucket, self_peer, debug).await?;
     }
 
     Ok(())
@@ -100,6 +136,7 @@ async fn import_missing_entries<B: Backend>(
     key: &VaultKey,
     bucket: &str,
     self_peer: u64,
+    debug: bool,
 ) -> anyhow::Result<()> {
     let peers: Vec<(u64, VerifyingKey)> = {
         let guard = store.lock().await;
@@ -134,6 +171,13 @@ async fn import_missing_entries<B: Backend>(
         }
         if fetched.is_empty() {
             continue;
+        }
+        if debug {
+            eprintln!(
+                "[be-sync]   import peer={peer_id}: fetched {} new entries (from index {})",
+                fetched.len(),
+                index - fetched.len() as u64,
+            );
         }
         let appended = reassemble_log(&fetched);
         let mut guard = store.lock().await;

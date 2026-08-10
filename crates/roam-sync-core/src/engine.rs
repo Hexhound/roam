@@ -52,6 +52,10 @@ pub struct Engine<T: Transport> {
     /// when to re-project the store to disk. `notify_waiters` is used, so it only
     /// wakes waiters already awaiting — no permit is stored for future awaits.
     changed: Arc<tokio::sync::Notify>,
+    /// Fired after [`flush_local`](Self::flush_local) runs (any local or
+    /// remote-projected change that produced ops). The backend sync task awaits
+    /// this to upload promptly instead of waiting for its next poll tick.
+    local_flush: Arc<tokio::sync::Notify>,
 }
 
 /// Everything we offer a peer on connect or in a `Hello` reply, gathered under a
@@ -76,7 +80,16 @@ impl<T: Transport + 'static> Engine<T> {
             acked_versions: Arc::new(Mutex::new(HashMap::new())),
             connected: Arc::new(Mutex::new(HashSet::new())),
             changed: Arc::new(tokio::sync::Notify::new()),
+            local_flush: Arc::new(tokio::sync::Notify::new()),
         }
+    }
+
+    /// A handle to the local-flush signal, fired after every `flush_local`. The
+    /// backend sync task awaits this to upload changes promptly instead of
+    /// waiting out its poll interval. `notify_waiters` semantics: register the
+    /// waiter (build the `Notified` and `enable()` it) before awaiting.
+    pub fn local_flushed(&self) -> Arc<tokio::sync::Notify> {
+        self.local_flush.clone()
     }
 
     /// The shared store handle. The backend sync task MUST use this exact
@@ -222,6 +235,12 @@ impl<T: Transport + 'static> Engine<T> {
             )
             .await;
         }
+
+        // Wake the backend sync task (if any) so it uploads this flush's ops
+        // immediately rather than on its next poll tick. Cheap no-op when no one
+        // is awaiting. Fired unconditionally: even a "nothing to push to peers"
+        // flush may carry new own-log ops the backend still needs.
+        self.local_flush.notify_waiters();
     }
 
     /// Pull every blob the synced file-set map references but whose bytes we
