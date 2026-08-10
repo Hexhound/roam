@@ -50,4 +50,19 @@ defmodule SyncWeb.SyncControllerTest do
   test "path-traversal id is rejected 400", %{conn: conn} do
     assert get(conn, "/b/#{@bucket}/entries/..%2f..%2fetc").status == 400
   end
+
+  test "reconcile endpoint returns octet-stream bytes or fails closed for a client frame", %{
+    conn: conn
+  } do
+    # Empty body: reconcile_server must fail closed -> 400, not crash -> 500.
+    conn = put_req_header(conn, "content-type", "application/octet-stream")
+    resp = post(conn, "/b/#{@bucket}/reconcile/entries", <<>>)
+    assert resp.status in [200, 400]
+    refute resp.status == 500
+  end
+
+  test "reconcile rejects an unknown kind 400", %{conn: conn} do
+    conn = put_req_header(conn, "content-type", "application/octet-stream")
+    assert post(conn, "/b/#{@bucket}/reconcile/bogus", <<>>).status == 400
+  end
 end

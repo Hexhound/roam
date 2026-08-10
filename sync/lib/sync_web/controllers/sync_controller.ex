@@ -12,6 +12,34 @@ defmodule SyncWeb.SyncController do
   def get_blob(conn, %{"bucket" => b, "id" => id}), do: do_get(conn, b, "blobs", id)
   def put_blob(conn, %{"bucket" => b, "id" => id}), do: do_put(conn, b, "blobs", id)
 
+  @kinds %{"entries" => "entries", "blobs" => "blobs"}
+
+  def reconcile(conn, %{"bucket" => bucket, "kind" => kind}) do
+    with :ok <- guard(conn, [bucket]),
+         {:ok, kind_dir} <- fetch_kind(kind),
+         {:ok, body, conn} <- read_body(conn) do
+      items = Store.id_bytes(bucket, kind_dir)
+
+      case Sync.Rbsr.reconcile_server(items, body) do
+        {:ok, reply} ->
+          conn |> put_resp_content_type("application/octet-stream") |> send_resp(200, reply)
+
+        {:error, _reason} ->
+          send_resp(conn, 400, "bad reconcile message")
+      end
+    else
+      {:halt, conn} -> conn
+      :error -> send_resp(conn, 400, "unknown kind")
+    end
+  end
+
+  defp fetch_kind(kind) do
+    case Map.fetch(@kinds, kind) do
+      {:ok, dir} -> {:ok, dir}
+      :error -> :error
+    end
+  end
+
   def manifest(conn, %{"bucket" => b}) do
     with :ok <- guard(conn, [b]) do
       json(conn, %{entry_ids: Store.list(b, "entries"), blob_ids: Store.list(b, "blobs")})
