@@ -8,6 +8,7 @@ mod keychain;
 mod keylog;
 mod keywrap;
 mod oplog;
+mod paper;
 mod roster;
 mod snapshot;
 mod store;
@@ -20,5 +21,6 @@ pub use keychain::{compute_epoch_id, EpochNode, Keychain, ReadPlan, VaultIssue, 
 pub use keylog::{KeyBody, KeyLog, KeyLogEntry, Recipient};
 pub use keywrap::{unwrap, wrap};
 pub use oplog::{Entry, OpLog};
+pub use paper::PaperKey;
 pub use roster::{merge_roster, PeerRecord, PeerStatus, RosterEntry, RosterLog, RosterOp};
 pub use store::{version_dominates, Store};
