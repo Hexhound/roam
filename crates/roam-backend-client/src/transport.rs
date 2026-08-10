@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64URL, Engine};
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
@@ -50,20 +51,15 @@ impl MemoryBackend {
         let Some(b) = guard.get(bucket) else {
             return Vec::new();
         };
-        b.keys().filter_map(|k| hex_to_id(k)).collect()
+        b.keys().filter_map(|k| str_to_id(k)).collect()
     }
 }
 
-/// Decode a 64-char lowercase-hex id back to 32 bytes; `None` if malformed.
-fn hex_to_id(s: &str) -> Option<[u8; 32]> {
-    if s.len() != 64 {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    for i in 0..32 {
-        out[i] = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
-    }
-    Some(out)
+/// Decode a base64url (no-pad) id back to 32 bytes; `None` if malformed. Matches
+/// the id encoding produced by `VaultKey` (see crypto.rs) so the backend's RBSR
+/// set is byte-for-byte comparable with the client's.
+fn str_to_id(s: &str) -> Option<[u8; 32]> {
+    B64URL.decode(s).ok()?.try_into().ok()
 }
 
 fn put(
@@ -184,8 +180,8 @@ mod reconcile_tests {
         b[0] = n;
         b
     }
-    fn hex(id: &[u8; 32]) -> String {
-        id.iter().map(|b| format!("{b:02x}")).collect()
+    fn id_str(id: &[u8; 32]) -> String {
+        B64URL.encode(id)
     }
 
     #[tokio::test]
@@ -193,7 +189,7 @@ mod reconcile_tests {
         let backend = MemoryBackend::default();
         for n in [1u8, 2, 3] {
             backend
-                .put_entry("bucket", &hex(&id(n)), vec![n])
+                .put_entry("bucket", &id_str(&id(n)), vec![n])
                 .await
                 .unwrap();
         }

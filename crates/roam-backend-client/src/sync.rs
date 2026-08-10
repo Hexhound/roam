@@ -1,10 +1,53 @@
 use crate::crypto::VaultKey;
 use crate::entries::{local_blobs, local_entries, reassemble_log, split_log_lines};
 use crate::transport::Backend;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64URL, Engine};
+use roam_rbsr::{initiate, reconcile, ItemSet, SetKind};
 use roam_storage::{PeerStatus, Store, VerifyingKey};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use tokio::sync::Mutex;
+
+/// Client-side round cap: bounds a pathological/hostile server that never
+/// converges. The 2s reconcile loop is self-healing, so aborting a pass is safe.
+const RBSR_ROUND_CAP: usize = 32;
+
+/// Drive an RBSR session for one `kind` to convergence against the backend.
+/// Returns `(have, need)` as id strings: `have` = ids the backend lacks
+/// (we upload), `need` = ids we lack (we fetch). Both are returned in the same
+/// base64url (no-pad) encoding used for entry/blob ids elsewhere.
+async fn reconcile_set<B: Backend>(
+    backend: &Arc<B>,
+    bucket: &str,
+    kind: SetKind,
+    local_ids: &BTreeSet<String>,
+) -> anyhow::Result<(BTreeSet<String>, BTreeSet<String>)> {
+    let id_bytes: Vec<[u8; 32]> = local_ids.iter().filter_map(|s| str_to_id(s)).collect();
+    let set = ItemSet::from_ids(id_bytes);
+
+    let mut msg = initiate(&set);
+    let mut have = BTreeSet::new();
+    let mut need = BTreeSet::new();
+    for _ in 0..RBSR_ROUND_CAP {
+        let reply = backend.reconcile(bucket, kind, msg).await?;
+        let out = reconcile(&set, &reply).map_err(|e| anyhow::anyhow!(e))?;
+        have.extend(out.have.iter().map(id_to_str));
+        need.extend(out.need.iter().map(id_to_str));
+        match out.next_msg {
+            Some(next) => msg = next,
+            None => return Ok((have, need)),
+        }
+    }
+    anyhow::bail!("RBSR did not converge within {RBSR_ROUND_CAP} rounds")
+}
+
+fn id_to_str(id: &[u8; 32]) -> String {
+    B64URL.encode(id)
+}
+
+fn str_to_id(s: &str) -> Option<[u8; 32]> {
+    B64URL.decode(s).ok()?.try_into().ok()
+}
 
 /// One full reconcile pass against the backend: push what the backend lacks,
 /// pull what the local store lacks, apply pulled ops through the existing
@@ -57,15 +100,22 @@ pub async fn reconcile_once<B: Backend>(
         );
     }
 
-    let manifest = backend.manifest(&bucket).await?;
-    let remote_entry_ids: BTreeSet<String> = manifest.entry_ids.into_iter().collect();
-    let remote_blob_ids: BTreeSet<String> = manifest.blob_ids.into_iter().collect();
+    // RBSR discovery: reconcile the entry and blob id sets independently. `need_*`
+    // are ids we lack (fetch); `have_*` are ids the backend lacks (upload).
+    let (have_entry_ids, need_entry_ids) =
+        reconcile_set(backend, &bucket, SetKind::Entries, &local_entry_ids).await?;
+    let (have_blob_ids, need_blob_ids) = {
+        let local_blob_id_set: BTreeSet<String> = local_blob_ids.keys().cloned().collect();
+        reconcile_set(backend, &bucket, SetKind::Blobs, &local_blob_id_set).await?
+    };
 
     if debug {
         eprintln!(
-            "[be-sync]   remote_entries={} remote_blobs={}",
-            remote_entry_ids.len(),
-            remote_blob_ids.len(),
+            "[be-sync]   rbsr entries: upload={} fetch={}  blobs: upload={} fetch={}",
+            have_entry_ids.len(),
+            need_entry_ids.len(),
+            have_blob_ids.len(),
+            need_blob_ids.len(),
         );
     }
 
@@ -74,7 +124,7 @@ pub async fn reconcile_once<B: Backend>(
     // filling it from the bottom.
     let mut uploaded_entries = 0usize;
     for (id, line) in &local_entries_vec {
-        if !remote_entry_ids.contains(id) {
+        if have_entry_ids.contains(id) {
             let ct = key.seal(line);
             backend.put_entry(&bucket, id, ct).await?;
             uploaded_entries += 1;
@@ -86,7 +136,7 @@ pub async fn reconcile_once<B: Backend>(
     // Upload blobs the backend lacks (encrypt the plaintext bytes). Order is
     // irrelevant — blobs are independent, self-identifying by content hash.
     for (id, content_hash) in &local_blob_ids {
-        if !remote_blob_ids.contains(id) {
+        if have_blob_ids.contains(id) {
             // The blob may have been removed between the initial listing and this
             // re-lock; if so, skip it — sealing an empty payload under the real
             // blob_id would corrupt it for every peer.
@@ -103,10 +153,7 @@ pub async fn reconcile_once<B: Backend>(
     }
 
     // Fetch blobs we lack, decrypt, store.
-    for id in &remote_blob_ids {
-        if local_blob_ids.contains_key(id) {
-            continue;
-        }
+    for id in &need_blob_ids {
         if let Some(ct) = backend.get_blob(&bucket, id).await? {
             let plaintext = key.open(&ct)?;
             let guard = store.lock().await;
@@ -115,9 +162,7 @@ pub async fn reconcile_once<B: Backend>(
     }
 
     // Fetch entries we lack, per peer, in strict index order, then import.
-    let has_missing = remote_entry_ids
-        .iter()
-        .any(|id| !local_entry_ids.contains(id));
+    let has_missing = !need_entry_ids.is_empty();
     if debug {
         eprintln!("[be-sync]   has_missing_entries={has_missing}");
     }
