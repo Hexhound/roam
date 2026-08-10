@@ -1,4 +1,4 @@
-use crate::transport::{Backend, Manifest, PutOutcome};
+use crate::transport::{Backend, Manifest, PutOutcome, SetKind};
 use async_trait::async_trait;
 
 /// Talks to a `roam-backend` server over HTTP. Paths mirror the spec §5 table.
@@ -59,5 +59,21 @@ impl Backend for HttpBackend {
     }
     async fn put_blob(&self, bucket: &str, id: &str, ct: Vec<u8>) -> anyhow::Result<PutOutcome> {
         put_bytes(&self.client, &self.blob_url(bucket, id), ct).await
+    }
+    async fn reconcile(
+        &self,
+        bucket: &str,
+        kind: SetKind,
+        msg: Vec<u8>,
+    ) -> anyhow::Result<Vec<u8>> {
+        let url = format!("{}/b/{bucket}/reconcile/{}", self.base, kind.as_str());
+        let resp = self
+            .client
+            .post(&url)
+            .body(msg)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(resp.bytes().await?.to_vec())
     }
 }

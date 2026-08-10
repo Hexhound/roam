@@ -2,6 +2,8 @@ use async_trait::async_trait;
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
+pub use roam_rbsr::SetKind;
+
 /// What the backend holds for one bucket.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Manifest {
@@ -24,6 +26,11 @@ pub trait Backend: Send + Sync {
     async fn put_entry(&self, bucket: &str, id: &str, ct: Vec<u8>) -> anyhow::Result<PutOutcome>;
     async fn get_blob(&self, bucket: &str, id: &str) -> anyhow::Result<Option<Vec<u8>>>;
     async fn put_blob(&self, bucket: &str, id: &str, ct: Vec<u8>) -> anyhow::Result<PutOutcome>;
+
+    /// One RBSR round: hand the backend a negentropy message for `kind`'s id set,
+    /// get its reply. Bytes are opaque negentropy protocol frames.
+    async fn reconcile(&self, bucket: &str, kind: SetKind, msg: Vec<u8>)
+        -> anyhow::Result<Vec<u8>>;
 }
 
 /// In-memory backend for unit tests. Mirrors the real server's dedup semantics.
@@ -31,6 +38,32 @@ pub trait Backend: Send + Sync {
 pub struct MemoryBackend {
     entries: Mutex<BTreeMap<String, BTreeMap<String, Vec<u8>>>>,
     blobs: Mutex<BTreeMap<String, BTreeMap<String, Vec<u8>>>>,
+}
+
+impl MemoryBackend {
+    fn id_set(&self, bucket: &str, kind: SetKind) -> Vec<[u8; 32]> {
+        let map = match kind {
+            SetKind::Entries => &self.entries,
+            SetKind::Blobs => &self.blobs,
+        };
+        let guard = map.lock().unwrap();
+        let Some(b) = guard.get(bucket) else {
+            return Vec::new();
+        };
+        b.keys().filter_map(|k| hex_to_id(k)).collect()
+    }
+}
+
+/// Decode a 64-char lowercase-hex id back to 32 bytes; `None` if malformed.
+fn hex_to_id(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for i in 0..32 {
+        out[i] = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
 }
 
 fn put(
@@ -94,6 +127,11 @@ impl Backend for MemoryBackend {
     async fn put_blob(&self, bucket: &str, id: &str, ct: Vec<u8>) -> anyhow::Result<PutOutcome> {
         Ok(put(&self.blobs, bucket, id, ct))
     }
+    async fn reconcile(&self, bucket: &str, kind: SetKind, msg: Vec<u8>)
+        -> anyhow::Result<Vec<u8>> {
+        let set = roam_rbsr::ItemSet::from_ids(self.id_set(bucket, kind));
+        roam_rbsr::reconcile_server(&set, &msg).map_err(|e| anyhow::anyhow!(e))
+    }
 }
 
 #[cfg(test)]
@@ -133,5 +171,51 @@ mod tests {
             Some(b"ct".to_vec())
         );
         assert_eq!(b.get_entry("bkt", "missing").await.unwrap(), None);
+    }
+}
+
+#[cfg(test)]
+mod reconcile_tests {
+    use super::*;
+    use roam_rbsr::{initiate, reconcile, ItemSet, SetKind};
+
+    fn id(n: u8) -> [u8; 32] {
+        let mut b = [0u8; 32];
+        b[0] = n;
+        b
+    }
+    fn hex(id: &[u8; 32]) -> String {
+        id.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[tokio::test]
+    async fn client_reconciles_against_memory_backend() {
+        let backend = MemoryBackend::default();
+        for n in [1u8, 2, 3] {
+            backend
+                .put_entry("bucket", &hex(&id(n)), vec![n])
+                .await
+                .unwrap();
+        }
+
+        let client_set = ItemSet::from_ids([id(1)]);
+        let mut msg = initiate(&client_set);
+        let (mut have, mut need) = (Vec::new(), Vec::new());
+        for _ in 0..64 {
+            let reply = backend
+                .reconcile("bucket", SetKind::Entries, msg)
+                .await
+                .unwrap();
+            let out = reconcile(&client_set, &reply).unwrap();
+            have.extend(out.have);
+            need.extend(out.need);
+            match out.next_msg {
+                Some(next) => msg = next,
+                None => break,
+            }
+        }
+        need.sort();
+        assert!(have.is_empty());
+        assert_eq!(need, vec![id(2), id(3)]);
     }
 }

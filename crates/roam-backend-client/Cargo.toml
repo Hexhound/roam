@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 roam-storage = { path = "../roam-storage" }
+roam-rbsr = { path = "../roam-rbsr" }
 chacha20poly1305 = { workspace = true }
 blake3 = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }
