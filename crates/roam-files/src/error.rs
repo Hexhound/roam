@@ -68,4 +68,11 @@ pub enum FilesError {
     /// [`FILESET_MAP_ID`]: crate::FILESET_MAP_ID
     #[error("reserved container id cannot be used as a vault file: {0}")]
     ReservedName(String),
+
+    /// This device has no write role, so it may not author or propagate content
+    /// ops. Every write path (edit, restore, resurrect) checks
+    /// [`Store::may_write`](roam_storage::Store::may_write) and refuses with this
+    /// error when it returns `false`.
+    #[error("device is read-only (no write role)")]
+    ReadOnly,
 }

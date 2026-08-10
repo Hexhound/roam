@@ -261,6 +261,13 @@ impl Store {
         Ok(())
     }
 
+    /// Whether THIS device may author/propagate content ops. Always true today;
+    /// the future roles slice overrides this for Reader-role devices, and all write
+    /// paths (edit, restore, resurrect) route through it.
+    pub fn may_write(&self) -> bool {
+        true
+    }
+
     /// Write a fast-load snapshot of the current state, then record a history
     /// marker pinning this moment: the op-log frontier (base64) and every
     /// peer's op-log line count. Later checkpoint compaction keys off these.
@@ -889,6 +896,13 @@ mod tests {
         assert_eq!(store.blobs().get(&hash).unwrap(), Some(vec![0x00, 0xff, 0x7f]));
         // Bytes landed under the assets dir beside the CRDT state.
         assert!(dir.path().join("assets").join(&hash).exists());
+    }
+
+    #[test]
+    fn may_write_is_true_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), Identity::generate()).unwrap();
+        assert!(store.may_write());
     }
 
     #[test]

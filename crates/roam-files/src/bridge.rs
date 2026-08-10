@@ -973,6 +973,35 @@ impl FolderBridge {
         self.project_file(store, file)
     }
 
+    /// Selectively restore specific files (granularity C, selective). Each path is
+    /// resurrected from retained history (or re-projected if already live). Refuses
+    /// if this device may not write. One outcome per restored file.
+    pub fn restore_paths(
+        &self,
+        store: &mut Store,
+        files: &[PathBuf],
+    ) -> Result<Vec<(PathBuf, SyncOutcome)>, FilesError> {
+        if !store.may_write() {
+            return Err(FilesError::ReadOnly);
+        }
+        let mut out = Vec::new();
+        for file in files {
+            let outcome = self.resurrect(store, file)?;
+            out.push((file.clone(), outcome));
+        }
+        Ok(out)
+    }
+
+    /// Whole-vault restore (granularity C, coarse): resurrect every currently
+    /// tombstoned file.
+    pub fn restore_all(&self, store: &mut Store) -> Result<Vec<(PathBuf, SyncOutcome)>, FilesError> {
+        if !store.may_write() {
+            return Err(FilesError::ReadOnly);
+        }
+        let deleted = self.list_deleted(store);
+        self.restore_paths(store, &deleted)
+    }
+
     /// Rename a file within the vault: move its content to the new path's
     /// container, mark the new path Live and the old path Tombstoned in the
     /// file-set map, and move the file + sidecar on disk.
@@ -3373,6 +3402,47 @@ mod tests {
             bridge.resurrect(&mut store, &file),
             Err(FilesError::NotFound(_))
         ));
+    }
+
+    #[test]
+    fn restore_paths_recovers_a_deleted_text_file() {
+        let dir = tempdir().unwrap();
+        let (bridge, mut store) = bridge(dir.path());
+        let vault = dir.path().join("vault");
+        let file = vault.join("keep.txt");
+        std::fs::write(&file, "precious").unwrap();
+        bridge.import_file(&mut store, &file).unwrap();
+        store.write_snapshot().unwrap();
+
+        std::fs::remove_file(&file).unwrap();
+        bridge.delete_file(&mut store, &file).unwrap();
+        assert!(!file.exists());
+
+        let outcomes = bridge.restore_paths(&mut store, &[file.clone()]).unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "precious");
+    }
+
+    #[test]
+    fn restore_all_recovers_every_deleted_file() {
+        let dir = tempdir().unwrap();
+        let (bridge, mut store) = bridge(dir.path());
+        let vault = dir.path().join("vault");
+        let a = vault.join("a.txt");
+        let b = vault.join("b.txt");
+        std::fs::write(&a, "aaa").unwrap();
+        std::fs::write(&b, "bbb").unwrap();
+        bridge.import_file(&mut store, &a).unwrap();
+        bridge.import_file(&mut store, &b).unwrap();
+        std::fs::remove_file(&a).unwrap();
+        std::fs::remove_file(&b).unwrap();
+        bridge.delete_file(&mut store, &a).unwrap();
+        bridge.delete_file(&mut store, &b).unwrap();
+
+        let outcomes = bridge.restore_all(&mut store).unwrap();
+        assert_eq!(outcomes.len(), 2);
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "aaa");
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "bbb");
     }
 
     #[test]
