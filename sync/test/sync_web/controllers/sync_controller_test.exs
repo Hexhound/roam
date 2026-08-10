@@ -65,4 +65,13 @@ defmodule SyncWeb.SyncControllerTest do
     conn = put_req_header(conn, "content-type", "application/octet-stream")
     assert post(conn, "/b/#{@bucket}/reconcile/bogus", <<>>).status == 400
   end
+
+  test "an oversized body fails closed (413), never 500", %{conn: conn} do
+    # >8MB exceeds read_body's default limit -> {:more, ...}; the controller must
+    # fail closed with 413, not raise WithClauseError -> 500.
+    big = :binary.copy(<<0>>, 8_000_001)
+    conn = put_req_header(conn, "content-type", "application/octet-stream")
+    resp = post(conn, "/b/#{@bucket}/reconcile/entries", big)
+    assert resp.status == 413
+  end
 end

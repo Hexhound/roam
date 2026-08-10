@@ -30,6 +30,8 @@ defmodule SyncWeb.SyncController do
     else
       {:halt, conn} -> conn
       :error -> send_resp(conn, 400, "unknown kind")
+      # Body exceeded read_body's length limit — fail closed, don't crash (500).
+      {:more, _partial, conn} -> send_resp(conn, 413, "payload too large")
     end
   end
 
@@ -71,6 +73,8 @@ defmodule SyncWeb.SyncController do
       end
     else
       {:halt, conn} -> conn
+      # Body exceeded the 64MB cap — fail closed (413), don't crash (500).
+      {:more, _partial, conn} -> send_resp(conn, 413, "payload too large")
     end
   end
 end

@@ -51,8 +51,8 @@ fn str_to_id(s: &str) -> Option<[u8; 32]> {
 
 /// One full reconcile pass against the backend: push what the backend lacks,
 /// pull what the local store lacks, apply pulled ops through the existing
-/// idempotent import path. Stateless — the manifest diff each round is
-/// authoritative; a stale manifest just defers work to the next round.
+/// idempotent import path. Stateless — RBSR discovery each round is
+/// authoritative; anything missed just defers work to the next round.
 ///
 /// INVARIANT: every mutation of `store` goes through the SAME `Arc<Mutex<Store>>`
 /// the iroh Engine holds, so the two apply paths never race.

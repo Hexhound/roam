@@ -5,9 +5,13 @@ defmodule Sync.Backend.Store do
   """
 
   @id_re ~r/^[A-Za-z0-9_-]+$/
+  # Ids are 43-char base64url; buckets are similar. Cap length so an absurdly long
+  # (but charset-valid) id can't reach File.* and raise ENAMETOOLONG → 500.
+  @max_id_len 128
 
   @spec valid_id?(String.t()) :: boolean()
-  def valid_id?(id), do: is_binary(id) and Regex.match?(@id_re, id)
+  def valid_id?(id),
+    do: is_binary(id) and byte_size(id) <= @max_id_len and Regex.match?(@id_re, id)
 
   @doc "Absolute data root; from :sync config or ROAM_BACKEND_DATA env."
   def data_root do
