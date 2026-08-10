@@ -28,6 +28,20 @@ defmodule SyncWeb.Router do
     plug :set_actor, :user
   end
 
+  pipeline :raw do
+    plug :accepts, ["*/*"]
+  end
+
+  scope "/b/:bucket", SyncWeb do
+    pipe_through :raw
+
+    get "/manifest", SyncController, :manifest
+    get "/entries/:id", SyncController, :get_entry
+    put "/entries/:id", SyncController, :put_entry
+    get "/blobs/:id", SyncController, :get_blob
+    put "/blobs/:id", SyncController, :put_blob
+  end
+
   scope "/", SyncWeb do
     pipe_through :browser
 
