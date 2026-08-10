@@ -56,6 +56,18 @@ impl VaultKey {
         self.keyed(&input)
     }
 
+    /// The STABLE id-derivation key (never rotates). All backend ids derive from
+    /// this; a rotated-out member keeps it (can enumerate ids) but not content.
+    pub fn id_key(&self) -> [u8; 32] {
+        self.id_subkey()
+    }
+
+    /// The epoch-0 AEAD key (== today's scheme). Epoch 0 ciphertext is written
+    /// UNTAGGED via [`VaultKey::seal`]; this exposes the key for the Keychain.
+    pub fn epoch0_key(&self) -> [u8; 32] {
+        self.aead_subkey()
+    }
+
     /// AEAD seal: returns `nonce(24) || ciphertext`.
     pub fn seal(&self, plaintext: &[u8]) -> Vec<u8> {
         let aead_key = self.aead_subkey();
@@ -78,6 +90,33 @@ impl VaultKey {
         let nonce = XNonce::from_slice(nonce_bytes);
         cipher.decrypt(nonce, ct).map_err(|_| CryptoError::Open)
     }
+}
+
+/// Seal `plaintext` under an explicit epoch key, tagging the output with
+/// `epoch_id`: returns `epoch_id(32) || nonce(24) || ct`. Callers writing under
+/// epoch 0 use [`VaultKey::seal`] instead (untagged, legacy-compatible).
+pub fn seal_epoch(epoch_key: &[u8; 32], epoch_id: &[u8; 32], plaintext: &[u8]) -> Vec<u8> {
+    let cipher = XChaCha20Poly1305::new(epoch_key.into());
+    let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+    let mut out = Vec::with_capacity(32 + 24 + plaintext.len() + 16);
+    out.extend_from_slice(epoch_id);
+    out.extend_from_slice(&nonce);
+    let ct = cipher.encrypt(&nonce, plaintext).expect("aead encrypt");
+    out.extend_from_slice(&ct);
+    out
+}
+
+/// Open a `nonce(24) || ct` body (the epoch tag, if any, already stripped by the
+/// caller via the keychain's `ReadPlan.body_offset`) under `epoch_key`.
+pub fn open_epoch(epoch_key: &[u8; 32], body: &[u8]) -> Result<Vec<u8>, CryptoError> {
+    if body.len() < 24 {
+        return Err(CryptoError::Short);
+    }
+    let (nonce_bytes, ct) = body.split_at(24);
+    let cipher = XChaCha20Poly1305::new(epoch_key.into());
+    cipher
+        .decrypt(XNonce::from_slice(nonce_bytes), ct)
+        .map_err(|_| CryptoError::Open)
 }
 
 #[cfg(test)]
@@ -134,5 +173,37 @@ mod tests {
     fn seal_uses_fresh_nonce_each_call() {
         let k = key();
         assert_ne!(k.seal(b"x"), k.seal(b"x"));
+    }
+
+    #[test]
+    fn epoch0_key_equals_legacy_aead_subkey_roundtrip() {
+        let k = key();
+        // A payload sealed with legacy `seal` must open under `epoch0_key` via
+        // the tagged `open_epoch` (same key) — guarantees epoch 0 == today's scheme.
+        let ct = k.seal(b"legacy bytes");
+        let opened = open_epoch(&k.epoch0_key(), &ct).unwrap();
+        assert_eq!(opened, b"legacy bytes");
+    }
+
+    #[test]
+    fn seal_epoch_prepends_the_epoch_id_and_open_epoch_strips_it() {
+        let epoch_key = [0x33u8; 32];
+        let epoch_id = [0xEEu8; 32];
+        let sealed = seal_epoch(&epoch_key, &epoch_id, b"secret v2");
+        assert_eq!(&sealed[..32], &epoch_id, "epoch id must prefix the payload");
+        let opened = open_epoch(&epoch_key, &sealed[32..]).unwrap();
+        assert_eq!(opened, b"secret v2");
+    }
+
+    #[test]
+    fn open_epoch_rejects_a_wrong_key() {
+        let sealed = seal_epoch(&[1u8; 32], &[9u8; 32], b"x");
+        assert!(open_epoch(&[2u8; 32], &sealed[32..]).is_err());
+    }
+
+    #[test]
+    fn id_key_is_stable_and_public() {
+        let k = key();
+        assert_eq!(k.id_key(), k.id_key());
     }
 }
