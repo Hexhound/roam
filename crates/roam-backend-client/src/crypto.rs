@@ -16,14 +16,17 @@ pub enum CryptoError {
 }
 
 impl VaultKey {
-    /// Independent subkey for opaque id derivation (keyed BLAKE3).
+    /// Independent subkey for opaque id derivation (keyed BLAKE3). Derived via
+    /// the shared [`roam_storage::vault_subkeys`] so the backend id namespace and
+    /// pairing's epoch-0 derivation can never drift apart.
     fn id_subkey(&self) -> [u8; 32] {
-        blake3::derive_key("roam-backend-client id-derivation v1", &self.0)
+        roam_storage::vault_subkeys(&self.0).0
     }
 
-    /// Independent subkey for AEAD seal/open (XChaCha20-Poly1305).
+    /// Independent subkey for AEAD seal/open (XChaCha20-Poly1305). See
+    /// [`Self::id_subkey`] — same shared-derivation rationale.
     fn aead_subkey(&self) -> [u8; 32] {
-        blake3::derive_key("roam-backend-client aead v1", &self.0)
+        roam_storage::vault_subkeys(&self.0).1
     }
 
     fn keyed(&self, label_and_input: &[u8]) -> String {

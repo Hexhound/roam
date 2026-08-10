@@ -65,22 +65,11 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use ed25519_dalek::Signature;
 use iroh::endpoint::{RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr};
-use roam_storage::{Identity, Store, VaultId, VerifyingKey};
+use roam_storage::{vault_subkeys, Identity, Store, VaultId, VerifyingKey};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::endpoint::{build_endpoint, PAIRING_ALPN};
-
-/// Derive the two vault subkeys from the raw 32-byte vault key. These labels
-/// MUST stay byte-identical to `roam_backend_client::crypto::VaultKey`'s
-/// `id_subkey`/`aead_subkey` derivations — the backend and the keychain must
-/// agree on epoch-0 and the id namespace. (Pairing needs them to publish the
-/// joiner's epoch wraps via `Store::backfill_wraps`.)
-fn vault_subkeys(vault_key: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
-    let id_key = blake3::derive_key("roam-backend-client id-derivation v1", vault_key);
-    let epoch0 = blake3::derive_key("roam-backend-client aead v1", vault_key);
-    (id_key, epoch0)
-}
 
 /// How long the host waits for the one inbound pairing connection before giving
 /// up. Pairing is an interactive, user-driven action, so this is generous.
