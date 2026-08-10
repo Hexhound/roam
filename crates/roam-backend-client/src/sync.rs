@@ -3,7 +3,7 @@ use crate::entries::{local_blobs, local_entries, reassemble_log, split_log_lines
 use crate::transport::Backend;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64URL, Engine};
 use roam_rbsr::{initiate, reconcile, ItemSet, SetKind};
-use roam_storage::{PeerStatus, Store, VerifyingKey};
+use roam_storage::{Keychain, PeerStatus, Store, VerifyingKey, EPOCH0_ID};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -11,6 +11,27 @@ use tokio::sync::Mutex;
 /// Client-side round cap: bounds a pathological/hostile server that never
 /// converges. The 2s reconcile loop is self-healing, so aborting a pass is safe.
 const RBSR_ROUND_CAP: usize = 32;
+
+/// Open a stored ciphertext via the keychain's read rule. Returns:
+/// - `Ok(Some(plaintext))` — opened,
+/// - `Ok(None)` — `Undecryptable` (epoch key missing, or an unknown-epoch blob
+///   whose epoch-0 fallback failed the AEAD tag check). NEVER aborts the pass.
+fn open_classified(kc: &Keychain, payload: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
+    let plan = kc.classify(payload);
+    let Some(key) = plan.key else { return Ok(None) };
+    match crate::crypto::open_epoch(&key, &payload[plan.body_offset..]) {
+        Ok(pt) => Ok(Some(pt)),
+        // A wrong/unknown-epoch blob mis-read as epoch 0 fails the tag check ->
+        // pending Undecryptable, self-heals when the key-log delivers the epoch.
+        Err(_) => Ok(None),
+    }
+}
+
+/// What a sync pass could not yet decrypt (surface for `WaitingKey`).
+#[derive(Debug, Default, Clone)]
+pub struct DecryptReport {
+    pub undecryptable: usize,
+}
 
 /// Drive an RBSR session for one `kind` to convergence against the backend.
 /// Returns `(have, need)` as id strings: `have` = ids the backend lacks
@@ -65,6 +86,15 @@ pub async fn reconcile_once<B: Backend>(
     // roam-sync-core, so this crate does its own env check.
     let debug = std::env::var_os("ROAM_DEBUG").is_some();
     let bucket = key.bucket_id();
+
+    // Rebuild the keychain each pass — a P2P key-log gossip may have delivered a
+    // new epoch since the last tick. Writes seal under the head epoch; reads
+    // classify against the epochs known right now.
+    let kc = {
+        let guard = store.lock().await;
+        guard.keychain(&key.id_key(), &key.epoch0_key())?
+    };
+    let mut report = DecryptReport::default();
 
     // `local_entries_vec` is ordered by (peer, ascending index); keep it ordered
     // for the upload loop so any mid-loop `put_entry` failure leaves a clean
@@ -125,7 +155,12 @@ pub async fn reconcile_once<B: Backend>(
     let mut uploaded_entries = 0usize;
     for (id, line) in &local_entries_vec {
         if have_entry_ids.contains(id) {
-            let ct = key.seal(line);
+            let ct = match kc.head_write_key() {
+                Some((epoch_id, epoch_key)) if epoch_id != EPOCH0_ID => {
+                    crate::crypto::seal_epoch(&epoch_key, &epoch_id, line)
+                }
+                _ => key.seal(line),
+            };
             backend.put_entry(&bucket, id, ct).await?;
             uploaded_entries += 1;
         }
@@ -147,7 +182,12 @@ pub async fn reconcile_once<B: Backend>(
             let Some(bytes) = bytes else {
                 continue;
             };
-            let ct = key.seal(&bytes);
+            let ct = match kc.head_write_key() {
+                Some((epoch_id, epoch_key)) if epoch_id != EPOCH0_ID => {
+                    crate::crypto::seal_epoch(&epoch_key, &epoch_id, &bytes)
+                }
+                _ => key.seal(&bytes),
+            };
             backend.put_blob(&bucket, id, ct).await?;
         }
     }
@@ -155,9 +195,16 @@ pub async fn reconcile_once<B: Backend>(
     // Fetch blobs we lack, decrypt, store.
     for id in &need_blob_ids {
         if let Some(ct) = backend.get_blob(&bucket, id).await? {
-            let plaintext = key.open(&ct)?;
-            let guard = store.lock().await;
-            guard.blobs().put(&plaintext)?;
+            match open_classified(&kc, &ct)? {
+                Some(plaintext) => {
+                    let guard = store.lock().await;
+                    guard.blobs().put(&plaintext)?;
+                }
+                None => {
+                    report.undecryptable += 1;
+                    continue; // pending; self-heals when the key-log delivers the epoch
+                }
+            }
         }
     }
 
@@ -167,7 +214,15 @@ pub async fn reconcile_once<B: Backend>(
         eprintln!("[be-sync]   has_missing_entries={has_missing}");
     }
     if has_missing {
-        import_missing_entries(store, backend, key, &bucket, self_peer, debug).await?;
+        import_missing_entries(store, backend, key, &bucket, self_peer, debug, &kc, &mut report)
+            .await?;
+    }
+
+    if report.undecryptable > 0 {
+        eprintln!(
+            "[be-sync] {} item(s) undecryptable this pass (WaitingKey — a peer holds the epoch key)",
+            report.undecryptable
+        );
     }
 
     Ok(())
@@ -182,6 +237,8 @@ async fn import_missing_entries<B: Backend>(
     bucket: &str,
     self_peer: u64,
     debug: bool,
+    kc: &Keychain,
+    report: &mut DecryptReport,
 ) -> anyhow::Result<()> {
     let peers: Vec<(u64, VerifyingKey)> = {
         let guard = store.lock().await;
@@ -207,10 +264,18 @@ async fn import_missing_entries<B: Backend>(
         loop {
             let id = key.entry_id(peer_id, index);
             match backend.get_entry(bucket, &id).await? {
-                Some(ct) => {
-                    fetched.push(key.open(&ct)?);
-                    index += 1;
-                }
+                Some(ct) => match open_classified(kc, &ct)? {
+                    Some(pt) => {
+                        fetched.push(pt);
+                        index += 1;
+                    }
+                    None => {
+                        // Missing this epoch's key blocks this peer's suffix
+                        // (contiguous log). Stop the walk; self-heals next pass.
+                        report.undecryptable += 1;
+                        break;
+                    }
+                },
                 None => break,
             }
         }
@@ -367,5 +432,25 @@ mod tests {
             b.lock().await.blobs().get(&hash).unwrap(),
             Some(b"blobdata".to_vec())
         );
+    }
+
+    #[test]
+    fn undecryptable_report_counts_items_whose_epoch_key_is_missing() {
+        use roam_storage::{Keychain, EPOCH0_ID};
+        let vault = VaultKey([9u8; 32]);
+        let kc = Keychain::build(vault.id_key(), vault.epoch0_key(), 1, &[0u8; 32], &[]);
+
+        // Genuine epoch-0 (legacy) ciphertext opens.
+        let legacy = vault.seal(b"ok");
+        let plan = kc.classify(&legacy);
+        assert_eq!(plan.epoch, EPOCH0_ID);
+        assert!(open_classified(&kc, &legacy).unwrap().is_some());
+
+        // A payload prefixed with an unknown 32-byte "epoch" + random body: classify
+        // says epoch 0 (prefix unknown), AEAD open fails -> None (Undecryptable),
+        // not an error that aborts the pass.
+        let mut bogus = [0xC7u8; 32].to_vec();
+        bogus.extend_from_slice(&[0u8; 40]);
+        assert!(open_classified(&kc, &bogus).unwrap().is_none());
     }
 }
