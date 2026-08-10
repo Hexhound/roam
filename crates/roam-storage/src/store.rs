@@ -1,5 +1,7 @@
 use crate::blob::BlobStore;
 use crate::error::StorageError;
+use crate::history::{HistoryIndex, Marker};
+use crate::history_util::count_log_lines;
 use crate::identity::{Identity, VerifyingKey};
 use crate::keychain::{compute_epoch_id, Keychain, VaultIssue};
 use crate::keylog::{KeyBody, KeyLog, KeyLogEntry, Recipient};
@@ -7,9 +9,16 @@ use crate::keywrap;
 use crate::oplog::OpLog;
 use crate::roster::{merge_roster, PeerRecord, PeerStatus, RosterEntry, RosterLog, RosterOp};
 use crate::snapshot;
+use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use roam_crdt::{Document, Version};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+
+/// Base64-encode bytes for storage in a history marker (same STANDARD engine
+/// the op-log uses for its signed lines).
+fn b64(bytes: &[u8]) -> String {
+    B64.encode(bytes)
+}
 
 /// The `peer_id` a verifying key MUST map to: the first 8 little-endian bytes of
 /// the key (see `Identity::generate`). The roster binds every peer to this so op
@@ -61,6 +70,10 @@ pub struct Store {
     /// bridge (and later blob-transfer/projection slices) reach the blobs
     /// through the one shared store handle.
     blobs: BlobStore,
+    /// Append-only local history index (`<root>/history/history.jsonl`). A
+    /// marker is recorded on every `write_snapshot`, capturing the op-log
+    /// frontier + per-peer log lengths for later checkpoint compaction.
+    history: HistoryIndex,
 }
 
 impl Store {
@@ -114,6 +127,7 @@ impl Store {
         // it here (creating the dir if absent) means every caller sharing this
         // Store reaches the same blob store via `blobs()`.
         let blobs = BlobStore::open(&root.join("assets"))?;
+        let history = HistoryIndex::new(&root.join("history"));
         let store = Self {
             root: root.to_path_buf(),
             identity,
@@ -123,6 +137,7 @@ impl Store {
             own_roster,
             peers,
             blobs,
+            history,
         };
         store.write_peers_cache()?;
         Ok(store)
@@ -246,10 +261,33 @@ impl Store {
         Ok(())
     }
 
-    /// Write a fast-load snapshot of the current state.
+    /// Write a fast-load snapshot of the current state, then record a history
+    /// marker pinning this moment: the op-log frontier (base64) and every
+    /// peer's op-log line count. Later checkpoint compaction keys off these.
     pub fn write_snapshot(&self) -> Result<(), StorageError> {
         let path = self.root.join("snapshots").join("snapshot.loro");
-        snapshot::save(&path, &self.doc.snapshot()?)
+        snapshot::save(&path, &self.doc.snapshot()?)?;
+
+        let frontier = self.doc.oplog_frontier();
+        let mut log_lens = std::collections::BTreeMap::new();
+        log_lens.insert(self.peer_id(), count_log_lines(&self.own_log.path()));
+        for peer in &self.peers {
+            let path = self
+                .root
+                .join("ops")
+                .join(format!("ops-{}.jsonl", peer.peer_id));
+            log_lens.insert(peer.peer_id, count_log_lines(&path));
+        }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        self.history.append(&Marker {
+            ts_ms: now_ms,
+            frontier: b64(&frontier.to_bytes()),
+            log_lens,
+        })?;
+        Ok(())
     }
 
     /// The raw bytes of this device's own oplog file (for copying to a peer).
@@ -703,6 +741,25 @@ mod tests {
         assert_eq!(store.blobs().get(&hash).unwrap(), Some(vec![0x00, 0xff, 0x7f]));
         // Bytes landed under the assets dir beside the CRDT state.
         assert!(dir.path().join("assets").join(&hash).exists());
+    }
+
+    #[test]
+    fn write_snapshot_records_a_history_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path(), Identity::generate()).unwrap();
+        store.edit_text("note", 0, "alpha").unwrap();
+        store.write_snapshot().unwrap();
+
+        let idx = crate::history::HistoryIndex::new(&dir.path().join("history"));
+        let markers = idx.markers().unwrap();
+        assert_eq!(markers.len(), 1, "one marker recorded on write_snapshot");
+        let m = &markers[0];
+        assert!(!m.frontier.is_empty(), "frontier bytes captured");
+        assert_eq!(
+            m.log_lens.get(&store.peer_id()).copied(),
+            Some(1),
+            "own op-log had one line at snapshot time"
+        );
     }
 
     #[test]

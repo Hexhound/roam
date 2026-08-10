@@ -3,6 +3,7 @@
 mod blob;
 mod error;
 mod history;
+mod history_util;
 mod identity;
 mod ids;
 mod keychain;
