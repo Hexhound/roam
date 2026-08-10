@@ -64,6 +64,19 @@ impl Identity {
         self.signing_key.to_bytes()
     }
 
+    /// This device's X25519 static secret, derived from its ed25519 signing key
+    /// (the clamped ed25519 scalar). Pairs with [`Identity::x25519_public`] and
+    /// with any peer's [`VerifyingKey::to_x25519`] for sealed-box key wrapping.
+    /// Never log or serialize the returned bytes.
+    pub fn x25519_secret(&self) -> [u8; 32] {
+        self.signing_key.to_scalar_bytes()
+    }
+
+    /// This device's X25519 public key, derived from its ed25519 verifying key.
+    pub fn x25519_public(&self) -> [u8; 32] {
+        self.signing_key.verifying_key().to_montgomery().to_bytes()
+    }
+
     /// Persist to `path` (caller chooses a location outside the vault).
     ///
     /// The file holds a raw ed25519 secret key, so this writes it as owner-only
@@ -117,6 +130,13 @@ impl VerifyingKey {
         DalekVerifyingKey::from_bytes(bytes)
             .map(VerifyingKey)
             .map_err(|_| StorageError::MalformedIdentity)
+    }
+
+    /// The X25519 public key for this ed25519 verifying key (Montgomery form).
+    /// Lets a sender wrap an epoch key to a roster member using only the key the
+    /// roster already carries — no separate DH key, no roster migration.
+    pub fn to_x25519(&self) -> [u8; 32] {
+        self.0.to_montgomery().to_bytes()
     }
 
     pub fn verify(&self, msg: &[u8], sig: &Signature) -> bool {
@@ -209,6 +229,32 @@ mod tests {
             Identity::load(&wrong_len),
             Err(StorageError::MalformedIdentity)
         ));
+    }
+
+    #[test]
+    fn ed25519_converts_to_a_matching_x25519_keypair() {
+        use x25519_dalek::{PublicKey, StaticSecret};
+
+        let a = Identity::generate();
+        let b = Identity::generate();
+
+        let a_sec = StaticSecret::from(a.x25519_secret());
+        let b_sec = StaticSecret::from(b.x25519_secret());
+        let a_pub = PublicKey::from(a.x25519_public());
+        let b_pub = PublicKey::from(b.x25519_public());
+
+        assert_eq!(PublicKey::from(&a_sec).to_bytes(), a_pub.to_bytes());
+
+        assert_eq!(
+            a_sec.diffie_hellman(&b_pub).to_bytes(),
+            b_sec.diffie_hellman(&a_pub).to_bytes()
+        );
+    }
+
+    #[test]
+    fn verifying_key_x25519_matches_identity_x25519_public() {
+        let a = Identity::generate();
+        assert_eq!(a.verifying_key().to_x25519(), a.x25519_public());
     }
 
     #[cfg(unix)]
