@@ -69,6 +69,14 @@ pub enum FilesError {
     #[error("reserved container id cannot be used as a vault file: {0}")]
     ReservedName(String),
 
+    /// A blob file was rolled back to a prior version, but that version's bytes
+    /// are not recoverable: either the blob opted OUT of edit history
+    /// (single-version mode released the superseded bytes on the next edit), or
+    /// the requested point is below the retained history base. Returned instead
+    /// of ever projecting wrong/empty bytes. Holds the affected path.
+    #[error("no blob history for {0}")]
+    NoBlobHistory(PathBuf),
+
     /// This device has no write role, so it may not author or propagate content
     /// ops. Every write path (edit, restore, resurrect) checks
     /// [`Store::may_write`](roam_storage::Store::may_write) and refuses with this

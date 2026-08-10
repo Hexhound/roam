@@ -834,6 +834,37 @@ impl Store {
         rewrite_history(&self.root.join("history"), &all, target.ts_ms)?;
         Ok(freed)
     }
+
+    /// The serialized entry value for `key` in `map_id` as of the newest retained
+    /// marker at/before `before_ts`, or `None` if no such marker exists or that
+    /// point can't be checked out (already compacted below the shallow base).
+    /// Checks out the historical frontier, reads, and returns to latest.
+    pub fn historical_entry(
+        &self,
+        map_id: &str,
+        key: &str,
+        before_ts: i64,
+    ) -> Result<Option<String>, StorageError> {
+        use roam_crdt::Frontier;
+        let idx = HistoryIndex::new(&self.root.join("history"));
+        let marker = match idx.marker_before(before_ts)? {
+            Some(m) => m,
+            None => return Ok(None),
+        };
+        let fbytes = B64
+            .decode(marker.frontier.as_bytes())
+            .map_err(|e| StorageError::Base64(e.to_string()))?;
+        let frontier = Frontier::from_bytes(&fbytes)?;
+        if self.doc.checkout(&frontier).is_err() {
+            // Re-attach to latest even on the error branch so a failed checkout
+            // never leaves the doc pinned at a partial/old frontier.
+            self.doc.checkout_latest();
+            return Ok(None);
+        }
+        let value = self.doc.get_entry(map_id, key);
+        self.doc.checkout_latest();
+        Ok(value)
+    }
 }
 
 /// Mirrors `roam_files::fileset::FILESET_MAP_ID`. Kept as a literal to avoid a
@@ -1652,5 +1683,17 @@ mod tests {
         assert_eq!(store.text("note"), before, "dry run does not mutate state");
         let markers_after = crate::history::HistoryIndex::new(&dir.path().join("history")).markers().unwrap().len();
         assert_eq!(markers_before, markers_after, "dry run does not rewrite history");
+    }
+
+    #[test]
+    fn historical_entry_none_when_no_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), Identity::generate()).unwrap();
+        assert_eq!(
+            store
+                .historical_entry("__roam_fileset__", "x", i64::MAX)
+                .unwrap(),
+            None
+        );
     }
 }

@@ -218,6 +218,13 @@ pub struct FolderBridge {
     /// and blob presence markers under `<meta_dir>/blobmarkers/`, each keyed by
     /// the file's `container_id` so nested notes never collide.
     meta_dir: PathBuf,
+    /// CLIENT-LOCAL big-blob single-version threshold (bytes). When set, a Blob
+    /// whose byte length EXCEEDS this value opts OUT of edit history: on edit,
+    /// its superseded (prior) bytes are released immediately, so rolling that
+    /// file back to a PRIOR version has no bytes and returns `NoBlobHistory`.
+    /// `None` (the default) keeps every blob version. Never synced — this is a
+    /// per-device retention policy, not part of the CRDT/wire state.
+    single_version_threshold: Option<u64>,
 }
 
 impl FolderBridge {
@@ -230,7 +237,15 @@ impl FolderBridge {
         Self {
             vault_root: vault_root.to_path_buf(),
             meta_dir: meta_dir.to_path_buf(),
+            single_version_threshold: None,
         }
+    }
+
+    /// Enable big-blob single-version mode: blobs larger than `bytes` release
+    /// their prior version on edit (client-local; not synced).
+    pub fn with_single_version_threshold(mut self, bytes: u64) -> Self {
+        self.single_version_threshold = Some(bytes);
+        self
     }
 
     /// Reconcile `file`'s on-disk text into its container (disk → CRDT).
@@ -392,6 +407,14 @@ impl FolderBridge {
         container: &str,
         bytes: Vec<u8>,
     ) -> Result<SyncOutcome, FilesError> {
+        // The hash THIS container referenced BEFORE this import — captured up
+        // front so big-blob single-version mode can release the superseded bytes
+        // after the new hash is set. `None` when the container had no entry yet.
+        let prior_hash = store
+            .get_entry(FILESET_MAP_ID, container)
+            .and_then(|v| FileEntry::from_value(&v).ok())
+            .map(|e| e.content_hash);
+
         // Store the bytes (idempotent/dedup) and take their content hash as the
         // blob-ref. `content_hash` doubles as the blob-ref for a Blob entry.
         let hash = store.blobs().put(&bytes)?;
@@ -420,7 +443,7 @@ impl FolderBridge {
         let value = FileEntry {
             kind: EntryKind::Blob,
             status: EntryStatus::Live,
-            content_hash: hash,
+            content_hash: hash.clone(),
             renamed_from: None,
             tombstoned_at: None,
         }
@@ -432,6 +455,24 @@ impl FolderBridge {
             return Ok(SyncOutcome::unchanged());
         }
         store.set_entry(FILESET_MAP_ID, container, &value)?;
+
+        // Big-blob single-version mode (CLIENT-LOCAL): a blob larger than the
+        // threshold opts OUT of edit history — release its now-superseded prior
+        // bytes so a later rollback correctly returns `NoBlobHistory` rather than
+        // stale bytes, and the local store never accumulates big dead versions.
+        // Guarded: only when the prior hash DIFFERS from the new one (a real
+        // edit, not a same-bytes re-import) AND no other CURRENT entry still
+        // references it (never yank bytes a live/tombstoned entry needs).
+        if let Some(threshold) = self.single_version_threshold {
+            if bytes.len() as u64 > threshold {
+                if let Some(prev) = prior_hash {
+                    if prev != hash && !hash_referenced(store, &prev) {
+                        store.blobs().remove(&prev)?;
+                    }
+                }
+            }
+        }
+
         Ok(SyncOutcome::changed_no_ops())
     }
 
@@ -1090,6 +1131,45 @@ impl FolderBridge {
 
         Ok(SyncOutcome::changed_no_ops())
     }
+
+    /// Roll a blob file back to its version as of `before_ts`. If the historical
+    /// entry is a blob whose bytes are still present locally, re-references and
+    /// projects them; if the bytes were released (single-version) or the point is
+    /// below retained history, returns `NoBlobHistory` — never wrong/empty bytes.
+    /// Text files are out of scope (returns `NoBlobHistory`).
+    pub fn restore_blob_version(
+        &self,
+        store: &mut Store,
+        file: &Path,
+        before_ts: i64,
+    ) -> Result<SyncOutcome, FilesError> {
+        if !store.may_write() {
+            return Err(FilesError::ReadOnly);
+        }
+        let key = container_id(&self.vault_root, file)?;
+        let value = store
+            .historical_entry(FILESET_MAP_ID, &key, before_ts)?
+            .ok_or_else(|| FilesError::NoBlobHistory(file.to_path_buf()))?;
+        let entry = FileEntry::from_value(&value)?;
+        if entry.kind != EntryKind::Blob {
+            return Err(FilesError::NoBlobHistory(file.to_path_buf()));
+        }
+        if !store.blobs().has(&entry.content_hash) {
+            return Err(FilesError::NoBlobHistory(file.to_path_buf()));
+        }
+        let live = entry.to_live();
+        store.set_entry(FILESET_MAP_ID, &key, &live.to_value())?;
+        self.project_file(store, file)
+    }
+}
+
+/// Whether any CURRENT fileset entry (any status) references `hash`.
+fn hash_referenced(store: &Store, hash: &str) -> bool {
+    store.entries(FILESET_MAP_ID).into_iter().any(|(_, v)| {
+        FileEntry::from_value(&v)
+            .map(|e| e.content_hash == hash)
+            .unwrap_or(false)
+    })
 }
 
 /// Atomically write `bytes` to `path` by writing a sibling temp file and
@@ -3631,5 +3711,52 @@ mod tests {
             store.blobs().has(&hash),
             "the blob must be RETAINED; reclaim now happens only via Store::checkpoint"
         );
+    }
+
+    #[test]
+    fn big_blob_edit_releases_prior_bytes_small_blob_keeps_both() {
+        let dir = tempdir().unwrap();
+        let (bridge0, mut store) = bridge(dir.path());
+        let vault = dir.path().join("vault");
+        let bridge = bridge0.with_single_version_threshold(4);
+
+        // Big blob (5 bytes > 4): v1 then edit to v2 -> v1 bytes released.
+        let big = vault.join("big.bin");
+        let v1_bytes = vec![0xFFu8, 0x00, 0xFF, 0x00, 0xFF];
+        std::fs::write(&big, &v1_bytes).unwrap();
+        bridge.import_file(&mut store, &big).unwrap();
+        let v1 = roam_storage::BlobStore::hash(&v1_bytes);
+        std::fs::write(&big, [0x00u8, 0xFF, 0x00, 0xFF, 0x00]).unwrap();
+        bridge.import_file(&mut store, &big).unwrap();
+        assert!(!store.blobs().has(&v1), "big blob's prior version released on edit");
+
+        // Small blob (3 bytes <= 4): both versions kept.
+        let small = vault.join("small.bin");
+        let s1_bytes = vec![0xFEu8, 0x00, 0xFE];
+        std::fs::write(&small, &s1_bytes).unwrap();
+        bridge.import_file(&mut store, &small).unwrap();
+        let s1 = roam_storage::BlobStore::hash(&s1_bytes);
+        std::fs::write(&small, [0x00u8, 0xFE, 0x00]).unwrap();
+        bridge.import_file(&mut store, &small).unwrap();
+        assert!(store.blobs().has(&s1), "small blob keeps its prior version");
+    }
+
+    #[test]
+    fn restore_blob_version_returns_no_history_when_bytes_released() {
+        let dir = tempdir().unwrap();
+        let (bridge0, mut store) = bridge(dir.path());
+        let vault = dir.path().join("vault");
+        let bridge = bridge0.with_single_version_threshold(4);
+        let big = vault.join("big.bin");
+        std::fs::write(&big, [0xFFu8, 0x00, 0xFF, 0x00, 0xFF]).unwrap();
+        bridge.import_file(&mut store, &big).unwrap();
+        store.write_snapshot().unwrap(); // marker at v1
+        std::fs::write(&big, [0x00u8, 0xFF, 0x00, 0xFF, 0x00]).unwrap();
+        bridge.import_file(&mut store, &big).unwrap();
+
+        let err = bridge
+            .restore_blob_version(&mut store, &big, i64::MAX)
+            .unwrap_err();
+        assert!(matches!(err, FilesError::NoBlobHistory(_)));
     }
 }
