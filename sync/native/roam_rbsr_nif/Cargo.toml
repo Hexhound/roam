@@ -1,0 +1,16 @@
+[package]
+name = "roam_rbsr_nif"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "roam_rbsr_nif"
+crate-type = ["cdylib"]
+
+[dependencies]
+rustler = "0.38"
+roam-rbsr = { path = "../../../crates/roam-rbsr" }
+
+# Detach from the parent cargo workspace at /home/sezdocs/projects/roam/roam-sync
+# (this crate is built by rustler, NOT a workspace member). REQUIRED or cargo errors.
+[workspace]
