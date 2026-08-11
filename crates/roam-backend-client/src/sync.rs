@@ -286,17 +286,26 @@ async fn import_needed_snapshots<B: Backend>(
         return Ok(());
     }
 
-    // Verifying keys we trust to author a snapshot: every roster peer plus self.
+    // Verifying keys we trust to author a snapshot: ADMIN roster peers only (plus
+    // self iff this device is an Admin). Authoring a snapshot authorizes a future
+    // prune and injects state via an additive `doc.import` that bypasses the
+    // per-op Reader-content-drop rule — so a non-Admin author must never be
+    // adopted, even with a valid self-signature. Producer-side gating is
+    // voluntary; this receiver-side gate is what actually enforces Admin-only.
     let author_keys: std::collections::HashMap<u64, VerifyingKey> = {
         let guard = store.lock().await;
         let mut m = std::collections::HashMap::new();
         for r in guard.roster() {
-            if let Ok(k) = VerifyingKey::from_bytes(&r.verifying_key) {
-                m.insert(r.peer_id, k);
+            if r.role == Role::Admin {
+                if let Ok(k) = VerifyingKey::from_bytes(&r.verifying_key) {
+                    m.insert(r.peer_id, k);
+                }
             }
         }
-        if let Ok(k) = VerifyingKey::from_bytes(&guard.identity_verifying_bytes()) {
-            m.insert(guard.peer_id(), k);
+        if guard.self_role() == Some(Role::Admin) {
+            if let Ok(k) = VerifyingKey::from_bytes(&guard.identity_verifying_bytes()) {
+                m.insert(guard.peer_id(), k);
+            }
         }
         m
     };
@@ -636,6 +645,66 @@ mod tests {
         // B recorded the snapshot as held (so it will advertise it + stop
         // advertising the entries it subsumes next pass).
         assert_eq!(b.lock().await.held_snapshots().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_non_admin_authored_snapshot_is_never_adopted() {
+        // Admin-only authorship is enforced RECEIVER-side: producer gating is
+        // voluntary, so a peer must reject a validly-signed snapshot whose author
+        // is not an Admin in the receiver's roster. Otherwise a Reader/Writer
+        // could inject content via the additive `doc.import` in `adopt_snapshot`,
+        // bypassing the per-op Reader-content-drop rule.
+        std::env::set_var("ROAM_SNAPSHOT_LAG_DAYS", "0");
+        let key = VaultKey([9u8; 32]);
+        let backend = Arc::new(MemoryBackend::default());
+        let a_dir = tempfile::tempdir().unwrap();
+        let b_dir = tempfile::tempdir().unwrap();
+        let a = store_at(a_dir.path()).await; // Admin in its OWN roster -> can produce
+        let b = store_at(b_dir.path()).await;
+
+        let (a_peer, a_key) = {
+            let g = a.lock().await;
+            (g.peer_id(), g.identity_verifying_bytes())
+        };
+        let (b_peer, b_key) = {
+            let g = b.lock().await;
+            (g.peer_id(), g.identity_verifying_bytes())
+        };
+        a.lock().await.add_peer(b_peer, b_key, Role::Admin).unwrap();
+        // B sees A as a WRITER, not an Admin.
+        b.lock()
+            .await
+            .add_peer(a_peer, a_key, Role::Writer)
+            .unwrap();
+
+        a.lock().await.set_entry("files", "k", "hello").unwrap();
+        reconcile_once(&a, &backend, &key).await.unwrap();
+        backend.set_snapshot_wanted(&key.bucket_id(), true);
+        reconcile_once(&a, &backend, &key).await.unwrap();
+        assert_eq!(
+            backend
+                .list_snapshots(&key.bucket_id())
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "A (Admin in its own roster) uploaded a validly-signed snapshot"
+        );
+
+        // Clear the request so B (also an Admin in its OWN roster) does not
+        // self-produce a snapshot on its pass — we want to test only whether B
+        // adopts A's Writer-authored one.
+        backend.set_snapshot_wanted(&key.bucket_id(), false);
+
+        // B runs a pass: it must NOT adopt the Writer-authored snapshot, and must
+        // not record it as held. (It still learns "k" via ordinary op-replay,
+        // which is correctly role-gated elsewhere — assert only the snapshot path.)
+        reconcile_once(&b, &backend, &key).await.unwrap();
+        assert_eq!(
+            b.lock().await.held_snapshots().unwrap().len(),
+            0,
+            "a non-Admin-authored snapshot must never be adopted/held"
+        );
     }
 
     #[tokio::test]
