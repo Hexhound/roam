@@ -56,6 +56,8 @@ pub struct MemoryBackend {
     snapshots: Mutex<BTreeMap<String, BTreeMap<String, Vec<u8>>>>,
     /// Buckets for which the backend is currently requesting a snapshot.
     snapshot_wanted: Mutex<std::collections::BTreeSet<String>>,
+    /// Per-entry-id `get_entry` call counts (test instrumentation).
+    entry_gets: Mutex<BTreeMap<String, usize>>,
 }
 
 impl MemoryBackend {
@@ -68,6 +70,16 @@ impl MemoryBackend {
         } else {
             guard.remove(bucket);
         }
+    }
+
+    /// Test hook: how many times `get_entry` was called for `id` (any bucket).
+    pub fn entry_get_count(&self, id: &str) -> usize {
+        self.entry_gets
+            .lock()
+            .unwrap()
+            .get(id)
+            .copied()
+            .unwrap_or(0)
     }
 
     fn id_set(&self, bucket: &str, kind: SetKind) -> Vec<[u8; 32]> {
@@ -151,6 +163,12 @@ impl Backend for MemoryBackend {
         })
     }
     async fn get_entry(&self, bucket: &str, id: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        *self
+            .entry_gets
+            .lock()
+            .unwrap()
+            .entry(id.to_string())
+            .or_insert(0) += 1;
         Ok(get(&self.entries, bucket, id))
     }
     async fn put_entry(&self, bucket: &str, id: &str, ct: Vec<u8>) -> anyhow::Result<PutOutcome> {

@@ -400,11 +400,16 @@ async fn maybe_produce_snapshot<B: Backend>(
         return Ok(());
     }
 
-    let before_ts = now_ms().saturating_sub(retention_lag_ms());
     // Pin a head marker so there is always a frontier to snapshot, then build.
+    // Compute `before_ts` AFTER writing the marker: the marker's timestamp is
+    // taken inside write_snapshot, so a `before_ts` sampled earlier could sit just
+    // below it and miss the fresh marker (flaky on the ms boundary). With the
+    // default lag the head marker is intentionally excluded, leaving a replayable
+    // tail; lag 0 (tests) snapshots at head.
     let snap = {
         let mut guard = store.lock().await;
         guard.write_snapshot()?;
+        let before_ts = now_ms().saturating_sub(retention_lag_ms());
         guard.build_backend_snapshot(before_ts)?
     };
     let Some(snap) = snap else {
@@ -631,6 +636,68 @@ mod tests {
         // B recorded the snapshot as held (so it will advertise it + stop
         // advertising the entries it subsumes next pass).
         assert_eq!(b.lock().await.held_snapshots().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn subsumed_ops_are_never_re_pulled_after_adoption() {
+        // The seed §2a regression: a client holding a snapshot must NOT re-fetch
+        // the ops that snapshot subsumes, on this or any later pass.
+        std::env::set_var("ROAM_SNAPSHOT_LAG_DAYS", "0");
+        let key = VaultKey([9u8; 32]);
+        let backend = Arc::new(MemoryBackend::default());
+        let a_dir = tempfile::tempdir().unwrap();
+        let b_dir = tempfile::tempdir().unwrap();
+        let a = store_at(a_dir.path()).await;
+        let b = store_at(b_dir.path()).await;
+
+        let (a_peer, a_key) = {
+            let g = a.lock().await;
+            (g.peer_id(), g.identity_verifying_bytes())
+        };
+        let (b_peer, b_key) = {
+            let g = b.lock().await;
+            (g.peer_id(), g.identity_verifying_bytes())
+        };
+        a.lock().await.add_peer(b_peer, b_key, Role::Admin).unwrap();
+        b.lock().await.add_peer(a_peer, a_key, Role::Admin).unwrap();
+
+        for i in 0..3 {
+            a.lock()
+                .await
+                .set_entry("files", "k", &format!("v{i}"))
+                .unwrap();
+        }
+        reconcile_once(&a, &backend, &key).await.unwrap();
+        backend.set_snapshot_wanted(&key.bucket_id(), true);
+        reconcile_once(&a, &backend, &key).await.unwrap();
+
+        // Read the uploaded snapshot's manifest to learn which entry ids it subsumes.
+        let sid = backend.list_snapshots(&key.bucket_id()).await.unwrap()[0].clone();
+        let framed = backend
+            .get_snapshot(&key.bucket_id(), &sid)
+            .await
+            .unwrap()
+            .unwrap();
+        let (mjson, _) = crate::snapshot_msg::unframe(&framed).unwrap();
+        let manifest: crate::snapshot_msg::SnapshotManifest =
+            serde_json::from_slice(mjson).unwrap();
+        assert!(!manifest.subsumed_entry_ids.is_empty());
+
+        // B bootstraps from the snapshot, then runs several more passes.
+        for _ in 0..3 {
+            reconcile_once(&b, &backend, &key).await.unwrap();
+        }
+        assert_eq!(
+            b.lock().await.get_entry("files", "k"),
+            Some("v2".to_string())
+        );
+        for id in &manifest.subsumed_entry_ids {
+            assert_eq!(
+                backend.entry_get_count(id),
+                0,
+                "subsumed op {id} must never be fetched once the snapshot is held"
+            );
+        }
     }
 
     #[tokio::test]
