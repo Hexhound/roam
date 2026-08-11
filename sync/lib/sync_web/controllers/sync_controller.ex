@@ -46,10 +46,13 @@ defmodule SyncWeb.SyncController do
 
   def manifest(conn, %{"bucket" => b}) do
     with :ok <- guard(conn, [b]) do
+      threshold = Application.get_env(:sync, :snapshot_threshold_bytes, 5_000_000)
+
       json(conn, %{
         entry_ids: Store.list(b, "entries"),
         blob_ids: Store.list(b, "blobs"),
-        snapshot_ids: Store.list(b, "snapshots")
+        snapshot_ids: Store.list(b, "snapshots"),
+        snapshot_wanted: Store.snapshot_wanted?(b, threshold)
       })
     else
       {:halt, conn} -> conn
