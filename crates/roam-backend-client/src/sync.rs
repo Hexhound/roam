@@ -1,5 +1,5 @@
 use crate::crypto::VaultKey;
-use crate::entries::{local_blobs, local_entries, reassemble_log, split_log_lines};
+use crate::entries::{local_blobs, local_entries};
 use crate::transport::Backend;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64URL, Engine};
 use roam_rbsr::{initiate, reconcile, ItemSet, SetKind};
@@ -214,11 +214,11 @@ pub async fn reconcile_once<B: Backend>(
         eprintln!("[be-sync]   has_missing_entries={has_missing}");
     }
     if has_missing {
-        import_missing_entries(
+        import_needed_entries(
             store,
             backend,
-            key,
             &bucket,
+            &need_entry_ids,
             self_peer,
             debug,
             &kc,
@@ -237,25 +237,31 @@ pub async fn reconcile_once<B: Backend>(
     Ok(())
 }
 
-/// For every roster peer, pull backend entries beyond what we hold locally, in
-/// strict index order, then import the reassembled suffix via `apply_peer_ops`.
-async fn import_missing_entries<B: Backend>(
+/// Fetch every content-addressed entry id in `need_entry_ids` directly from the
+/// backend (RBSR's discovery is set-based, not sequential, so there is no
+/// per-peer index to walk anymore), decrypt, attribute it to its author via the
+/// line's own `peer` field, and append it into that author's op-log through
+/// [`Store::dedup_append_peer_line`] — which re-imports the whole log each
+/// time, so Loro buffers any op whose dependency hasn't landed yet and
+/// converges once it does, regardless of fetch order.
+async fn import_needed_entries<B: Backend>(
     store: &Arc<Mutex<Store>>,
     backend: &Arc<B>,
-    key: &VaultKey,
     bucket: &str,
+    need_entry_ids: &BTreeSet<String>,
     self_peer: u64,
     debug: bool,
     kc: &Keychain,
     report: &mut DecryptReport,
 ) -> anyhow::Result<()> {
-    let peers: Vec<(u64, VerifyingKey)> = {
+    // Active roster peers (peer_id -> VerifyingKey), excluding self — the trust
+    // boundary for attributing a fetched line to an author.
+    let peers: std::collections::HashMap<u64, VerifyingKey> = {
         let guard = store.lock().await;
         guard
             .roster()
             .into_iter()
-            .filter(|r| r.peer_id != self_peer)
-            .filter(|r| r.status == PeerStatus::Active)
+            .filter(|r| r.peer_id != self_peer && r.status == PeerStatus::Active)
             .filter_map(|r| {
                 VerifyingKey::from_bytes(&r.verifying_key)
                     .ok()
@@ -264,49 +270,44 @@ async fn import_missing_entries<B: Backend>(
             .collect()
     };
 
-    for (peer_id, vkey) in peers {
-        let mut index = {
-            let guard = store.lock().await;
-            split_log_lines(&guard.export_peer_log(peer_id).unwrap_or_default()).len() as u64
-        };
-        let mut fetched: Vec<Vec<u8>> = Vec::new();
-        loop {
-            let id = key.entry_id(peer_id, index);
-            match backend.get_entry(bucket, &id).await? {
-                Some(ct) => match open_classified(kc, &ct)? {
-                    Some(pt) => {
-                        fetched.push(pt);
-                        index += 1;
-                    }
-                    None => {
-                        // Missing this epoch's key blocks this peer's suffix
-                        // (contiguous log). Stop the walk; self-heals next pass.
-                        report.undecryptable += 1;
-                        break;
-                    }
-                },
-                None => break,
-            }
-        }
-        if fetched.is_empty() {
+    let mut imported = 0usize;
+    for id in need_entry_ids {
+        let Some(ct) = backend.get_entry(bucket, id).await? else {
             continue;
-        }
-        if debug {
-            eprintln!(
-                "[be-sync]   import peer={peer_id}: fetched {} new entries (from index {})",
-                fetched.len(),
-                index - fetched.len() as u64,
-            );
-        }
-        let appended = reassemble_log(&fetched);
+        };
+        let Some(line) = open_classified(kc, &ct)? else {
+            // Missing this epoch's key; self-heals when the key-log delivers it.
+            report.undecryptable += 1;
+            continue;
+        };
+        let Some(author) = parse_entry_author(&line) else {
+            continue; // malformed line; nothing sane to attribute it to
+        };
+        let Some(vkey) = peers.get(&author) else {
+            continue; // unknown/untrusted author -> drop
+        };
         let mut guard = store.lock().await;
         // A bad entry must not abort the whole pass (matching Engine behavior),
         // but it must be observable rather than silently swallowed.
-        if let Err(err) = guard.apply_peer_ops(peer_id, &vkey, &appended) {
-            eprintln!("backend sync: apply_peer_ops for peer {peer_id} failed: {err}");
+        if let Err(err) = guard.dedup_append_peer_line(author, vkey, &line) {
+            eprintln!("backend sync: dedup_append_peer_line peer={author} failed: {err}");
+        } else {
+            imported += 1;
         }
     }
+    if debug {
+        eprintln!(
+            "[be-sync]   import_needed_entries: fetched/imported {imported} of {} needed",
+            need_entry_ids.len(),
+        );
+    }
     Ok(())
+}
+
+/// Pull the `peer` field out of one op-log JSONL line (`{"peer":<u64>,...}`).
+fn parse_entry_author(line: &[u8]) -> Option<u64> {
+    let v: serde_json::Value = serde_json::from_slice(line).ok()?;
+    v.get("peer")?.as_u64()
 }
 
 #[cfg(test)]

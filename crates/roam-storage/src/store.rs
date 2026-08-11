@@ -1049,6 +1049,46 @@ impl Store {
         Ok(())
     }
 
+    /// Append one already-formed peer op-log line if absent (exact-bytes dedup),
+    /// then re-import the peer log. Order-independent: Loro buffers ops whose
+    /// deps are absent and converges once the missing ancestor lands. Used by
+    /// the backend content-id fetch path (`roam-backend-client::sync`), which
+    /// resolves entries out of causal order (RBSR discovery is set-based, not
+    /// sequential).
+    pub fn dedup_append_peer_line(
+        &mut self,
+        author: u64,
+        key: &VerifyingKey,
+        line: &[u8],
+    ) -> Result<(), StorageError> {
+        if author == self.identity.peer_id() {
+            return Ok(());
+        }
+        let existing = self.export_peer_log(author)?;
+        let already = split_log_lines_bytes(&existing)
+            .iter()
+            .any(|l| l.as_slice() == line);
+        if !already {
+            let path = self.root.join("ops").join(format!("ops-{author}.jsonl"));
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let mut with_nl = line.to_vec();
+            if !with_nl.ends_with(b"\n") {
+                with_nl.push(b'\n');
+            }
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)?;
+            f.write_all(&with_nl)?;
+            f.sync_all()?;
+        }
+        let whole = self.export_peer_log(author)?;
+        self.import_peer(author, key, whole)
+    }
+
     /// Rewrite the `peers.json` materialized cache via a temp file + rename.
     ///
     /// Like the snapshot, this is a **rebuildable cache** (the signed roster logs
@@ -1213,6 +1253,25 @@ const FILESET_MAP_ID: &str = "__roam_fileset__";
 fn extract_content_hash(value: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(value).ok()?;
     v.get("content_hash")?.as_str().map(|s| s.to_string())
+}
+
+/// Split a JSONL byte buffer into its individual lines, each chunk keeping its
+/// trailing `\n` (a torn final line without a newline is its own chunk).
+/// Mirrors `roam_backend_client::entries::split_log_lines`, duplicated here so
+/// `roam-storage` (a dependency of that crate) never needs a reverse edge.
+fn split_log_lines_bytes(log: &[u8]) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    for (i, b) in log.iter().enumerate() {
+        if *b == b'\n' {
+            out.push(log[start..=i].to_vec());
+            start = i + 1;
+        }
+    }
+    if start < log.len() {
+        out.push(log[start..].to_vec());
+    }
+    out
 }
 
 /// Drop the first `n` non-empty lines from a JSONL file, rewriting atomically.
@@ -2472,5 +2531,58 @@ mod tests {
             .unwrap();
         let err = a2.import_peer(p.peer_id(), &p.verifying_key(), p_ops);
         assert!(err.is_err(), "reader-authored content ops must be refused");
+    }
+
+    #[test]
+    fn dedup_append_peer_line_is_idempotent_and_order_free() {
+        // Exercises the backend content-id fetch path's write primitive: lines
+        // can arrive one at a time, out of order, and with duplicates (RBSR
+        // discovery is set-based, not sequential) — the peer log must still end
+        // up holding exactly the distinct lines, and Loro must converge once
+        // both are present regardless of arrival order.
+        let dir = tempdir().unwrap();
+        let author = Identity::generate();
+        let mut s = Store::open(dir.path(), Identity::generate()).unwrap();
+        s.declare_founder(Role::Admin).unwrap();
+        s.add_peer(
+            author.peer_id(),
+            author.verifying_key().to_bytes(),
+            Role::Admin,
+        )
+        .unwrap();
+
+        // Build a real 2-line signed log: a throwaway store owned by `author`
+        // produces two ops, then we split its own log into lines.
+        let adir = tempdir().unwrap();
+        let mut astore = Store::open(adir.path(), author.clone()).unwrap();
+        astore.declare_founder(Role::Admin).unwrap();
+        astore.set_entry("files", "k", "v1").unwrap();
+        astore.set_entry("files", "k", "v2").unwrap();
+        let log = astore.export_own_log().unwrap();
+        let lines = split_log_lines_bytes(&log);
+        assert_eq!(
+            lines.len(),
+            2,
+            "two set_entry calls produce two op-log lines"
+        );
+
+        let vk = author.verifying_key();
+        // Out of order, plus a duplicate of an already-applied line.
+        s.dedup_append_peer_line(author.peer_id(), &vk, &lines[1])
+            .unwrap();
+        s.dedup_append_peer_line(author.peer_id(), &vk, &lines[0])
+            .unwrap();
+        s.dedup_append_peer_line(author.peer_id(), &vk, &lines[1])
+            .unwrap(); // dup: no-op
+
+        // Exactly 2 distinct lines retained on disk (dedup, not 3).
+        let stored = s.export_peer_log(author.peer_id()).unwrap();
+        assert_eq!(
+            stored.iter().filter(|&&b| b == b'\n').count(),
+            2,
+            "duplicate line must not be appended twice"
+        );
+        // And the doc converged to the final value despite the reordering.
+        assert_eq!(s.get_entry("files", "k"), Some("v2".to_string()));
     }
 }
