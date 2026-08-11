@@ -11,8 +11,10 @@ defmodule SyncWeb.SyncController do
   def put_entry(conn, %{"bucket" => b, "id" => id}), do: do_put(conn, b, "entries", id)
   def get_blob(conn, %{"bucket" => b, "id" => id}), do: do_get(conn, b, "blobs", id)
   def put_blob(conn, %{"bucket" => b, "id" => id}), do: do_put(conn, b, "blobs", id)
+  def get_snapshot(conn, %{"bucket" => b, "id" => id}), do: do_get(conn, b, "snapshots", id)
+  def put_snapshot(conn, %{"bucket" => b, "id" => id}), do: do_put(conn, b, "snapshots", id)
 
-  @kinds %{"entries" => "entries", "blobs" => "blobs"}
+  @kinds %{"entries" => "entries", "blobs" => "blobs", "snapshots" => "snapshots"}
 
   def reconcile(conn, %{"bucket" => bucket, "kind" => kind}) do
     with :ok <- guard(conn, [bucket]),
@@ -44,7 +46,11 @@ defmodule SyncWeb.SyncController do
 
   def manifest(conn, %{"bucket" => b}) do
     with :ok <- guard(conn, [b]) do
-      json(conn, %{entry_ids: Store.list(b, "entries"), blob_ids: Store.list(b, "blobs")})
+      json(conn, %{
+        entry_ids: Store.list(b, "entries"),
+        blob_ids: Store.list(b, "blobs"),
+        snapshot_ids: Store.list(b, "snapshots")
+      })
     else
       {:halt, conn} -> conn
     end
