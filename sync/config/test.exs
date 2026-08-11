@@ -43,3 +43,7 @@ config :phoenix_live_view,
 # Sort query params output of verified routes for robust url comparisons
 config :phoenix,
   sort_verified_routes_query_params: true
+
+# Keep the retention sweeper out of the supervision tree in tests; sweep_all/1 is
+# driven directly where needed.
+config :sync, :enable_sweeper, false

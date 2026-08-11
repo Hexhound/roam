@@ -24,6 +24,15 @@ defmodule Sync.Application do
       {AshAuthentication.Supervisor, [otp_app: :sync]}
     ]
 
+    # The retention sweeper is opt-out (off in test env, where sweep_all/1 is
+    # driven directly).
+    children =
+      if Application.get_env(:sync, :enable_sweeper, true) do
+        children ++ [Sync.Backend.Sweeper]
+      else
+        children
+      end
+
     # See https://elixir.hexdocs.pm/Supervisor.html
     # for other strategies and supported options
     opts = [strategy: :one_for_one, name: Sync.Supervisor]
