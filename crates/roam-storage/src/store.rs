@@ -47,6 +47,66 @@ pub fn version_dominates(superset: &[u8], subset: &[u8]) -> bool {
     }
 }
 
+/// On-disk byte usage of a vault, broken down by category. Every field counts
+/// bytes physically stored under the vault root; `total` is their sum. Reported
+/// by [`Store::data_size`] so a client can show the user how much space the
+/// vault uses (and, paired with [`Store::checkpoint_dry_run`], how much a
+/// compaction would reclaim) without walking the disk itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DataSize {
+    /// Content-addressed blob bytes (`<root>/assets`) — binary payloads that
+    /// live outside the CRDT.
+    pub blobs: u64,
+    /// CRDT op-logs and the fast-load snapshot (`<root>/ops`, `<root>/snapshots`).
+    pub oplog: u64,
+    /// Signed roster/key logs, the local history index, and the founder pin
+    /// (`<root>/roster`, `<root>/keylog`, `<root>/history`, `<root>/founder`).
+    pub meta: u64,
+    /// Sum of every bucket above.
+    pub total: u64,
+}
+
+/// Total byte size of every regular file at or under `path`, recursively. A
+/// missing directory counts as 0 (an empty vault has not created it yet). Any
+/// other IO error propagates — a size report must never silently undercount.
+fn dir_size(path: &Path) -> Result<u64, StorageError> {
+    let entries = match std::fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e.into()),
+    };
+    let mut total = 0u64;
+    for entry in entries {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            total = total.saturating_add(dir_size(&entry.path())?);
+        } else if file_type.is_file() {
+            total = total.saturating_add(entry.metadata()?.len());
+        }
+    }
+    Ok(total)
+}
+
+/// Total byte size of the regular files sitting DIRECTLY in `path` (its
+/// non-recursive top level; subdirectories are ignored — they are summed
+/// separately by [`dir_size`]). A missing directory counts as 0.
+fn root_file_bytes(path: &Path) -> Result<u64, StorageError> {
+    let entries = match std::fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e.into()),
+    };
+    let mut total = 0u64;
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_type()?.is_file() {
+            total = total.saturating_add(entry.metadata()?.len());
+        }
+    }
+    Ok(total)
+}
+
 /// A vault-backed CRDT document store. Layout under `root`:
 /// - `ops/ops-<peer>.jsonl` — one signed append-log per peer
 /// - `roster/roster-<peer>.jsonl` — one signed membership log per device
@@ -230,6 +290,33 @@ impl Store {
     /// (cross-device byte transfer, disk projection, GC) reach them the same way.
     pub fn blobs(&self) -> &BlobStore {
         &self.blobs
+    }
+
+    /// On-disk byte usage of this vault, broken down by category (see
+    /// [`DataSize`]). Walks the vault directories and sums file sizes — cheap
+    /// enough for a UI to call on demand (one `read_dir` + a stat per file), but
+    /// not O(1): cost scales with the number of stored files. Pair with
+    /// [`Store::checkpoint_dry_run`] to show "total now" vs "freeable by
+    /// compacting" side by side.
+    pub fn data_size(&self) -> Result<DataSize, StorageError> {
+        let blobs = dir_size(&self.root.join("assets"))?;
+        let oplog = dir_size(&self.root.join("ops"))?
+            .saturating_add(dir_size(&self.root.join("snapshots"))?);
+        let mut meta = dir_size(&self.root.join("roster"))?
+            .saturating_add(dir_size(&self.root.join("keylog"))?)
+            .saturating_add(dir_size(&self.root.join("history"))?);
+        // Bare files directly at the vault root (the `founder` pin, the
+        // `peers.json` roster cache, the vault-key file, …) are all metadata.
+        // Count them generically so a new root-level file is never silently
+        // dropped from the total — subdirectories are summed above.
+        meta = meta.saturating_add(root_file_bytes(&self.root)?);
+        let total = blobs.saturating_add(oplog).saturating_add(meta);
+        Ok(DataSize {
+            blobs,
+            oplog,
+            meta,
+            total,
+        })
     }
 
     /// Insert text, commit, and durably append the resulting signed delta.
@@ -1189,6 +1276,37 @@ mod tests {
         );
         // Bytes landed under the assets dir beside the CRDT state.
         assert!(dir.path().join("assets").join(&hash).exists());
+    }
+
+    #[test]
+    fn data_size_sums_blobs_oplog_and_meta_on_disk() {
+        // data_size() reports on-disk byte usage broken down by category so a
+        // client can show "how big is my vault" without walking the disk itself.
+        let dir = tempdir().unwrap();
+        let mut store = Store::open(dir.path(), Identity::generate()).unwrap();
+
+        // Empty vault: nothing written yet, every bucket is zero.
+        let empty = store.data_size().unwrap();
+        assert_eq!(empty.blobs, 0, "no blobs yet");
+        assert_eq!(empty.total, empty.blobs + empty.oplog + empty.meta);
+
+        // Blobs bucket == exact sum of stored blob bytes (3 + 5 = 8).
+        store.blobs().put(&[1, 2, 3]).unwrap();
+        store.blobs().put(&[9, 8, 7, 6, 5]).unwrap();
+        // An edit + snapshot writes the op-log and snapshot (the oplog bucket).
+        store.declare_founder(Role::Admin).unwrap();
+        store.edit_text("greeting", 0, "hello world").unwrap();
+        store.write_snapshot().unwrap();
+
+        let size = store.data_size().unwrap();
+        assert_eq!(size.blobs, 8, "blobs bucket is the exact blob byte sum");
+        assert!(size.oplog > 0, "op-log/snapshot bytes were written");
+        assert!(size.meta > 0, "roster/founder metadata was written");
+        assert_eq!(
+            size.total,
+            size.blobs + size.oplog + size.meta,
+            "total is the sum of every bucket"
+        );
     }
 
     #[test]

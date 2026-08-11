@@ -971,6 +971,11 @@ async fn status(vault: &Path, identity_path: Option<PathBuf>) -> Result<()> {
     }
     println!("note: {} bytes", store.text("note").len());
     println!("doc version: {} bytes", store.doc_version_bytes().len());
+    let size = store.data_size().context("measure vault size")?;
+    println!(
+        "data size: {} bytes total (blobs {}, oplog {}, meta {})",
+        size.total, size.blobs, size.oplog, size.meta
+    );
 
     // Key-rotation state needs BOTH the real identity (to open own key-log +
     // unwrap epochs) and the vault key (to derive the id + epoch-0 keys). Missing
