@@ -1,4 +1,4 @@
-use roam_storage::{Identity, Store, VaultId};
+use roam_storage::{Identity, Role, Store, VaultId};
 use roam_sync_core::engine::Engine;
 use roam_transport_iroh::IrohTransport;
 use std::collections::HashMap;
@@ -16,8 +16,11 @@ async fn two_real_endpoints_catch_up_offline_edits() {
 
     let mut sa = Store::open(da.path(), ia.clone()).unwrap();
     let mut sb = Store::open(db.path(), ib.clone()).unwrap();
-    sa.add_peer(ib.peer_id(), ib.verifying_key().to_bytes()).unwrap();
-    sb.add_peer(ia.peer_id(), ia.verifying_key().to_bytes()).unwrap();
+    // Each device founds its own vault as admin so its own `add_peer` vouches fold.
+    sa.declare_founder(Role::Admin).unwrap();
+    sb.declare_founder(Role::Admin).unwrap();
+    sa.add_peer(ib.peer_id(), ib.verifying_key().to_bytes(), Role::Admin).unwrap();
+    sb.add_peer(ia.peer_id(), ia.verifying_key().to_bytes(), Role::Admin).unwrap();
     // Edit BEFORE connecting (offline).
     sa.edit_text("note", 0, "offline-A").unwrap();
     sb.edit_text("note", 0, "offline-B").unwrap();

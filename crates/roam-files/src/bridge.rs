@@ -255,6 +255,11 @@ impl FolderBridge {
     /// now matches the file, and records the new sidecar. A file with no
     /// changes since the last sync is a no-op that leaves the sidecar untouched.
     pub fn import_file(&self, store: &mut Store, file: &Path) -> Result<SyncOutcome, FilesError> {
+        // Read-only role gate: a device with no write role must never author or
+        // propagate content ops. Refuse before any mutation.
+        if !store.may_write() {
+            return Err(FilesError::ReadOnly);
+        }
         let container = container_id(&self.vault_root, file)?;
 
         // Case-only-collision guard (B2). On a case-insensitive filesystem two
@@ -484,6 +489,10 @@ impl FolderBridge {
     /// of the container's CURRENT store text so a later resurrection guard can
     /// tell whether the content changed after the delete.
     pub fn delete_file(&self, store: &mut Store, file: &Path) -> Result<SyncOutcome, FilesError> {
+        // Read-only role gate: a Reader may not author a tombstone (a write).
+        if !store.may_write() {
+            return Err(FilesError::ReadOnly);
+        }
         let container = container_id(&self.vault_root, file)?;
 
         // Preserve the EXISTING entry's kind: a tombstoned blob must stay
@@ -545,6 +554,28 @@ impl FolderBridge {
     /// `changed` reflects whether disk was written; `ops_applied` is always 0
     /// because projection never mutates the CRDT.
     pub fn project_file(&self, store: &mut Store, file: &Path) -> Result<SyncOutcome, FilesError> {
+        self.project_file_inner(store, file, false)
+    }
+
+    /// Like [`project_file`](Self::project_file) but FORCES the overwrite past
+    /// the dirty-file guard. Used ONLY on a read-only (Reader) store, where a
+    /// local disk edit will never become an op and must be reverted to the
+    /// authoritative CRDT projection. The writable path never sets `force`, so
+    /// the data-loss guard stays intact for Writers/Admins.
+    fn project_file_forced(
+        &self,
+        store: &mut Store,
+        file: &Path,
+    ) -> Result<SyncOutcome, FilesError> {
+        self.project_file_inner(store, file, true)
+    }
+
+    fn project_file_inner(
+        &self,
+        store: &mut Store,
+        file: &Path,
+        force: bool,
+    ) -> Result<SyncOutcome, FilesError> {
         let container = container_id(&self.vault_root, file)?;
         let text = store.text(&container);
 
@@ -578,14 +609,16 @@ impl FolderBridge {
         // store), is safe to project. When no sidecar exists we have no proof
         // the file is clean, so an existing differing file is treated as dirty
         // rather than silently overwritten.
-        if let Some(disk) = on_disk.as_deref() {
-            if disk != text {
-                let edited_since_sync = match &sidecar {
-                    Some(sidecar) => disk != sidecar.last_synced_text,
-                    None => true,
-                };
-                if edited_since_sync {
-                    return Err(FilesError::DirtyFile(file.to_path_buf()));
+        if !force {
+            if let Some(disk) = on_disk.as_deref() {
+                if disk != text {
+                    let edited_since_sync = match &sidecar {
+                        Some(sidecar) => disk != sidecar.last_synced_text,
+                        None => true,
+                    };
+                    if edited_since_sync {
+                        return Err(FilesError::DirtyFile(file.to_path_buf()));
+                    }
                 }
             }
         }
@@ -754,14 +787,51 @@ impl FolderBridge {
             Some(set) => files.into_iter().filter(|f| set.contains(f)).collect(),
         };
 
+        // A read-only (Reader) vault is a PURE PROJECTION: the device never
+        // authors ops, so local disk edits must NOT be imported. Instead each
+        // locally-edited file is DISCARDED (logged) and force-reverted to the
+        // authoritative CRDT content below. Steps 1b/2 (which author fileset
+        // entries/tombstones — writes) are skipped entirely for such a device.
+        let read_only = !store.may_write();
+
         let mut outcomes = Vec::new();
-        for file in to_import {
-            // Every discovered file imports (text or blob by content); a genuine
-            // error (Desync, IO, ...) aborts the scan rather than being skipped.
-            let outcome = self.import_file(store, &file)?;
-            outcomes.push((file, outcome));
+        if read_only {
+            for file in &to_import {
+                // No `tracing`/`log` dependency in this crate — mirror the
+                // intended `tracing::warn!(path, "...")` with `eprintln!`.
+                eprintln!(
+                    "read-only vault: discarding local edit, reverting to projection: {}",
+                    file.display()
+                );
+                // A non-UTF-8 (blob) file has no text container to revert to;
+                // leave blob reconciliation to Step 3's remote projection.
+                let is_text = std::fs::read(file)
+                    .map(|bytes| std::str::from_utf8(&bytes).is_ok())
+                    .unwrap_or(false);
+                if !is_text {
+                    continue;
+                }
+                // Force past the dirty-file guard: the un-imported local edit is
+                // intentionally clobbered by the projection (it never becomes an
+                // op). The guard stays intact for the writable path.
+                match self.project_file_forced(store, file) {
+                    Ok(outcome) if outcome.changed => outcomes.push((file.clone(), outcome)),
+                    Ok(_) => {}
+                    Err(err) => return Err(err),
+                }
+            }
+        } else {
+            for file in to_import {
+                // Every discovered file imports (text or blob by content); a genuine
+                // error (Desync, IO, ...) aborts the scan rather than being skipped.
+                let outcome = self.import_file(store, &file)?;
+                outcomes.push((file, outcome));
+            }
         }
 
+        // Steps 1b + 2 author fileset entries / tombstones (CRDT writes) — a
+        // read-only Reader never mutates the CRDT, so both are skipped for it.
+        if !read_only {
         // --- Step 1b: heal present files with NO file-set entry at all. ---
         // `import_file` writes its Live entry AFTER the `ops.is_empty()` early
         // return, so an unchanged present file that has no entry (pre-file-set
@@ -851,6 +921,7 @@ impl FolderBridge {
             remove_if_present(&sidecar)?;
             outcomes.push((file, SyncOutcome::changed_no_ops()));
         }
+        } // end `if !read_only` (Steps 1b + 2)
 
         // --- Step 3: apply remote state onto disk. ---
         for (key, value) in store.entries(FILESET_MAP_ID) {
@@ -1030,6 +1101,9 @@ impl FolderBridge {
     /// ops that propagate and heal the mesh. For a blob, the referenced bytes
     /// must still be present.
     pub fn resurrect(&self, store: &mut Store, file: &Path) -> Result<SyncOutcome, FilesError> {
+        if !store.may_write() {
+            return Err(FilesError::ReadOnly);
+        }
         let key = container_id(&self.vault_root, file)?;
         let value = store
             .get_entry(FILESET_MAP_ID, &key)
@@ -1110,6 +1184,10 @@ impl FolderBridge {
         from: &Path,
         to: &Path,
     ) -> Result<SyncOutcome, FilesError> {
+        // Read-only role gate: a rename authors ops (delete + re-seed), refused.
+        if !store.may_write() {
+            return Err(FilesError::ReadOnly);
+        }
         let from_container = container_id(&self.vault_root, from)?;
         let to_container = container_id(&self.vault_root, to)?;
 
@@ -1585,7 +1663,12 @@ mod tests {
         let store_root = root.join("store");
         std::fs::create_dir_all(&vault).unwrap();
         let bridge = FolderBridge::new(&vault, &tmeta(root));
-        let store = Store::open(&store_root, Identity::generate()).unwrap();
+        let mut store = Store::open(&store_root, Identity::generate()).unwrap();
+        // Under the roles model a store with no roster role has `may_write() ==
+        // false` (a read-only projection). These bridge tests exercise the
+        // writable import/delete/rename paths, so self-found as Admin to keep
+        // the device WRITABLE — matching the pre-roles behavior.
+        store.declare_founder(roam_storage::Role::Admin).unwrap();
         (bridge, store)
     }
 

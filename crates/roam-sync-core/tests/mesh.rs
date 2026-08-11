@@ -1,4 +1,4 @@
-use roam_storage::{Identity, PeerStatus, Store, VaultId};
+use roam_storage::{Identity, PeerStatus, Role, Store, VaultId};
 use roam_sync_core::engine::Engine;
 use roam_sync_core::memory::MemorySwitchboard;
 use std::sync::Arc;
@@ -17,12 +17,15 @@ async fn c_learns_b_transitively_through_a() {
     let mut sa = Store::open(da.path(), ia.clone()).unwrap();
     let mut sb = Store::open(db.path(), ib.clone()).unwrap();
     let mut sc = Store::open(dc.path(), ic.clone()).unwrap();
+    sa.declare_founder(Role::Admin).unwrap();
+    sb.declare_founder(Role::Admin).unwrap();
+    sc.declare_founder(Role::Admin).unwrap();
     // A vouches for B and C (as pairing would).
-    sa.add_peer(ib.peer_id(), ib.verifying_key().to_bytes()).unwrap();
-    sa.add_peer(ic.peer_id(), ic.verifying_key().to_bytes()).unwrap();
+    sa.add_peer(ib.peer_id(), ib.verifying_key().to_bytes(), Role::Admin).unwrap();
+    sa.add_peer(ic.peer_id(), ic.verifying_key().to_bytes(), Role::Admin).unwrap();
     // B and C each trust A (learned at their own pairing with A).
-    sb.add_peer(ia.peer_id(), ia.verifying_key().to_bytes()).unwrap();
-    sc.add_peer(ia.peer_id(), ia.verifying_key().to_bytes()).unwrap();
+    sb.add_peer(ia.peer_id(), ia.verifying_key().to_bytes(), Role::Admin).unwrap();
+    sc.add_peer(ia.peer_id(), ia.verifying_key().to_bytes(), Role::Admin).unwrap();
 
     let ea = Arc::new(Engine::new(ia.clone(), vault, sa, Arc::new(board.endpoint(ia.peer_id()))));
     let eb = Arc::new(Engine::new(ib.clone(), vault, sb, Arc::new(board.endpoint(ib.peer_id()))));
@@ -62,11 +65,14 @@ async fn transitive_learn_adds_a_dynamic_route_under_strict_routing() {
     let mut sa = Store::open(da.path(), ia.clone()).unwrap();
     let mut sb = Store::open(db.path(), ib.clone()).unwrap();
     let mut sc = Store::open(dc.path(), ic.clone()).unwrap();
+    sa.declare_founder(Role::Admin).unwrap();
+    sb.declare_founder(Role::Admin).unwrap();
+    sc.declare_founder(Role::Admin).unwrap();
     // B (the hub) vouches for A and C; A and C each only know B.
-    sb.add_peer(ia.peer_id(), ia.verifying_key().to_bytes()).unwrap();
-    sb.add_peer(ic.peer_id(), ic.verifying_key().to_bytes()).unwrap();
-    sa.add_peer(ib.peer_id(), ib.verifying_key().to_bytes()).unwrap();
-    sc.add_peer(ib.peer_id(), ib.verifying_key().to_bytes()).unwrap();
+    sb.add_peer(ia.peer_id(), ia.verifying_key().to_bytes(), Role::Admin).unwrap();
+    sb.add_peer(ic.peer_id(), ic.verifying_key().to_bytes(), Role::Admin).unwrap();
+    sa.add_peer(ib.peer_id(), ib.verifying_key().to_bytes(), Role::Admin).unwrap();
+    sc.add_peer(ib.peer_id(), ib.verifying_key().to_bytes(), Role::Admin).unwrap();
 
     // Strict routes: A and C initially reach only B; B reaches A and C. A and C
     // must learn to reach each other dynamically for the C edit to arrive.
@@ -104,8 +110,10 @@ async fn revoked_peer_edits_stop_propagating() {
     let (ia, ib) = (Identity::generate(), Identity::generate());
     let mut sa = Store::open(da.path(), ia.clone()).unwrap();
     let mut sb = Store::open(db.path(), ib.clone()).unwrap();
-    sa.add_peer(ib.peer_id(), ib.verifying_key().to_bytes()).unwrap();
-    sb.add_peer(ia.peer_id(), ia.verifying_key().to_bytes()).unwrap();
+    sa.declare_founder(Role::Admin).unwrap();
+    sb.declare_founder(Role::Admin).unwrap();
+    sa.add_peer(ib.peer_id(), ib.verifying_key().to_bytes(), Role::Admin).unwrap();
+    sb.add_peer(ia.peer_id(), ia.verifying_key().to_bytes(), Role::Admin).unwrap();
 
     let ea = Arc::new(Engine::new(ia.clone(), vault, sa, Arc::new(board.endpoint(ia.peer_id()))));
     let eb = Arc::new(Engine::new(ib.clone(), vault, sb, Arc::new(board.endpoint(ib.peer_id()))));

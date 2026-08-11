@@ -34,7 +34,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use roam_files::{container_id, EntryStatus, FileEntry, FolderBridge, SyncOutcome, FILESET_MAP_ID};
-use roam_storage::{Identity, Store, VaultId};
+use roam_storage::{Identity, Role, Store, VaultId};
 use roam_sync_core::engine::Engine;
 use roam_transport_iroh::IrohTransport;
 use tempfile::TempDir;
@@ -152,12 +152,15 @@ async fn real_folder_create_delete_rename_syncs_over_iroh() {
 
     let mut store_a = Store::open(store_dir_a.path(), identity_a.clone()).unwrap();
     let mut store_b = Store::open(store_dir_b.path(), identity_b.clone()).unwrap();
+    // Each device founds its own vault as admin so its own `add_peer` vouches fold.
+    store_a.declare_founder(Role::Admin).unwrap();
+    store_b.declare_founder(Role::Admin).unwrap();
     // Cross-trust: each device vouches for the other in its roster.
     store_a
-        .add_peer(identity_b.peer_id(), identity_b.verifying_key().to_bytes())
+        .add_peer(identity_b.peer_id(), identity_b.verifying_key().to_bytes(), Role::Admin)
         .unwrap();
     store_b
-        .add_peer(identity_a.peer_id(), identity_a.verifying_key().to_bytes())
+        .add_peer(identity_a.peer_id(), identity_a.verifying_key().to_bytes(), Role::Admin)
         .unwrap();
 
     // Transport routes: each transport knows the other peer's key.

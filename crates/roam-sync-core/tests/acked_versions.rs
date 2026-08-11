@@ -6,7 +6,7 @@
 //! Have never regresses a peer's acked version). These tests drive real Have
 //! frames over the in-memory transport and assert the recorded versions.
 
-use roam_storage::{version_dominates, Identity, Store, VaultId};
+use roam_storage::{version_dominates, Identity, Role, Store, VaultId};
 use roam_sync_core::engine::Engine;
 use roam_sync_core::frame::Frame;
 use roam_sync_core::memory::MemorySwitchboard;
@@ -17,7 +17,7 @@ use tempfile::tempdir;
 /// Seed `store`'s roster so it vouches for `peer`.
 fn seed(store: &mut Store, peer: &Identity) {
     store
-        .add_peer(peer.peer_id(), peer.verifying_key().to_bytes())
+        .add_peer(peer.peer_id(), peer.verifying_key().to_bytes(), Role::Admin)
         .unwrap();
 }
 
@@ -32,6 +32,8 @@ async fn engine_records_and_advances_peer_acked_version() {
 
     let mut sa = Store::open(da.path(), ia.clone()).unwrap();
     let mut sb = Store::open(db.path(), ib.clone()).unwrap();
+    sa.declare_founder(Role::Admin).unwrap();
+    sb.declare_founder(Role::Admin).unwrap();
     seed(&mut sa, &ib);
     seed(&mut sb, &ia);
 

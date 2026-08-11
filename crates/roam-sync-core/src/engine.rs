@@ -320,12 +320,18 @@ impl<T: Transport + 'static> Engine<T> {
             })
     }
 
+    /// The set of peers with a live session right now (distinct from roster
+    /// membership). For consumers building a member table alongside `Store::roster()`.
+    pub async fn connected_peers(&self) -> std::collections::HashSet<u64> {
+        self.connected.lock().await.clone()
+    }
+
     /// Vouch for `peer` (holding `key`) locally, then gossip the updated roster
     /// to every connected peer so they learn the new device (transitive mesh).
-    pub async fn add_peer(&self, peer: u64, key: [u8; 32]) -> anyhow::Result<()> {
+    pub async fn add_peer(&self, peer: u64, key: [u8; 32], role: roam_storage::Role) -> anyhow::Result<()> {
         {
             let mut store = self.store.lock().await;
-            store.add_peer(peer, key)?;
+            store.add_peer(peer, key, role)?;
         }
         // Teach the transport how to reach the new device before we gossip.
         self.transport.add_route(peer, key).await;
@@ -811,7 +817,30 @@ impl<T: Transport + 'static> Engine<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::{blob_fits_frame, MAX_BLOB_BYTES};
+    use super::{blob_fits_frame, Engine, MAX_BLOB_BYTES};
+    use crate::memory::MemorySwitchboard;
+    use roam_storage::{Identity, Store, VaultId};
+    use std::sync::Arc;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn connected_peers_starts_empty_and_is_exposed() {
+        // Construct an Engine exactly as the integration engine tests do
+        // (MemoryTransport endpoint + a freshly opened store). A brand-new
+        // engine has established no sessions, so its connected set is empty.
+        let board = MemorySwitchboard::new();
+        let vault = VaultId::generate();
+        let dir = tempdir().unwrap();
+        let identity = Identity::generate();
+        let store = Store::open(dir.path(), identity.clone()).unwrap();
+        let engine = Engine::new(
+            identity.clone(),
+            vault,
+            store,
+            Arc::new(board.endpoint(identity.peer_id())),
+        );
+        assert!(engine.connected_peers().await.is_empty());
+    }
 
     #[test]
     fn blob_fits_frame_decides_at_the_cap_boundary() {

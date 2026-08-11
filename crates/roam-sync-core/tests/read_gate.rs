@@ -3,7 +3,7 @@
 //! mesh-wide, not only on the write path).
 
 use futures::StreamExt;
-use roam_storage::{Identity, Store, VaultId};
+use roam_storage::{Identity, Role, Store, VaultId};
 use roam_sync_core::engine::Engine;
 use roam_sync_core::frame::Frame;
 use roam_sync_core::memory::MemorySwitchboard;
@@ -21,8 +21,9 @@ async fn a_does_not_reply_to_a_revoked_peers_have() {
     let _ = db;
 
     let mut sa = Store::open(da.path(), ia.clone()).unwrap();
+    sa.declare_founder(Role::Admin).unwrap();
     // A trusts then revokes B: B is in the roster, but Revoked.
-    sa.add_peer(ib.peer_id(), ib.verifying_key().to_bytes()).unwrap();
+    sa.add_peer(ib.peer_id(), ib.verifying_key().to_bytes(), Role::Admin).unwrap();
     sa.revoke_peer(ib.peer_id(), ib.verifying_key().to_bytes()).unwrap();
     let version = sa.doc_version_bytes();
 
@@ -57,7 +58,8 @@ async fn a_does_reply_to_an_active_peers_have() {
     let _ = db;
 
     let mut sa = Store::open(da.path(), ia.clone()).unwrap();
-    sa.add_peer(ib.peer_id(), ib.verifying_key().to_bytes()).unwrap();
+    sa.declare_founder(Role::Admin).unwrap();
+    sa.add_peer(ib.peer_id(), ib.verifying_key().to_bytes(), Role::Admin).unwrap();
     let version = sa.doc_version_bytes();
 
     let ea = Arc::new(Engine::new(

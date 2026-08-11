@@ -7,11 +7,21 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-/// A membership change. Basic revocation only in Slice 2 (stop accepting a
-/// peer's ops); key rotation / compromise-recovery is deferred.
+/// A client role, ordered ascending by privilege so that `Ord`'s `min()`
+/// selects the LEAST privilege: Reader < Writer < Admin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum Role {
+    Reader,
+    Writer,
+    Admin,
+}
+
+/// A membership change under the grant-certificate model. `Add`/`SetRole` carry
+/// the role the author intends for the subject; `Revoke` is terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RosterOp {
-    Add,
+    Add { role: Role },
+    SetRole { role: Role },
     Revoke,
 }
 
@@ -42,17 +52,28 @@ impl RosterEntry {
     /// across encode/decode (do not sign the JSON — field order/formatting is
     /// not guaranteed).
     pub fn canonical_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(1 + 8 + 1 + 8 + 32 + 8);
-        buf.extend_from_slice(b"roam.roster.v1");
+        let mut buf = Vec::with_capacity(1 + 8 + 2 + 8 + 32 + 8);
+        buf.extend_from_slice(b"roam.roster.v2");
         buf.extend_from_slice(&self.seq.to_le_bytes());
-        buf.push(match self.op {
-            RosterOp::Add => 0,
-            RosterOp::Revoke => 1,
-        });
+        let (op_tag, role_tag) = match self.op {
+            RosterOp::Add { role } => (0u8, role_byte(role)),
+            RosterOp::SetRole { role } => (2u8, role_byte(role)),
+            RosterOp::Revoke => (1u8, 0xFF),
+        };
+        buf.push(op_tag);
+        buf.push(role_tag);
         buf.extend_from_slice(&self.subject_peer.to_le_bytes());
         buf.extend_from_slice(&self.subject_key);
         buf.extend_from_slice(&self.added_by.to_le_bytes());
         buf
+    }
+}
+
+fn role_byte(role: Role) -> u8 {
+    match role {
+        Role::Reader => 0,
+        Role::Writer => 1,
+        Role::Admin => 2,
     }
 }
 
@@ -70,38 +91,88 @@ pub struct PeerRecord {
     /// ed25519 verifying key == iroh NodeId.
     pub verifying_key: [u8; 32],
     pub status: PeerStatus,
+    pub role: Role,
 }
 
-/// Fold a set of verified roster entries into the current peer set. Later
-/// entries (by any author) win: a `Revoke` after an `Add` yields `Revoked`.
-/// Entries are applied in a deterministic order: (subject_peer, added_by, seq).
-pub fn merge_roster(entries: &mut [RosterEntry]) -> Vec<PeerRecord> {
-    use std::collections::BTreeMap;
-    entries.sort_by_key(|e| (e.subject_peer, e.added_by, e.seq));
-    let mut out: BTreeMap<u64, PeerRecord> = BTreeMap::new();
-    for e in entries.iter() {
-        // Defense against a malicious trusted author injecting a mismatched
-        // entry: every peer_id MUST be the first 8 LE bytes of its key. Drop
-        // (don't brick the whole log on) an entry that breaks that binding.
-        if e.subject_peer != u64::from_le_bytes(e.subject_key[0..8].try_into().unwrap()) {
-            continue;
+/// Fold a set of signed roster entries into the current peer set using the
+/// grant-certificate model. Purely a function of the signed entry set (no causal
+/// metadata): `ever_admin` is a monotone closure seeded by `founder`; a `Revoke`
+/// by any `ever_admin` peer is terminal (prefer-deny); the role is the
+/// least-privilege combination of each `ever_admin` author's latest intent.
+pub fn merge_roster(entries: &mut [RosterEntry], founder: Option<u64>) -> Vec<PeerRecord> {
+    use std::collections::{BTreeMap, HashMap, HashSet};
+    let valid: Vec<&RosterEntry> = entries
+        .iter()
+        .filter(|e| e.subject_peer == u64::from_le_bytes(e.subject_key[0..8].try_into().unwrap()))
+        .collect();
+    let mut ever_admin: HashSet<u64> = HashSet::new();
+    if let Some(f) = founder {
+        ever_admin.insert(f);
+    }
+    loop {
+        let before = ever_admin.len();
+        for e in &valid {
+            let grants_admin = matches!(
+                e.op,
+                RosterOp::Add { role: Role::Admin } | RosterOp::SetRole { role: Role::Admin }
+            );
+            if grants_admin && ever_admin.contains(&e.added_by) {
+                ever_admin.insert(e.subject_peer);
+            }
         }
-        let rec = out.entry(e.subject_peer).or_insert(PeerRecord {
-            peer_id: e.subject_peer,
-            verifying_key: e.subject_key,
-            status: PeerStatus::Active,
-        });
-        rec.verifying_key = e.subject_key;
-        // Revocation is terminal in Slice 2 (prefer-deny): once ANY trusted
-        // author revokes a subject, no later Add from any author resurrects it.
-        // Key rotation / un-revoke is deferred. This makes status order-independent
-        // (`seq` is per-author, so it cannot order cross-author entries) and blocks
-        // the stolen-device attack where a stale Add masks a Revoke.
-        if e.op == RosterOp::Revoke {
-            rec.status = PeerStatus::Revoked;
+        if ever_admin.len() == before {
+            break;
         }
     }
-    out.into_values().collect()
+    let mut keys: BTreeMap<u64, [u8; 32]> = BTreeMap::new();
+    let mut revoked: HashSet<u64> = HashSet::new();
+    let mut intents: BTreeMap<u64, HashMap<u64, (u64, Role)>> = BTreeMap::new();
+    for e in valid.iter().filter(|e| ever_admin.contains(&e.added_by)) {
+        keys.entry(e.subject_peer)
+            .and_modify(|k| {
+                if e.subject_key < *k {
+                    *k = e.subject_key;
+                }
+            })
+            .or_insert(e.subject_key);
+        match e.op {
+            RosterOp::Revoke => {
+                revoked.insert(e.subject_peer);
+            }
+            RosterOp::Add { role } | RosterOp::SetRole { role } => {
+                let per = intents.entry(e.subject_peer).or_default();
+                let slot = per.entry(e.added_by).or_insert((0, Role::Reader));
+                match e.seq.cmp(&slot.0) {
+                    std::cmp::Ordering::Greater => *slot = (e.seq, role),
+                    std::cmp::Ordering::Equal => slot.1 = slot.1.min(role),
+                    std::cmp::Ordering::Less => {}
+                }
+            }
+        }
+    }
+    let mut out: Vec<PeerRecord> = intents
+        .iter()
+        .map(|(subject, per_author)| {
+            let role = per_author
+                .values()
+                .map(|(_, r)| *r)
+                .min()
+                .unwrap_or(Role::Reader);
+            let status = if revoked.contains(subject) {
+                PeerStatus::Revoked
+            } else {
+                PeerStatus::Active
+            };
+            PeerRecord {
+                peer_id: *subject,
+                verifying_key: keys[subject],
+                status,
+                role,
+            }
+        })
+        .collect();
+    out.sort_by_key(|p| p.peer_id);
+    out
 }
 
 /// An append-only, per-device signed roster log (`<dir>/roster-<peer>.jsonl`).
@@ -192,6 +263,37 @@ impl RosterLog {
         Ok(entry)
     }
 
+    /// Peek the key this log's author vouches for ITSELF: the `subject_key` of the
+    /// first entry whose `subject_peer == author` (a self-`Add`). Read WITHOUT
+    /// verification — the caller derives the peer-id binding and re-verifies the
+    /// whole log against this key before trusting it. Used to bootstrap trust in a
+    /// pinned founder whose self-signed log is the only proof of its key. Returns
+    /// `None` if the log is absent or carries no self entry.
+    pub fn peek_self_key(&self) -> Result<Option<[u8; 32]>, StorageError> {
+        let text = match std::fs::read_to_string(&self.path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        for line in text.lines().filter(|l| !l.trim().is_empty()) {
+            let parsed: RosterLine = match serde_json::from_str(line) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            if parsed.subject_peer != self.author {
+                continue;
+            }
+            let key_bytes = match B64.decode(parsed.subject_key.as_bytes()) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            if let Ok(arr) = <[u8; 32]>::try_from(key_bytes) {
+                return Ok(Some(arr));
+            }
+        }
+        Ok(None)
+    }
+
     /// Read every entry, verifying each signature against `key` (the author's).
     /// Same fail-closed + torn-tail rules as `OpLog::read_verified`.
     pub fn read_verified(&self, key: &VerifyingKey) -> Result<Vec<RosterEntry>, StorageError> {
@@ -272,6 +374,52 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    /// A subject/key pair whose `peer_id` derives from the key's first 8 LE bytes.
+    fn pid(k: u8) -> (u64, [u8; 32]) {
+        let key = [k; 32];
+        (u64::from_le_bytes(key[0..8].try_into().unwrap()), key)
+    }
+
+    #[test]
+    fn duplicate_seq_role_conflict_is_order_independent() {
+        let (f, fk) = pid(1);
+        let (b, bk) = pid(2);
+        // Two same-author (founder) entries for b at the SAME seq, different roles.
+        let e_admin = RosterEntry {
+            seq: 2,
+            op: RosterOp::SetRole { role: Role::Admin },
+            subject_peer: b,
+            subject_key: bk,
+            added_by: f,
+        };
+        let e_reader = RosterEntry {
+            seq: 2,
+            op: RosterOp::SetRole { role: Role::Reader },
+            subject_peer: b,
+            subject_key: bk,
+            added_by: f,
+        };
+        let seed = RosterEntry {
+            seq: 1,
+            op: RosterOp::Add { role: Role::Admin },
+            subject_peer: f,
+            subject_key: fk,
+            added_by: f,
+        };
+        let mut order1 = vec![seed.clone(), e_admin.clone(), e_reader.clone()];
+        let mut order2 = vec![seed, e_reader, e_admin];
+        let r1 = merge_roster(&mut order1, Some(f));
+        let r2 = merge_roster(&mut order2, Some(f));
+        let role1 = r1.iter().find(|p| p.peer_id == b).unwrap().role;
+        let role2 = r2.iter().find(|p| p.peer_id == b).unwrap().role;
+        assert_eq!(role1, role2, "same set, different order → same result");
+        assert_eq!(
+            role1,
+            Role::Reader,
+            "equal-seq tie resolves to least privilege"
+        );
+    }
+
     #[test]
     fn merge_roster_drops_a_mismatched_peer_id_entry() {
         let a = Identity::generate();
@@ -282,7 +430,7 @@ mod tests {
             // Honest entry: peer_id derives from the key.
             RosterEntry {
                 seq: 1,
-                op: RosterOp::Add,
+                op: RosterOp::Add { role: Role::Admin },
                 subject_peer: b.peer_id(),
                 subject_key: b_key,
                 added_by: a.peer_id(),
@@ -290,15 +438,94 @@ mod tests {
             // Poisoned entry: peer_id does NOT derive from the key.
             RosterEntry {
                 seq: 2,
-                op: RosterOp::Add,
+                op: RosterOp::Add { role: Role::Admin },
                 subject_peer: b.peer_id().wrapping_add(999),
                 subject_key: b_key,
                 added_by: a.peer_id(),
             },
         ];
-        let merged = merge_roster(&mut entries);
+        let merged = merge_roster(&mut entries, Some(a.peer_id()));
         assert_eq!(merged.len(), 1, "the mismatched entry must be dropped");
         assert_eq!(merged[0].peer_id, b.peer_id());
+    }
+
+    #[test]
+    fn founder_self_add_seeds_admin_but_other_self_add_does_not() {
+        let (f, f_key) = pid(10);
+        let (b, b_key) = pid(20);
+        let mut entries = vec![
+            RosterEntry { seq: 1, op: RosterOp::Add { role: Role::Admin }, subject_peer: f, subject_key: f_key, added_by: f },
+            RosterEntry { seq: 1, op: RosterOp::Add { role: Role::Admin }, subject_peer: b, subject_key: b_key, added_by: b },
+        ];
+        let peers = merge_roster(&mut entries, Some(f));
+        let frec = peers.iter().find(|p| p.peer_id == f).unwrap();
+        assert_eq!(frec.role, Role::Admin);
+        assert!(peers.iter().all(|p| p.peer_id != b), "self-add cannot bootstrap admin");
+    }
+
+    #[test]
+    fn non_admin_grant_has_no_effect() {
+        let (f, f_key) = pid(10);
+        let (w, w_key) = pid(20);
+        let (c, c_key) = pid(30);
+        let mut entries = vec![
+            RosterEntry { seq: 1, op: RosterOp::Add { role: Role::Admin }, subject_peer: f, subject_key: f_key, added_by: f },
+            RosterEntry { seq: 2, op: RosterOp::Add { role: Role::Writer }, subject_peer: w, subject_key: w_key, added_by: f },
+            RosterEntry { seq: 1, op: RosterOp::Add { role: Role::Admin }, subject_peer: c, subject_key: c_key, added_by: w },
+        ];
+        let peers = merge_roster(&mut entries, Some(f));
+        assert!(peers.iter().all(|p| p.peer_id != c), "a non-admin cannot grant anything");
+    }
+
+    #[test]
+    fn concurrent_setrole_resolves_to_least_privilege() {
+        let (f, f_key) = pid(10);
+        let (a2, a2_key) = pid(20);
+        let (b, b_key) = pid(30);
+        let mut entries = vec![
+            RosterEntry { seq: 1, op: RosterOp::Add { role: Role::Admin }, subject_peer: f, subject_key: f_key, added_by: f },
+            RosterEntry { seq: 2, op: RosterOp::Add { role: Role::Admin }, subject_peer: a2, subject_key: a2_key, added_by: f },
+            RosterEntry { seq: 3, op: RosterOp::Add { role: Role::Admin }, subject_peer: b, subject_key: b_key, added_by: f },
+            RosterEntry { seq: 1, op: RosterOp::SetRole { role: Role::Reader }, subject_peer: b, subject_key: b_key, added_by: a2 },
+        ];
+        let peers = merge_roster(&mut entries, Some(f));
+        let brec = peers.iter().find(|p| p.peer_id == b).unwrap();
+        assert_eq!(brec.role, Role::Reader);
+    }
+
+    #[test]
+    fn grandfathered_grant_survives_granter_demotion_and_revocation() {
+        let (a, a_key) = pid(10);
+        let (b, b_key) = pid(20);
+        let (c, c_key) = pid(30);
+        let mut entries = vec![
+            RosterEntry { seq: 1, op: RosterOp::Add { role: Role::Admin }, subject_peer: a, subject_key: a_key, added_by: a },
+            RosterEntry { seq: 2, op: RosterOp::Add { role: Role::Admin }, subject_peer: b, subject_key: b_key, added_by: a },
+            RosterEntry { seq: 1, op: RosterOp::Add { role: Role::Admin }, subject_peer: c, subject_key: c_key, added_by: b },
+            RosterEntry { seq: 3, op: RosterOp::SetRole { role: Role::Reader }, subject_peer: b, subject_key: b_key, added_by: a },
+            RosterEntry { seq: 4, op: RosterOp::Revoke, subject_peer: b, subject_key: b_key, added_by: a },
+        ];
+        let peers = merge_roster(&mut entries, Some(a));
+        let brec = peers.iter().find(|p| p.peer_id == b).unwrap();
+        assert_eq!(brec.role, Role::Reader);
+        assert_eq!(brec.status, PeerStatus::Revoked);
+        let crec = peers.iter().find(|p| p.peer_id == c).unwrap();
+        assert_eq!(crec.role, Role::Admin);
+        assert_eq!(crec.status, PeerStatus::Active);
+    }
+
+    #[test]
+    fn same_author_latest_seq_intent_wins() {
+        let (f, f_key) = pid(10);
+        let (b, b_key) = pid(20);
+        let mut entries = vec![
+            RosterEntry { seq: 1, op: RosterOp::Add { role: Role::Admin }, subject_peer: f, subject_key: f_key, added_by: f },
+            RosterEntry { seq: 2, op: RosterOp::Add { role: Role::Reader }, subject_peer: b, subject_key: b_key, added_by: f },
+            RosterEntry { seq: 3, op: RosterOp::SetRole { role: Role::Writer }, subject_peer: b, subject_key: b_key, added_by: f },
+        ];
+        let peers = merge_roster(&mut entries, Some(f));
+        let brec = peers.iter().find(|p| p.peer_id == b).unwrap();
+        assert_eq!(brec.role, Role::Writer);
     }
 
     #[test]
@@ -309,7 +536,7 @@ mod tests {
         let log = RosterLog::new(dir.path(), a.peer_id());
 
         let e1 = log
-            .append(&a, RosterOp::Add, b.peer_id(), b.verifying_key().to_bytes())
+            .append(&a, RosterOp::Add { role: Role::Admin }, b.peer_id(), b.verifying_key().to_bytes())
             .unwrap();
         assert_eq!(e1.seq, 1);
         let e2 = log
@@ -319,7 +546,7 @@ mod tests {
 
         let entries = log.read_verified(&a.verifying_key()).unwrap();
         assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].op, RosterOp::Add);
+        assert_eq!(entries[0].op, RosterOp::Add { role: Role::Admin });
         assert_eq!(entries[1].op, RosterOp::Revoke);
         assert_eq!(entries[0].subject_peer, b.peer_id());
     }
@@ -330,7 +557,7 @@ mod tests {
         let a = Identity::generate();
         let b = Identity::generate();
         let log = RosterLog::new(dir.path(), a.peer_id());
-        log.append(&a, RosterOp::Add, b.peer_id(), b.verifying_key().to_bytes())
+        log.append(&a, RosterOp::Add { role: Role::Admin }, b.peer_id(), b.verifying_key().to_bytes())
             .unwrap();
 
         // Flip subject_peer, keep the old signature -> must fail verification.
@@ -353,12 +580,12 @@ mod tests {
         // drops the entry; this test is about revoke terminality, not the binding.
         let x = u64::from_le_bytes(key[0..8].try_into().unwrap());
         let mut entries = vec![
-            RosterEntry { seq: 1, op: RosterOp::Add,    subject_peer: x, subject_key: key, added_by: 1 },
+            RosterEntry { seq: 1, op: RosterOp::Add { role: Role::Writer }, subject_peer: x, subject_key: key, added_by: 1 },
             RosterEntry { seq: 2, op: RosterOp::Revoke, subject_peer: x, subject_key: key, added_by: 1 },
             // Stale Add from a DIFFERENT, higher-id author must NOT resurrect X.
-            RosterEntry { seq: 1, op: RosterOp::Add,    subject_peer: x, subject_key: key, added_by: 2 },
+            RosterEntry { seq: 1, op: RosterOp::Add { role: Role::Writer }, subject_peer: x, subject_key: key, added_by: 2 },
         ];
-        let peers = merge_roster(&mut entries);
+        let peers = merge_roster(&mut entries, Some(1));
         let rec = peers.iter().find(|p| p.peer_id == x).unwrap();
         assert_eq!(rec.status, PeerStatus::Revoked, "revocation must be terminal across authors");
     }
@@ -370,7 +597,7 @@ mod tests {
         let other = Identity::generate();
         let log = RosterLog::new(dir.path(), a.peer_id());
         // `other` is not this log's author -> append must refuse.
-        let err = log.append(&other, RosterOp::Add, 7, [0u8; 32]);
+        let err = log.append(&other, RosterOp::Add { role: Role::Reader }, 7, [0u8; 32]);
         assert!(matches!(err, Err(StorageError::Peer(_))));
     }
 
@@ -380,7 +607,7 @@ mod tests {
         let a = Identity::generate();
         let b = Identity::generate();
         let log = RosterLog::new(dir.path(), a.peer_id());
-        log.append(&a, RosterOp::Add, b.peer_id(), b.verifying_key().to_bytes())
+        log.append(&a, RosterOp::Add { role: Role::Admin }, b.peer_id(), b.verifying_key().to_bytes())
             .unwrap();
 
         let mut f = std::fs::OpenOptions::new()

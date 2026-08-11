@@ -1,6 +1,6 @@
 //! End-to-end (no network): create a file, snapshot, delete it, restore it.
 use roam_files::FolderBridge;
-use roam_storage::{Identity, Store};
+use roam_storage::{Identity, Role, Store};
 
 /// The CLI's meta-dir convention: internal sidecars/blob-markers live under
 /// `<vault>/filemeta`, OUTSIDE the user's synced folder (mirrors the `sync`
@@ -17,6 +17,8 @@ fn delete_then_restore_recovers_content() {
     std::fs::create_dir_all(&folder).unwrap();
 
     let mut store = Store::open(&vault, Identity::generate()).unwrap();
+    // Found the vault as admin so local writes (import) are permitted (not ReadOnly).
+    store.declare_founder(Role::Admin).unwrap();
     let bridge = bridge_for(&folder, &vault);
 
     let file = folder.join("secret.txt");
@@ -48,6 +50,8 @@ fn checkpoint_to_latest_preserves_state_across_reopen() {
     let file = folder.join("keep.txt");
     {
         let mut store = Store::open(&vault, Identity::load(&id_path).unwrap()).unwrap();
+        // Found the vault as admin so local writes (import) are permitted.
+        store.declare_founder(Role::Admin).unwrap();
         let bridge = bridge_for(&folder, &vault);
         std::fs::write(&file, "kept").unwrap();
         bridge.import_file(&mut store, &file).unwrap();
