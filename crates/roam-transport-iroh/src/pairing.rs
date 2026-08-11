@@ -140,10 +140,12 @@ pub struct JoinAccept {
     /// The shared vault key (backend decryption secret). Only ever sent here,
     /// after the joiner's proof verifies, over the encrypted pairing stream.
     pub vault_key: [u8; 32],
-    /// The author of `roster_jsonl` (A's peer id).
-    pub roster_author: u64,
-    /// A's signed roster log, so B learns A's siblings (transitive mesh).
-    pub roster_jsonl: Vec<u8>,
+    /// A's TRANSITIVE roster: every roster log the host holds, keyed by author
+    /// peer id. This includes the founder chain the host received when it joined
+    /// (e.g. `roster-<founder>.jsonl`) plus the host's own log, so a joiner behind
+    /// a non-founder admin folds the full founder->host->joiner chain. Verified
+    /// per-author during the joiner's roster fold, not here.
+    pub rosters: Vec<(u64, Vec<u8>)>,
     /// The host's signed key-log (author = `keylog_author`), so the joiner learns
     /// the epoch DAG and any wraps addressed to it. Empty for an un-rotated vault.
     pub keylog_author: u64,
@@ -302,8 +304,10 @@ impl PairingHost<'_> {
         let accept = JoinAccept {
             vault: self.vault.0,
             vault_key: self.vault_key,
-            roster_author: self.identity.peer_id(),
-            roster_jsonl: self.store.export_own_roster().context("export own roster")?,
+            rosters: self
+                .store
+                .export_all_rosters()
+                .context("export transitive roster")?,
             keylog_author: self.identity.peer_id(),
             keylog_jsonl: self.store.export_own_keylog().context("export own keylog")?,
             founder,
@@ -393,14 +397,16 @@ async fn run_join(
     store
         .pin_founder(accept.founder)
         .context("pin founder delivered by host")?;
-    // Import the host's signed roster so we learn its self-`Add` (proves its
-    // admin role) and the `Add{role}` it authored for us, plus its siblings
-    // (transitive mesh). The host's key from the token authenticates its roster.
+    // Import the host's TRANSITIVE roster so we learn the founder's self-`Add`
+    // (proves its admin role and anchors the fold), the host's own log, and the
+    // `Add{role}` the host authored for us — the full founder->host->joiner chain.
+    // Each author's log is verified against the roster-vouched key during our fold
+    // (`rebuild_peers`); the founder pin above anchors trust in the founder.
     let host_key = VerifyingKey::from_bytes(&token.verifying_key)
         .context("token carried a malformed host key")?;
     store
-        .import_roster(accept.roster_author, &host_key, accept.roster_jsonl)
-        .context("import host roster")?;
+        .import_roster_bundle(accept.rosters)
+        .context("import host transitive roster")?;
     // Import the host's key-log so we learn the epoch DAG and any wraps addressed
     // to us (the host published them via backfill during accept). Authenticated by
     // the same host key as the roster.

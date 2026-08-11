@@ -203,7 +203,10 @@ impl Store {
                 Err(_) => continue,
             };
             let log = RosterLog::new(&roster_dir, author);
-            let entries = log.read_verified(&author_key)?;
+            let entries = match log.read_verified(&author_key) {
+                Ok(e) => e,
+                Err(_) => continue, // a corrupt/forged log for one author must not brick the roster
+            };
             for entry in &entries {
                 // Learn subject keys this author vouches for (Add or Revoke both
                 // carry the key; a later fixpoint pass never removes trust).
@@ -580,6 +583,63 @@ impl Store {
         // Verify BEFORE persisting: a forged/tampered roster must never touch disk.
         roster_log.verify_bytes(key, &bytes)?;
         std::fs::write(&roster_path, &bytes)?;
+        self.refresh_peers()
+    }
+
+    /// The raw bytes of EVERY roster log this device holds, keyed by author
+    /// peer id. This is the TRANSITIVE roster the host ships at pairing: a
+    /// non-founder admin B holds both `roster-<A>.jsonl` (the founder chain it
+    /// received when it joined) and its own `roster-<B>.jsonl`, so a joiner C can
+    /// fold the full A->B->C chain. Bytes are returned unverified — each trusted
+    /// author's log is verified during the roster fold on the receiving side.
+    pub fn export_all_rosters(&self) -> Result<Vec<(u64, Vec<u8>)>, StorageError> {
+        let roster_dir = self.roster_dir();
+        let mut out = Vec::new();
+        let entries = match std::fs::read_dir(&roster_dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+            Err(e) => return Err(e.into()),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            // Filenames are `roster-<author>.jsonl`; skip anything else.
+            let Some(rest) = name.strip_prefix("roster-") else { continue };
+            let Some(author_str) = rest.strip_suffix(".jsonl") else { continue };
+            let Ok(author) = author_str.parse::<u64>() else { continue };
+            let bytes = std::fs::read(entry.path())?;
+            out.push((author, bytes));
+        }
+        Ok(out)
+    }
+
+    /// Import a bundle of roster logs delivered at pairing (the host's transitive
+    /// roster). Unlike [`Self::import_roster`], the receiver does NOT yet hold each
+    /// author's key, so verification is deferred to the roster fold: we dump the
+    /// raw logs to disk (never overwriting our OWN, never shrinking an existing
+    /// log) and then `refresh_peers` once — `rebuild_peers` verifies each trusted
+    /// author's log as it folds, and skips any that fail.
+    pub fn import_roster_bundle(&mut self, logs: Vec<(u64, Vec<u8>)>) -> Result<(), StorageError> {
+        let roster_dir = self.roster_dir();
+        std::fs::create_dir_all(&roster_dir)?;
+        let me = self.identity.peer_id();
+        for (author, bytes) in logs {
+            // Never overwrite our own roster log with foreign bytes.
+            if author == me {
+                continue;
+            }
+            let roster_log = RosterLog::new(&roster_dir, author);
+            let roster_path = roster_log.path();
+            // Append-only: refuse a shorter/older resend that would truncate newer
+            // entries already on disk.
+            if let Ok(existing) = std::fs::read(&roster_path) {
+                if bytes.len() < existing.len() {
+                    continue;
+                }
+            }
+            std::fs::write(&roster_path, &bytes)?;
+        }
         self.refresh_peers()
     }
 
@@ -1844,6 +1904,36 @@ mod tests {
         let mut store = Store::open(dir.path(), id).unwrap();
         store.declare_founder(Role::Admin).unwrap();
         assert!(store.declare_founder(Role::Admin).is_err());
+    }
+
+    #[test]
+    fn non_founder_admin_can_bootstrap_a_joiner_via_roster_bundle() {
+        // A founds (Admin), grants B Admin.
+        let da = tempfile::tempdir().unwrap();
+        let a = Identity::generate();
+        let mut sa = Store::open(da.path(), a.clone()).unwrap();
+        sa.declare_founder(Role::Admin).unwrap();
+        let b = Identity::generate();
+        sa.add_peer(b.peer_id(), b.verifying_key().to_bytes(), Role::Admin).unwrap();
+
+        // B store: pin founder A, import A's roster bundle, then B (admin) adds C as Reader.
+        let db = tempfile::tempdir().unwrap();
+        let mut sb = Store::open(db.path(), b.clone()).unwrap();
+        sb.pin_founder(a.peer_id()).unwrap();
+        sb.import_roster_bundle(sa.export_all_rosters().unwrap()).unwrap();
+        assert_eq!(sb.self_role(), Some(Role::Admin), "B is admin after bootstrap");
+        let c = Identity::generate();
+        sb.add_peer(c.peer_id(), c.verifying_key().to_bytes(), Role::Reader).unwrap();
+
+        // C store: pin founder A, import B's TRANSITIVE roster bundle (contains A's + B's logs).
+        let dc = tempfile::tempdir().unwrap();
+        let mut sc = Store::open(dc.path(), c.clone()).unwrap();
+        sc.pin_founder(a.peer_id()).unwrap();
+        sc.import_roster_bundle(sb.export_all_rosters().unwrap()).unwrap();
+        assert_eq!(sc.self_role(), Some(Role::Reader), "C folds its role via the A->B->C chain");
+        // C trusts A and B in its roster:
+        assert!(sc.role_of(a.peer_id()).is_some());
+        assert!(sc.role_of(b.peer_id()).is_some());
     }
 
     #[test]
