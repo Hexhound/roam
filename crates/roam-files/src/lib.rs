@@ -21,7 +21,7 @@ pub use fileset::{EntryKind, EntryStatus, FileEntry, FILESET_MAP_ID};
 pub use rebase::Conflict;
 // Re-exported so consumers can construct a `FolderBridge` without depending on
 // `roam-storage` directly.
-pub use roam_storage::Identity;
 pub use path::{container_id, key_to_path};
+pub use roam_storage::Identity;
 pub use sidecar::{sidecar_path, text_hash, Sidecar};
 pub use textdiff::{diff_to_ops, TextOp};

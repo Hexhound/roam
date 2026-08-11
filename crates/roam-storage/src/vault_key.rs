@@ -44,7 +44,13 @@ mod tests {
 
         // Freeze the exact byte values so an accidental label edit is caught here
         // (changing a label would orphan every existing vault).
-        assert_eq!(id_a, blake3::derive_key("roam-backend-client id-derivation v1", &vk));
-        assert_eq!(aead_a, blake3::derive_key("roam-backend-client aead v1", &vk));
+        assert_eq!(
+            id_a,
+            blake3::derive_key("roam-backend-client id-derivation v1", &vk)
+        );
+        assert_eq!(
+            aead_a,
+            blake3::derive_key("roam-backend-client aead v1", &vk)
+        );
     }
 }

@@ -221,10 +221,18 @@ fn two_bridges_converge_via_store_merge() {
         // drops ops authored by a non-Writer, so the neutral merge store
         // self-founds as Admin and vouches A/B as Writers to accept their ops.
         m.declare_founder(Role::Admin).unwrap();
-        m.add_peer(id_a.peer_id(), id_a.verifying_key().to_bytes(), Role::Writer)
-            .unwrap();
-        m.add_peer(id_b.peer_id(), id_b.verifying_key().to_bytes(), Role::Writer)
-            .unwrap();
+        m.add_peer(
+            id_a.peer_id(),
+            id_a.verifying_key().to_bytes(),
+            Role::Writer,
+        )
+        .unwrap();
+        m.add_peer(
+            id_b.peer_id(),
+            id_b.verifying_key().to_bytes(),
+            Role::Writer,
+        )
+        .unwrap();
     }
 
     // m1: A then B.

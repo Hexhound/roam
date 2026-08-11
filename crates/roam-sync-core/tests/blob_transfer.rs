@@ -60,10 +60,21 @@ async fn pull_round_trip_transfers_blob_bytes_and_fires_changed() {
     assert!(!sb.blobs().has(&hash), "precondition: B lacks the bytes");
 
     // A records the `Blob` entry-ref in the file-set map (rides the op-log).
-    sa.set_entry(FILESET_MAP_ID, "file-1", &blob_entry_value(&hash)).unwrap();
+    sa.set_entry(FILESET_MAP_ID, "file-1", &blob_entry_value(&hash))
+        .unwrap();
 
-    let ea = Arc::new(Engine::new(ia.clone(), vault, sa, Arc::new(board.endpoint(ia.peer_id()))));
-    let eb = Arc::new(Engine::new(ib.clone(), vault, sb, Arc::new(board.endpoint(ib.peer_id()))));
+    let ea = Arc::new(Engine::new(
+        ia.clone(),
+        vault,
+        sa,
+        Arc::new(board.endpoint(ia.peer_id())),
+    ));
+    let eb = Arc::new(Engine::new(
+        ib.clone(),
+        vault,
+        sb,
+        Arc::new(board.endpoint(ib.peer_id())),
+    ));
     tokio::spawn(ea.clone().run());
     tokio::spawn(eb.clone().run());
 
@@ -85,10 +96,17 @@ async fn pull_round_trip_transfers_blob_bytes_and_fires_changed() {
     eb.request_missing_blobs().await;
 
     let fired = tokio::time::timeout(Duration::from_millis(1000), &mut notified).await;
-    assert!(fired.is_ok(), "changed() did not fire after the blob landed");
+    assert!(
+        fired.is_ok(),
+        "changed() did not fire after the blob landed"
+    );
 
     let bb = eb.store().lock().await.blobs().get(&hash).unwrap();
-    assert_eq!(bb, Some(payload), "B did not receive the correct blob bytes");
+    assert_eq!(
+        bb,
+        Some(payload),
+        "B did not receive the correct blob bytes"
+    );
     assert!(eb.store().lock().await.blobs().has(&hash));
 }
 
@@ -107,14 +125,23 @@ async fn corrupt_blob_data_is_rejected_no_poison() {
     seed(&mut sb, &ia);
     // B genuinely wants this hash (a Live Blob entry references it).
     let claimed = BlobStore::hash(b"the real bytes");
-    sb.set_entry(FILESET_MAP_ID, "file-1", &blob_entry_value(&claimed)).unwrap();
+    sb.set_entry(FILESET_MAP_ID, "file-1", &blob_entry_value(&claimed))
+        .unwrap();
 
-    let eb = Arc::new(Engine::new(ib.clone(), vault, sb, Arc::new(board.endpoint(ib.peer_id()))));
+    let eb = Arc::new(Engine::new(
+        ib.clone(),
+        vault,
+        sb,
+        Arc::new(board.endpoint(ib.peer_id())),
+    ));
 
     // A (trusted) sends bytes that DO NOT hash to `claimed`.
     eb.handle(
         ia.peer_id(),
-        Frame::BlobData { hash: claimed.clone(), bytes: b"WRONG bytes".to_vec() },
+        Frame::BlobData {
+            hash: claimed.clone(),
+            bytes: b"WRONG bytes".to_vec(),
+        },
     )
     .await
     .unwrap();
@@ -137,15 +164,24 @@ async fn a_does_not_serve_a_revoked_peers_blob_want() {
     let mut sa = Store::open(da.path(), ia.clone()).unwrap();
     sa.declare_founder(Role::Admin).unwrap();
     // A trusts then revokes B: B is in the roster, but Revoked.
-    sa.add_peer(ib.peer_id(), ib.verifying_key().to_bytes(), Role::Admin).unwrap();
-    sa.revoke_peer(ib.peer_id(), ib.verifying_key().to_bytes()).unwrap();
+    sa.add_peer(ib.peer_id(), ib.verifying_key().to_bytes(), Role::Admin)
+        .unwrap();
+    sa.revoke_peer(ib.peer_id(), ib.verifying_key().to_bytes())
+        .unwrap();
     let hash = sa.blobs().put(b"secret blob").unwrap();
 
-    let ea = Arc::new(Engine::new(ia.clone(), vault, sa, Arc::new(board.endpoint(ia.peer_id()))));
+    let ea = Arc::new(Engine::new(
+        ia.clone(),
+        vault,
+        sa,
+        Arc::new(board.endpoint(ia.peer_id())),
+    ));
     let tb = board.endpoint(ib.peer_id());
     let mut b_in = tb.incoming();
 
-    ea.handle(ib.peer_id(), Frame::BlobWant { hash }).await.unwrap();
+    ea.handle(ib.peer_id(), Frame::BlobWant { hash })
+        .await
+        .unwrap();
 
     let got = tokio::time::timeout(Duration::from_millis(200), b_in.next()).await;
     assert!(got.is_err(), "A served a blob to a revoked peer: {got:?}");
@@ -162,15 +198,23 @@ async fn a_serves_an_active_peers_blob_want() {
 
     let mut sa = Store::open(da.path(), ia.clone()).unwrap();
     sa.declare_founder(Role::Admin).unwrap();
-    sa.add_peer(ib.peer_id(), ib.verifying_key().to_bytes(), Role::Admin).unwrap();
+    sa.add_peer(ib.peer_id(), ib.verifying_key().to_bytes(), Role::Admin)
+        .unwrap();
     let payload = b"served blob".to_vec();
     let hash = sa.blobs().put(&payload).unwrap();
 
-    let ea = Arc::new(Engine::new(ia.clone(), vault, sa, Arc::new(board.endpoint(ia.peer_id()))));
+    let ea = Arc::new(Engine::new(
+        ia.clone(),
+        vault,
+        sa,
+        Arc::new(board.endpoint(ia.peer_id())),
+    ));
     let tb = board.endpoint(ib.peer_id());
     let mut b_in = tb.incoming();
 
-    ea.handle(ib.peer_id(), Frame::BlobWant { hash: hash.clone() }).await.unwrap();
+    ea.handle(ib.peer_id(), Frame::BlobWant { hash: hash.clone() })
+        .await
+        .unwrap();
 
     let got = tokio::time::timeout(Duration::from_millis(200), b_in.next()).await;
     match got {
@@ -194,15 +238,23 @@ async fn blob_want_for_absent_blob_serves_nothing() {
 
     let mut sa = Store::open(da.path(), ia.clone()).unwrap();
     sa.declare_founder(Role::Admin).unwrap();
-    sa.add_peer(ib.peer_id(), ib.verifying_key().to_bytes(), Role::Admin).unwrap();
+    sa.add_peer(ib.peer_id(), ib.verifying_key().to_bytes(), Role::Admin)
+        .unwrap();
 
-    let ea = Arc::new(Engine::new(ia.clone(), vault, sa, Arc::new(board.endpoint(ia.peer_id()))));
+    let ea = Arc::new(Engine::new(
+        ia.clone(),
+        vault,
+        sa,
+        Arc::new(board.endpoint(ia.peer_id())),
+    ));
     let tb = board.endpoint(ib.peer_id());
     let mut b_in = tb.incoming();
 
     // A valid-shaped hash A does not have.
     let missing = BlobStore::hash(b"A never stored this");
-    ea.handle(ib.peer_id(), Frame::BlobWant { hash: missing }).await.unwrap();
+    ea.handle(ib.peer_id(), Frame::BlobWant { hash: missing })
+        .await
+        .unwrap();
 
     let got = tokio::time::timeout(Duration::from_millis(200), b_in.next()).await;
     assert!(got.is_err(), "A served a blob it does not hold: {got:?}");
@@ -222,9 +274,15 @@ async fn blob_data_for_already_held_blob_is_a_noop() {
     sb.declare_founder(Role::Admin).unwrap();
     seed(&mut sb, &ia);
     let hash = sb.blobs().put(&payload).unwrap();
-    sb.set_entry(FILESET_MAP_ID, "file-1", &blob_entry_value(&hash)).unwrap();
+    sb.set_entry(FILESET_MAP_ID, "file-1", &blob_entry_value(&hash))
+        .unwrap();
 
-    let eb = Arc::new(Engine::new(ib.clone(), vault, sb, Arc::new(board.endpoint(ib.peer_id()))));
+    let eb = Arc::new(Engine::new(
+        ib.clone(),
+        vault,
+        sb,
+        Arc::new(board.endpoint(ib.peer_id())),
+    ));
 
     let changed = eb.changed();
     let notified = changed.notified();
@@ -232,13 +290,19 @@ async fn blob_data_for_already_held_blob_is_a_noop() {
 
     eb.handle(
         ia.peer_id(),
-        Frame::BlobData { hash: hash.clone(), bytes: payload.clone() },
+        Frame::BlobData {
+            hash: hash.clone(),
+            bytes: payload.clone(),
+        },
     )
     .await
     .unwrap();
 
     // Still present, and no change was signalled (nothing new landed).
-    assert_eq!(eb.store().lock().await.blobs().get(&hash).unwrap(), Some(payload));
+    assert_eq!(
+        eb.store().lock().await.blobs().get(&hash).unwrap(),
+        Some(payload)
+    );
     let fired = tokio::time::timeout(Duration::from_millis(150), &mut notified).await;
     assert!(fired.is_err(), "changed() fired for an already-held blob");
 }
@@ -256,9 +320,15 @@ async fn request_missing_blobs_sends_nothing_when_complete() {
     seed(&mut sb, &ia);
     // A Live Blob entry whose bytes B ALREADY holds → nothing is missing.
     let hash = sb.blobs().put(b"complete").unwrap();
-    sb.set_entry(FILESET_MAP_ID, "file-1", &blob_entry_value(&hash)).unwrap();
+    sb.set_entry(FILESET_MAP_ID, "file-1", &blob_entry_value(&hash))
+        .unwrap();
 
-    let eb = Arc::new(Engine::new(ib.clone(), vault, sb, Arc::new(board.endpoint(ib.peer_id()))));
+    let eb = Arc::new(Engine::new(
+        ib.clone(),
+        vault,
+        sb,
+        Arc::new(board.endpoint(ib.peer_id())),
+    ));
     // Raw observer endpoint for A: no engine, just read what B sends.
     let ta = board.endpoint(ia.peer_id());
     let mut a_in = ta.incoming();
@@ -273,5 +343,8 @@ async fn request_missing_blobs_sends_nothing_when_complete() {
     // Nothing missing → no BlobWant (in fact no frame at all).
     eb.request_missing_blobs().await;
     let got = tokio::time::timeout(Duration::from_millis(200), a_in.next()).await;
-    assert!(got.is_err(), "request_missing_blobs sent a frame with nothing missing: {got:?}");
+    assert!(
+        got.is_err(),
+        "request_missing_blobs sent a frame with nothing missing: {got:?}"
+    );
 }

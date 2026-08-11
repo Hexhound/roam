@@ -109,12 +109,7 @@ async fn keylog_gossips_a_rotated_epoch_to_a_trusted_peer() {
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     // B must now be able to open A's rotated epoch via the gossiped key-log.
-    let kc_b = eb
-        .store()
-        .lock()
-        .await
-        .keychain(&id_key, &epoch0)
-        .unwrap();
+    let kc_b = eb.store().lock().await.keychain(&id_key, &epoch0).unwrap();
     assert!(
         kc_b.epoch_key(&epoch).is_some(),
         "B must recover A's rotated epoch key via key-log gossip"

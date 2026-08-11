@@ -110,7 +110,9 @@ impl Identity {
         let raw = B64
             .decode(file.secret_key.as_bytes())
             .map_err(|e| StorageError::Base64(e.to_string()))?;
-        let raw: [u8; 32] = raw.try_into().map_err(|_| StorageError::MalformedIdentity)?;
+        let raw: [u8; 32] = raw
+            .try_into()
+            .map_err(|_| StorageError::MalformedIdentity)?;
         Ok(Self {
             signing_key: SigningKey::from_bytes(&raw),
             peer_id: file.peer_id,
@@ -216,7 +218,11 @@ mod tests {
 
         // Valid JSON, but the secret_key is not valid base64.
         let bad_b64 = dir.path().join("badb64.key");
-        std::fs::write(&bad_b64, br#"{"peer_id":1,"secret_key":"!!!not base64!!!"}"#).unwrap();
+        std::fs::write(
+            &bad_b64,
+            br#"{"peer_id":1,"secret_key":"!!!not base64!!!"}"#,
+        )
+        .unwrap();
         assert!(matches!(
             Identity::load(&bad_b64),
             Err(StorageError::Base64(_))

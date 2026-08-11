@@ -123,8 +123,12 @@ impl Backend for MemoryBackend {
     async fn put_blob(&self, bucket: &str, id: &str, ct: Vec<u8>) -> anyhow::Result<PutOutcome> {
         Ok(put(&self.blobs, bucket, id, ct))
     }
-    async fn reconcile(&self, bucket: &str, kind: SetKind, msg: Vec<u8>)
-        -> anyhow::Result<Vec<u8>> {
+    async fn reconcile(
+        &self,
+        bucket: &str,
+        kind: SetKind,
+        msg: Vec<u8>,
+    ) -> anyhow::Result<Vec<u8>> {
         let set = roam_rbsr::ItemSet::from_ids(self.id_set(bucket, kind));
         roam_rbsr::reconcile_server(&set, &msg).map_err(|e| anyhow::anyhow!(e))
     }

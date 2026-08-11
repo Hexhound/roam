@@ -19,8 +19,10 @@ async fn two_real_endpoints_catch_up_offline_edits() {
     // Each device founds its own vault as admin so its own `add_peer` vouches fold.
     sa.declare_founder(Role::Admin).unwrap();
     sb.declare_founder(Role::Admin).unwrap();
-    sa.add_peer(ib.peer_id(), ib.verifying_key().to_bytes(), Role::Admin).unwrap();
-    sb.add_peer(ia.peer_id(), ia.verifying_key().to_bytes(), Role::Admin).unwrap();
+    sa.add_peer(ib.peer_id(), ib.verifying_key().to_bytes(), Role::Admin)
+        .unwrap();
+    sb.add_peer(ia.peer_id(), ia.verifying_key().to_bytes(), Role::Admin)
+        .unwrap();
     // Edit BEFORE connecting (offline).
     sa.edit_text("note", 0, "offline-A").unwrap();
     sb.edit_text("note", 0, "offline-B").unwrap();
@@ -46,5 +48,8 @@ async fn two_real_endpoints_catch_up_offline_edits() {
     let ta_text = ea.store().lock().await.text("note");
     let tb_text = eb.store().lock().await.text("note");
     assert_eq!(ta_text, tb_text, "real endpoints must converge");
-    assert!(ta_text.contains("A") && ta_text.contains("B"), "lost an offline edit: {ta_text}");
+    assert!(
+        ta_text.contains("A") && ta_text.contains("B"),
+        "lost an offline edit: {ta_text}"
+    );
 }

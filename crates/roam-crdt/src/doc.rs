@@ -252,8 +252,16 @@ mod tests {
         // edit was dropped (both survive the merge).
         assert_eq!(a.text("note"), b.text("note"));
         assert!(a.text("note").starts_with("hello"));
-        assert!(a.text("note").contains(" from A"), "lost A's edit: {}", a.text("note"));
-        assert!(a.text("note").contains(" from B"), "lost B's edit: {}", a.text("note"));
+        assert!(
+            a.text("note").contains(" from A"),
+            "lost A's edit: {}",
+            a.text("note")
+        );
+        assert!(
+            a.text("note").contains(" from B"),
+            "lost B's edit: {}",
+            a.text("note")
+        );
     }
 
     #[test]
@@ -377,7 +385,10 @@ mod tests {
         let v_late = a.version();
 
         assert!(v_late.includes(&v_early), "later must dominate earlier");
-        assert!(!v_early.includes(&v_late), "earlier must NOT dominate later");
+        assert!(
+            !v_early.includes(&v_late),
+            "earlier must NOT dominate later"
+        );
     }
 
     #[test]

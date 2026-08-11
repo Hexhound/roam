@@ -214,8 +214,17 @@ pub async fn reconcile_once<B: Backend>(
         eprintln!("[be-sync]   has_missing_entries={has_missing}");
     }
     if has_missing {
-        import_missing_entries(store, backend, key, &bucket, self_peer, debug, &kc, &mut report)
-            .await?;
+        import_missing_entries(
+            store,
+            backend,
+            key,
+            &bucket,
+            self_peer,
+            debug,
+            &kc,
+            &mut report,
+        )
+        .await?;
     }
 
     if report.undecryptable > 0 {

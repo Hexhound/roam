@@ -64,7 +64,10 @@ async fn flush_local_gossips_direct_store_edits() {
 
     tokio::time::sleep(Duration::from_millis(150)).await;
     let tb = eb.store().lock().await.text("note");
-    assert_eq!(tb, "hi", "flush_local did not propagate a direct store edit");
+    assert_eq!(
+        tb, "hi",
+        "flush_local did not propagate a direct store edit"
+    );
 }
 
 /// `flush_local` is idempotent: with nothing new to send it must transmit no
@@ -211,13 +214,19 @@ async fn changed_fires_on_inbound_ops() {
 
     // Pending before any real inbound change.
     let pending = tokio::time::timeout(Duration::from_millis(120), &mut notified).await;
-    assert!(pending.is_err(), "changed() fired before any inbound change");
+    assert!(
+        pending.is_err(),
+        "changed() fired before any inbound change"
+    );
 
     // A edits and live-pushes to B; B applies and must fire changed().
     ea.edit_text("note", 0, "remote!").await.unwrap();
 
     let fired = tokio::time::timeout(Duration::from_millis(500), &mut notified).await;
-    assert!(fired.is_ok(), "changed() did not fire after an inbound apply");
+    assert!(
+        fired.is_ok(),
+        "changed() did not fire after an inbound apply"
+    );
     assert_eq!(eb.store().lock().await.text("note"), "remote!");
 }
 
@@ -265,5 +274,8 @@ async fn repeated_edits_do_not_duplicate_on_peer() {
 
     // B must hold exactly the two edits, in order, with no duplication.
     let tb = eb.store().lock().await.text("note");
-    assert_eq!(tb, "abcd", "repeated edits duplicated or lost on peer: {tb}");
+    assert_eq!(
+        tb, "abcd",
+        "repeated edits duplicated or lost on peer: {tb}"
+    );
 }

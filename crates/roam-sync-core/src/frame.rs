@@ -67,13 +67,28 @@ mod tests {
     fn frames_round_trip_through_postcard() {
         let frames = vec![
             Frame::Hello { vault: [7u8; 32] },
-            Frame::Have { doc_version: vec![1, 2, 3] },
-            Frame::Ops { author: 42, jsonl: b"{\"peer\":42}\n".to_vec() },
-            Frame::RosterHave { authors: vec![(1, 3), (2, 0)] },
-            Frame::RosterOps { author: 1, jsonl: vec![9, 9] },
+            Frame::Have {
+                doc_version: vec![1, 2, 3],
+            },
+            Frame::Ops {
+                author: 42,
+                jsonl: b"{\"peer\":42}\n".to_vec(),
+            },
+            Frame::RosterHave {
+                authors: vec![(1, 3), (2, 0)],
+            },
+            Frame::RosterOps {
+                author: 1,
+                jsonl: vec![9, 9],
+            },
             Frame::Ping,
-            Frame::BlobWant { hash: "ab".repeat(32) },
-            Frame::BlobData { hash: "cd".repeat(32), bytes: vec![0, 1, 2, 255] },
+            Frame::BlobWant {
+                hash: "ab".repeat(32),
+            },
+            Frame::BlobData {
+                hash: "cd".repeat(32),
+                bytes: vec![0, 1, 2, 255],
+            },
         ];
         for f in frames {
             let bytes = f.encode();
@@ -83,9 +98,14 @@ mod tests {
 
     #[test]
     fn keylog_frames_roundtrip_through_postcard() {
-        let have = Frame::KeylogHave { authors: vec![(7, 3), (9, 1)] };
+        let have = Frame::KeylogHave {
+            authors: vec![(7, 3), (9, 1)],
+        };
         assert_eq!(Frame::decode(&have.encode()).unwrap(), have);
-        let ops = Frame::KeylogOps { author: 7, jsonl: vec![1, 2, 3] };
+        let ops = Frame::KeylogOps {
+            author: 7,
+            jsonl: vec![1, 2, 3],
+        };
         assert_eq!(Frame::decode(&ops.encode()).unwrap(), ops);
         assert_eq!(have.kind(), "KeylogHave");
         assert_eq!(ops.kind(), "KeylogOps");

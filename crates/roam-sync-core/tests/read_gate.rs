@@ -23,8 +23,10 @@ async fn a_does_not_reply_to_a_revoked_peers_have() {
     let mut sa = Store::open(da.path(), ia.clone()).unwrap();
     sa.declare_founder(Role::Admin).unwrap();
     // A trusts then revokes B: B is in the roster, but Revoked.
-    sa.add_peer(ib.peer_id(), ib.verifying_key().to_bytes(), Role::Admin).unwrap();
-    sa.revoke_peer(ib.peer_id(), ib.verifying_key().to_bytes()).unwrap();
+    sa.add_peer(ib.peer_id(), ib.verifying_key().to_bytes(), Role::Admin)
+        .unwrap();
+    sa.revoke_peer(ib.peer_id(), ib.verifying_key().to_bytes())
+        .unwrap();
     let version = sa.doc_version_bytes();
 
     let ea = Arc::new(Engine::new(
@@ -38,9 +40,14 @@ async fn a_does_not_reply_to_a_revoked_peers_have() {
     let mut b_in = tb.incoming();
 
     // A handles a (valid) Have from the revoked peer B directly.
-    ea.handle(ib.peer_id(), Frame::Have { doc_version: version })
-        .await
-        .unwrap();
+    ea.handle(
+        ib.peer_id(),
+        Frame::Have {
+            doc_version: version,
+        },
+    )
+    .await
+    .unwrap();
 
     // A must send NOTHING back to the revoked peer.
     let got = tokio::time::timeout(Duration::from_millis(200), b_in.next()).await;
@@ -59,7 +66,8 @@ async fn a_does_reply_to_an_active_peers_have() {
 
     let mut sa = Store::open(da.path(), ia.clone()).unwrap();
     sa.declare_founder(Role::Admin).unwrap();
-    sa.add_peer(ib.peer_id(), ib.verifying_key().to_bytes(), Role::Admin).unwrap();
+    sa.add_peer(ib.peer_id(), ib.verifying_key().to_bytes(), Role::Admin)
+        .unwrap();
     let version = sa.doc_version_bytes();
 
     let ea = Arc::new(Engine::new(
@@ -71,9 +79,14 @@ async fn a_does_reply_to_an_active_peers_have() {
     let tb = board.endpoint(ib.peer_id());
     let mut b_in = tb.incoming();
 
-    ea.handle(ib.peer_id(), Frame::Have { doc_version: version })
-        .await
-        .unwrap();
+    ea.handle(
+        ib.peer_id(),
+        Frame::Have {
+            doc_version: version,
+        },
+    )
+    .await
+    .unwrap();
 
     let got = tokio::time::timeout(Duration::from_millis(200), b_in.next()).await;
     assert!(

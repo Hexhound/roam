@@ -37,7 +37,10 @@ pub struct Keychain {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VaultIssue {
     /// This epoch's key is missing here but ≥1 current member holds a wrap.
-    WaitingKey { epoch: [u8; 32], candidates: Vec<u64> },
+    WaitingKey {
+        epoch: [u8; 32],
+        candidates: Vec<u64>,
+    },
     /// This epoch's key is missing and no current member (nor paper) holds it.
     KeyOrphaned { epoch: [u8; 32] },
     /// This epoch is wrapped to only one live device — one loss from orphaning.
@@ -80,7 +83,13 @@ impl Keychain {
         // Genesis: epoch 0 always known.
         epochs.insert(
             EPOCH0_ID,
-            EpochNode { parents: vec![], minted_by: 0, key: Some(epoch0_key), wrapped_to: BTreeSet::new(), wrapped_paper: false },
+            EpochNode {
+                parents: vec![],
+                minted_by: 0,
+                key: Some(epoch0_key),
+                wrapped_to: BTreeSet::new(),
+                wrapped_paper: false,
+            },
         );
 
         // First pass: Rotate announces nodes.
@@ -120,7 +129,11 @@ impl Keychain {
         }
 
         let head = Self::select_head(&epochs);
-        Self { id_key, epochs, head }
+        Self {
+            id_key,
+            epochs,
+            head,
+        }
     }
 
     /// Deterministic write-head: among the DAG leaves (epochs that are no node's
@@ -159,11 +172,19 @@ impl Keychain {
             prefix.copy_from_slice(&payload[..32]);
             if prefix != EPOCH0_ID {
                 if let Some(node) = self.epochs.get(&prefix) {
-                    return ReadPlan { epoch: prefix, key: node.key, body_offset: 32 };
+                    return ReadPlan {
+                        epoch: prefix,
+                        key: node.key,
+                        body_offset: 32,
+                    };
                 }
             }
         }
-        ReadPlan { epoch: EPOCH0_ID, key: self.epoch_key(&EPOCH0_ID), body_offset: 0 }
+        ReadPlan {
+            epoch: EPOCH0_ID,
+            key: self.epoch_key(&EPOCH0_ID),
+            body_offset: 0,
+        }
     }
 
     /// The recovery state machine, computed from wrap coverage ∩ current roster.
@@ -176,16 +197,26 @@ impl Keychain {
             .collect();
         let mut issues = Vec::new();
         for (epoch, node) in &self.epochs {
-            let live_holders: Vec<u64> =
-                node.wrapped_to.iter().filter(|p| active.contains(p)).copied().collect();
+            let live_holders: Vec<u64> = node
+                .wrapped_to
+                .iter()
+                .filter(|p| active.contains(p))
+                .copied()
+                .collect();
             if node.key.is_none() {
                 if live_holders.is_empty() && !node.wrapped_paper {
                     issues.push(VaultIssue::KeyOrphaned { epoch: *epoch });
                 } else {
-                    issues.push(VaultIssue::WaitingKey { epoch: *epoch, candidates: live_holders });
+                    issues.push(VaultIssue::WaitingKey {
+                        epoch: *epoch,
+                        candidates: live_holders,
+                    });
                 }
             } else if live_holders.len() == 1 && !node.wrapped_paper {
-                issues.push(VaultIssue::KeyRedundancyLow { epoch: *epoch, holders: live_holders });
+                issues.push(VaultIssue::KeyRedundancyLow {
+                    epoch: *epoch,
+                    holders: live_holders,
+                });
             }
         }
         issues
@@ -222,7 +253,12 @@ impl Keychain {
                 is_parent.insert(*p);
             }
         }
-        let mut heads: Vec<[u8; 32]> = self.epochs.keys().filter(|id| !is_parent.contains(*id)).copied().collect();
+        let mut heads: Vec<[u8; 32]> = self
+            .epochs
+            .keys()
+            .filter(|id| !is_parent.contains(*id))
+            .copied()
+            .collect();
         if heads.is_empty() {
             heads.push(EPOCH0_ID);
         }
@@ -239,12 +275,23 @@ mod tests {
     fn peer(id: u64, status: PeerStatus) -> PeerRecord {
         let mut key = [0u8; 32];
         key[0..8].copy_from_slice(&id.to_le_bytes());
-        PeerRecord { peer_id: id, verifying_key: key, status, role: crate::roster::Role::Admin }
+        PeerRecord {
+            peer_id: id,
+            verifying_key: key,
+            status,
+            role: crate::roster::Role::Admin,
+        }
     }
 
     #[test]
     fn epoch0_is_always_known_and_is_default_head() {
-        let kc = Keychain::build([1u8; 32], [2u8; 32], 5, &Identity::generate().x25519_secret(), &[]);
+        let kc = Keychain::build(
+            [1u8; 32],
+            [2u8; 32],
+            5,
+            &Identity::generate().x25519_secret(),
+            &[],
+        );
         assert_eq!(kc.head, EPOCH0_ID);
         assert_eq!(kc.epoch_key(&EPOCH0_ID), Some([2u8; 32]));
     }
@@ -258,10 +305,32 @@ mod tests {
         let blob = keywrap::wrap(&me.x25519_public(), &k_new);
 
         let entries = vec![
-            KeyLogEntry { seq: 1, author: me.peer_id(), epoch_id: epoch, body: KeyBody::Rotate { parent_epochs: vec![EPOCH0_ID], nonce } },
-            KeyLogEntry { seq: 2, author: me.peer_id(), epoch_id: epoch, body: KeyBody::Wrap { recipient: Recipient::Device(me.peer_id()), blob } },
+            KeyLogEntry {
+                seq: 1,
+                author: me.peer_id(),
+                epoch_id: epoch,
+                body: KeyBody::Rotate {
+                    parent_epochs: vec![EPOCH0_ID],
+                    nonce,
+                },
+            },
+            KeyLogEntry {
+                seq: 2,
+                author: me.peer_id(),
+                epoch_id: epoch,
+                body: KeyBody::Wrap {
+                    recipient: Recipient::Device(me.peer_id()),
+                    blob,
+                },
+            },
         ];
-        let kc = Keychain::build([1u8; 32], [2u8; 32], me.peer_id(), &me.x25519_secret(), &entries);
+        let kc = Keychain::build(
+            [1u8; 32],
+            [2u8; 32],
+            me.peer_id(),
+            &me.x25519_secret(),
+            &entries,
+        );
         assert_eq!(kc.epoch_key(&epoch), Some(k_new));
         assert_eq!(kc.head, epoch, "head advances to the new leaf epoch");
     }
@@ -273,10 +342,32 @@ mod tests {
         let epoch = compute_epoch_id(&[EPOCH0_ID], me.peer_id(), &nonce);
         let blob = keywrap::wrap(&me.x25519_public(), &[9u8; 32]);
         let entries = vec![
-            KeyLogEntry { seq: 1, author: me.peer_id(), epoch_id: epoch, body: KeyBody::Rotate { parent_epochs: vec![EPOCH0_ID], nonce } },
-            KeyLogEntry { seq: 2, author: me.peer_id(), epoch_id: epoch, body: KeyBody::Wrap { recipient: Recipient::Device(me.peer_id()), blob } },
+            KeyLogEntry {
+                seq: 1,
+                author: me.peer_id(),
+                epoch_id: epoch,
+                body: KeyBody::Rotate {
+                    parent_epochs: vec![EPOCH0_ID],
+                    nonce,
+                },
+            },
+            KeyLogEntry {
+                seq: 2,
+                author: me.peer_id(),
+                epoch_id: epoch,
+                body: KeyBody::Wrap {
+                    recipient: Recipient::Device(me.peer_id()),
+                    blob,
+                },
+            },
         ];
-        let kc = Keychain::build([1u8; 32], [2u8; 32], me.peer_id(), &me.x25519_secret(), &entries);
+        let kc = Keychain::build(
+            [1u8; 32],
+            [2u8; 32],
+            me.peer_id(),
+            &me.x25519_secret(),
+            &entries,
+        );
 
         // Tagged payload: prefix is a known epoch → offset 32, key present.
         let mut tagged = epoch.to_vec();
@@ -299,17 +390,44 @@ mod tests {
         let epoch = compute_epoch_id(&[EPOCH0_ID], 7, &nonce);
         let holder = keywrap::wrap(&Identity::generate().x25519_public(), &[1u8; 32]); // not to us
         let entries = vec![
-            KeyLogEntry { seq: 1, author: 7, epoch_id: epoch, body: KeyBody::Rotate { parent_epochs: vec![EPOCH0_ID], nonce } },
-            KeyLogEntry { seq: 2, author: 7, epoch_id: epoch, body: KeyBody::Wrap { recipient: Recipient::Device(7), blob: holder } },
+            KeyLogEntry {
+                seq: 1,
+                author: 7,
+                epoch_id: epoch,
+                body: KeyBody::Rotate {
+                    parent_epochs: vec![EPOCH0_ID],
+                    nonce,
+                },
+            },
+            KeyLogEntry {
+                seq: 2,
+                author: 7,
+                epoch_id: epoch,
+                body: KeyBody::Wrap {
+                    recipient: Recipient::Device(7),
+                    blob: holder,
+                },
+            },
         ];
         let me = Identity::generate();
-        let kc = Keychain::build([1u8; 32], [2u8; 32], me.peer_id(), &me.x25519_secret(), &entries);
+        let kc = Keychain::build(
+            [1u8; 32],
+            [2u8; 32],
+            me.peer_id(),
+            &me.x25519_secret(),
+            &entries,
+        );
 
         let waiting = kc.diagnose(&[peer(7, PeerStatus::Active)]);
-        assert!(matches!(waiting.as_slice(), [VaultIssue::WaitingKey { candidates, .. }] if candidates == &vec![7]));
+        assert!(
+            matches!(waiting.as_slice(), [VaultIssue::WaitingKey { candidates, .. }] if candidates == &vec![7])
+        );
 
         let orphaned = kc.diagnose(&[peer(7, PeerStatus::Revoked)]);
-        assert!(matches!(orphaned.as_slice(), [VaultIssue::KeyOrphaned { .. }]));
+        assert!(matches!(
+            orphaned.as_slice(),
+            [VaultIssue::KeyOrphaned { .. }]
+        ));
     }
 
     #[test]
@@ -320,13 +438,43 @@ mod tests {
         let epoch = compute_epoch_id(&[EPOCH0_ID], me.peer_id(), &nonce);
         let blob = keywrap::wrap(&me.x25519_public(), &k_new);
         let entries = vec![
-            KeyLogEntry { seq: 1, author: me.peer_id(), epoch_id: epoch, body: KeyBody::Rotate { parent_epochs: vec![EPOCH0_ID], nonce } },
-            KeyLogEntry { seq: 2, author: me.peer_id(), epoch_id: epoch, body: KeyBody::Wrap { recipient: Recipient::Device(me.peer_id()), blob } },
+            KeyLogEntry {
+                seq: 1,
+                author: me.peer_id(),
+                epoch_id: epoch,
+                body: KeyBody::Rotate {
+                    parent_epochs: vec![EPOCH0_ID],
+                    nonce,
+                },
+            },
+            KeyLogEntry {
+                seq: 2,
+                author: me.peer_id(),
+                epoch_id: epoch,
+                body: KeyBody::Wrap {
+                    recipient: Recipient::Device(me.peer_id()),
+                    blob,
+                },
+            },
         ];
-        let kc = Keychain::build([1u8; 32], [2u8; 32], me.peer_id(), &me.x25519_secret(), &entries);
+        let kc = Keychain::build(
+            [1u8; 32],
+            [2u8; 32],
+            me.peer_id(),
+            &me.x25519_secret(),
+            &entries,
+        );
 
-        let targets = kc.backfill_targets(&[peer(me.peer_id(), PeerStatus::Active), peer(8, PeerStatus::Active)]);
-        assert!(targets.iter().any(|(e, k, p)| *e == epoch && *k == k_new && *p == 8));
-        assert!(!targets.iter().any(|(_, _, p)| *p == me.peer_id()), "already-wrapped self is not a target");
+        let targets = kc.backfill_targets(&[
+            peer(me.peer_id(), PeerStatus::Active),
+            peer(8, PeerStatus::Active),
+        ]);
+        assert!(targets
+            .iter()
+            .any(|(e, k, p)| *e == epoch && *k == k_new && *p == 8));
+        assert!(
+            !targets.iter().any(|(_, _, p)| *p == me.peer_id()),
+            "already-wrapped self is not a target"
+        );
     }
 }

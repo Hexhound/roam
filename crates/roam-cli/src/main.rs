@@ -26,7 +26,11 @@ use tokio::sync::mpsc;
 const FS_DEBOUNCE: Duration = Duration::from_millis(200);
 
 #[derive(Parser)]
-#[command(name = "roam", about = "Manual harness for roam-sync over iroh", version)]
+#[command(
+    name = "roam",
+    about = "Manual harness for roam-sync over iroh",
+    version
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -250,7 +254,8 @@ fn save_vault_id(vault: &Path, id: &VaultId) -> Result<()> {
 
 /// Reload a [`VaultId`] previously written by [`save_vault_id`].
 fn load_vault_id(vault: &Path) -> Result<VaultId> {
-    let bytes = std::fs::read(vault_id_path(vault)).context("read vault-id (run `roam init` first)")?;
+    let bytes =
+        std::fs::read(vault_id_path(vault)).context("read vault-id (run `roam init` first)")?;
     let raw: [u8; 32] = bytes
         .as_slice()
         .try_into()
@@ -308,7 +313,10 @@ async fn init(vault: &Path, identity_path: &Path, role: &str) -> Result<()> {
     save_vault_key(vault, &vault_key)?;
     println!("initialized vault at {}", vault.display());
     println!("peer_id: {}", identity.peer_id());
-    println!("founder role: {}", format!("{founder_role:?}").to_lowercase());
+    println!(
+        "founder role: {}",
+        format!("{founder_role:?}").to_lowercase()
+    );
     Ok(())
 }
 
@@ -434,7 +442,11 @@ fn spawn_backend_sync(
             // Opportunistic wrap-back-fill: publish any missing epoch wraps for
             // members we can now see (convergent, idempotent). Best-effort; a
             // failure here must not kill the sync loop.
-            if let Err(err) = store.lock().await.backfill_wraps(&vault_key.id_key(), &vault_key.epoch0_key()) {
+            if let Err(err) = store
+                .lock()
+                .await
+                .backfill_wraps(&vault_key.id_key(), &vault_key.epoch0_key())
+            {
                 eprintln!("backend sync backfill error: {err}");
             }
         }
@@ -474,7 +486,10 @@ async fn setup_engine(vault: &Path, identity_path: &Path) -> Result<Arc<Engine<I
     // more importantly, delay the backend sync task and folder loop that the
     // caller spawns right after. The periodic reconnect task (spawned by the
     // folder loop) keeps retrying, so a peer that is not up yet still connects.
-    println!("connecting to {} active peer(s) in background...", active.len());
+    println!(
+        "connecting to {} active peer(s) in background...",
+        active.len()
+    );
     {
         let engine = engine.clone();
         tokio::spawn(async move {
@@ -508,17 +523,17 @@ async fn run_scan(
 ) -> anyhow::Result<Vec<(PathBuf, SyncOutcome)>> {
     let store = engine.store(); // Arc<Mutex<Store>>
     let bridge = bridge.clone(); // FolderBridge is just a PathBuf (derives Clone).
-    // Gather the causally-stable-GC inputs BEFORE the blocking closure: the
-    // per-peer acked versions are behind their own async mutex (fetched here,
-    // never across the store guard), and `self_peer` is cheap. The trusted-peer
-    // roster is read inside the closure from the already-held store guard.
+                                 // Gather the causally-stable-GC inputs BEFORE the blocking closure: the
+                                 // per-peer acked versions are behind their own async mutex (fetched here,
+                                 // never across the store guard), and `self_peer` is cheap. The trusted-peer
+                                 // roster is read inside the closure from the already-held store guard.
     let self_peer = engine.peer_id();
     let acked_versions = engine.acked_versions().await;
     tokio::task::spawn_blocking(move || {
         let mut guard = store.blocking_lock(); // OK on a blocking thread.
-        // Trusted, non-revoked peers (a roster snapshot). A tombstone may only be
-        // GC'd once EVERY one of these has acked past it; a peer absent from
-        // `acked_versions` (never heard from) keeps the tombstone alive.
+                                               // Trusted, non-revoked peers (a roster snapshot). A tombstone may only be
+                                               // GC'd once EVERY one of these has acked past it; a peer absent from
+                                               // `acked_versions` (never heard from) keeps the tombstone alive.
         let trusted_peers = guard
             .roster()
             .into_iter()
@@ -622,10 +637,7 @@ async fn sync_folder(
         }
     };
 
-    println!(
-        "watching {} for changes; Ctrl-C to stop.",
-        folder.display()
-    );
+    println!("watching {} for changes; Ctrl-C to stop.", folder.display());
     let mut interval = tokio::time::interval(Duration::from_millis(500));
 
     // Self-healing reconnect runs in its OWN task, NOT in the select loop below.
@@ -721,7 +733,14 @@ async fn scan_and_maybe_flush(
 ) {
     let hint_dbg = hint
         .as_ref()
-        .map(|h| format!("hinted {:?}", h.iter().map(|p| p.display().to_string()).collect::<Vec<_>>()))
+        .map(|h| {
+            format!(
+                "hinted {:?}",
+                h.iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+            )
+        })
         .unwrap_or_else(|| "full-poll".to_string());
     match run_scan(engine, bridge, hint).await {
         Ok(outcomes) => {
@@ -865,7 +884,8 @@ async fn sync_repl(engine: Arc<Engine<IrohTransport>>) -> Result<()> {
     // stdin is an Option so we can disable it on EOF (piped input / non-TTY)
     // without exiting — the change watcher must keep running so the peer stays
     // visible even after our own input stream closes.
-    let mut lines: Option<Lines<BufReader<Stdin>>> = Some(BufReader::new(tokio::io::stdin()).lines());
+    let mut lines: Option<Lines<BufReader<Stdin>>> =
+        Some(BufReader::new(tokio::io::stdin()).lines());
     let mut ticker = tokio::time::interval(Duration::from_millis(500));
     let mut last_seen = String::new();
 
@@ -1083,7 +1103,9 @@ async fn checkpoint(vault: &Path, identity_path: &Path, before: &str, dry_run: b
     let mut store = Store::open(vault, identity).context("open vault store")?;
     if dry_run {
         let bytes = store.checkpoint_dry_run(cutoff).context("dry-run")?;
-        println!("checkpoint --before {before}: would free {bytes} bytes (blobs). No changes made.");
+        println!(
+            "checkpoint --before {before}: would free {bytes} bytes (blobs). No changes made."
+        );
     } else {
         let freed = store.checkpoint(cutoff).context("checkpoint")?;
         println!("checkpoint done: freed {freed} bytes; op history compacted. Local only.");
@@ -1096,14 +1118,21 @@ async fn checkpoint(vault: &Path, identity_path: &Path, before: &str, dry_run: b
 /// The bridge uses `--folder` as its working root and `<vault>/filemeta` as its
 /// meta-dir, matching `sync`. The restored projection is persisted with
 /// `write_snapshot` before returning.
-async fn restore(vault: &Path, identity_path: &Path, folder: &Path, paths: Vec<PathBuf>) -> Result<()> {
+async fn restore(
+    vault: &Path,
+    identity_path: &Path,
+    folder: &Path,
+    paths: Vec<PathBuf>,
+) -> Result<()> {
     let identity = Identity::load(identity_path).context("load identity")?;
     let mut store = Store::open(vault, identity).context("open vault store")?;
     let bridge = FolderBridge::new(folder, &vault.join("filemeta"));
     let outcomes = if paths.is_empty() {
         bridge.restore_all(&mut store).context("restore all")?
     } else {
-        bridge.restore_paths(&mut store, &paths).context("restore paths")?
+        bridge
+            .restore_paths(&mut store, &paths)
+            .context("restore paths")?
     };
     store.write_snapshot().context("persist after restore")?;
     println!("restored {} file(s):", outcomes.len());

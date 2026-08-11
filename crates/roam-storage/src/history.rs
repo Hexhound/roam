@@ -30,7 +30,9 @@ pub struct HistoryIndex {
 impl HistoryIndex {
     /// Open (lazily; the file is created on first append) rooted at `dir`.
     pub fn new(dir: &Path) -> Self {
-        Self { path: dir.join("history.jsonl") }
+        Self {
+            path: dir.join("history.jsonl"),
+        }
     }
 
     /// Append one marker as a JSON line.
@@ -59,7 +61,9 @@ impl HistoryIndex {
         };
         let mut out = Vec::new();
         for line in text.lines() {
-            if line.trim().is_empty() { continue; }
+            if line.trim().is_empty() {
+                continue;
+            }
             match serde_json::from_str::<Marker>(line) {
                 Ok(m) => out.push(m),
                 Err(_) => break, // torn tail: stop at first unparsable line
@@ -87,7 +91,11 @@ mod tests {
     fn marker(ts: i64) -> Marker {
         let mut log_lens = BTreeMap::new();
         log_lens.insert(7u64, ts as u64);
-        Marker { ts_ms: ts, frontier: format!("f{ts}"), log_lens }
+        Marker {
+            ts_ms: ts,
+            frontier: format!("f{ts}"),
+            log_lens,
+        }
     }
 
     #[test]

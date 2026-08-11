@@ -123,7 +123,10 @@ mod tests {
     /// Drive a full client↔server session to convergence, returning the client's
     /// final (have, need). `have` = ids the server lacks; `need` = ids the client
     /// lacks. Round-capped so a bug can't loop forever.
-    fn run_session(client_ids: &[[u8; 32]], server_ids: &[[u8; 32]]) -> (Vec<[u8; 32]>, Vec<[u8; 32]>) {
+    fn run_session(
+        client_ids: &[[u8; 32]],
+        server_ids: &[[u8; 32]],
+    ) -> (Vec<[u8; 32]>, Vec<[u8; 32]>) {
         let client_set = ItemSet::from_ids(client_ids.iter().copied());
         let server_set = ItemSet::from_ids(server_ids.iter().copied());
 

@@ -57,7 +57,10 @@ impl KeyLogEntry {
         buf.extend_from_slice(&self.author.to_le_bytes());
         buf.extend_from_slice(&self.epoch_id);
         match &self.body {
-            KeyBody::Rotate { parent_epochs, nonce } => {
+            KeyBody::Rotate {
+                parent_epochs,
+                nonce,
+            } => {
                 buf.push(0);
                 buf.extend_from_slice(&(parent_epochs.len() as u64).to_le_bytes());
                 for p in parent_epochs {
@@ -146,11 +149,19 @@ impl KeyLog {
             std::fs::create_dir_all(parent)?;
         }
         let seq = self.last_seq(&id.verifying_key())? + 1;
-        let entry = KeyLogEntry { seq, author: self.author, epoch_id, body };
+        let entry = KeyLogEntry {
+            seq,
+            author: self.author,
+            epoch_id,
+            body,
+        };
         let sig = id.sign(&entry.canonical_bytes());
 
         let body_line = match &entry.body {
-            KeyBody::Rotate { parent_epochs, nonce } => KeyBodyLine::Rotate {
+            KeyBody::Rotate {
+                parent_epochs,
+                nonce,
+            } => KeyBodyLine::Rotate {
                 parents: parent_epochs.iter().map(|p| B64.encode(p)).collect(),
                 nonce: B64.encode(nonce),
             },
@@ -170,7 +181,10 @@ impl KeyLog {
         json.push(b'\n');
 
         let is_create = !self.path.exists();
-        let mut file = OpenOptions::new().create(true).append(true).open(&self.path)?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
         file.write_all(&json)?;
         file.sync_all()?;
         #[cfg(unix)]
@@ -193,12 +207,21 @@ impl KeyLog {
         self.verify_text(key, &text)
     }
 
-    pub fn verify_bytes(&self, key: &VerifyingKey, bytes: &[u8]) -> Result<Vec<KeyLogEntry>, StorageError> {
-        let text = std::str::from_utf8(bytes).map_err(|e| StorageError::MalformedEntry(e.to_string()))?;
+    pub fn verify_bytes(
+        &self,
+        key: &VerifyingKey,
+        bytes: &[u8],
+    ) -> Result<Vec<KeyLogEntry>, StorageError> {
+        let text =
+            std::str::from_utf8(bytes).map_err(|e| StorageError::MalformedEntry(e.to_string()))?;
         self.verify_text(key, text)
     }
 
-    fn verify_text(&self, key: &VerifyingKey, text: &str) -> Result<Vec<KeyLogEntry>, StorageError> {
+    fn verify_text(
+        &self,
+        key: &VerifyingKey,
+        text: &str,
+    ) -> Result<Vec<KeyLogEntry>, StorageError> {
         let torn_tail = !text.is_empty() && !text.ends_with('\n');
         let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
         let last = lines.len().saturating_sub(1);
@@ -218,17 +241,31 @@ impl KeyLog {
                     for p in &parents {
                         ps.push(b64_32(p)?);
                     }
-                    KeyBody::Rotate { parent_epochs: ps, nonce: b64_32(&nonce)? }
+                    KeyBody::Rotate {
+                        parent_epochs: ps,
+                        nonce: b64_32(&nonce)?,
+                    }
                 }
                 KeyBodyLine::Wrap { recipient, blob } => KeyBody::Wrap {
                     recipient,
-                    blob: B64.decode(blob.as_bytes()).map_err(|e| StorageError::MalformedEntry(e.to_string()))?,
+                    blob: B64
+                        .decode(blob.as_bytes())
+                        .map_err(|e| StorageError::MalformedEntry(e.to_string()))?,
                 },
             };
-            let sig_bytes = B64.decode(parsed.sig.as_bytes()).map_err(|e| StorageError::MalformedEntry(e.to_string()))?;
-            let sig_arr: [u8; 64] = sig_bytes.try_into().map_err(|_| StorageError::MalformedEntry("signature length".into()))?;
+            let sig_bytes = B64
+                .decode(parsed.sig.as_bytes())
+                .map_err(|e| StorageError::MalformedEntry(e.to_string()))?;
+            let sig_arr: [u8; 64] = sig_bytes
+                .try_into()
+                .map_err(|_| StorageError::MalformedEntry("signature length".into()))?;
             let sig = Signature::from_bytes(&sig_arr);
-            let entry = KeyLogEntry { seq: parsed.seq, author: parsed.author, epoch_id: b64_32(&parsed.epoch_id)?, body };
+            let entry = KeyLogEntry {
+                seq: parsed.seq,
+                author: parsed.author,
+                epoch_id: b64_32(&parsed.epoch_id)?,
+                body,
+            };
             if !key.verify(&entry.canonical_bytes(), &sig) {
                 return Err(StorageError::BadSignature(self.author));
             }
@@ -250,11 +287,25 @@ mod tests {
         let log = KeyLog::new(dir.path(), a.peer_id());
 
         let e1 = log
-            .append(&a, [7u8; 32], KeyBody::Rotate { parent_epochs: vec![[0u8; 32]], nonce: [9u8; 32] })
+            .append(
+                &a,
+                [7u8; 32],
+                KeyBody::Rotate {
+                    parent_epochs: vec![[0u8; 32]],
+                    nonce: [9u8; 32],
+                },
+            )
             .unwrap();
         assert_eq!(e1.seq, 1);
         let e2 = log
-            .append(&a, [7u8; 32], KeyBody::Wrap { recipient: Recipient::Device(a.peer_id()), blob: vec![1, 2, 3] })
+            .append(
+                &a,
+                [7u8; 32],
+                KeyBody::Wrap {
+                    recipient: Recipient::Device(a.peer_id()),
+                    blob: vec![1, 2, 3],
+                },
+            )
             .unwrap();
         assert_eq!(e2.seq, 2);
 
@@ -269,14 +320,25 @@ mod tests {
         let dir = tempdir().unwrap();
         let a = Identity::generate();
         let log = KeyLog::new(dir.path(), a.peer_id());
-        log.append(&a, [7u8; 32], KeyBody::Rotate { parent_epochs: vec![], nonce: [9u8; 32] }).unwrap();
+        log.append(
+            &a,
+            [7u8; 32],
+            KeyBody::Rotate {
+                parent_epochs: vec![],
+                nonce: [9u8; 32],
+            },
+        )
+        .unwrap();
 
         let path = log.path();
         let line = std::fs::read_to_string(&path).unwrap();
         let mut v: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
         v["seq"] = serde_json::Value::from(999u64);
         std::fs::write(&path, format!("{}\n", v)).unwrap();
-        assert!(matches!(log.read_verified(&a.verifying_key()), Err(StorageError::BadSignature(_))));
+        assert!(matches!(
+            log.read_verified(&a.verifying_key()),
+            Err(StorageError::BadSignature(_))
+        ));
     }
 
     #[test]
@@ -285,7 +347,14 @@ mod tests {
         let a = Identity::generate();
         let other = Identity::generate();
         let log = KeyLog::new(dir.path(), a.peer_id());
-        let err = log.append(&other, [0u8; 32], KeyBody::Rotate { parent_epochs: vec![], nonce: [0u8; 32] });
+        let err = log.append(
+            &other,
+            [0u8; 32],
+            KeyBody::Rotate {
+                parent_epochs: vec![],
+                nonce: [0u8; 32],
+            },
+        );
         assert!(matches!(err, Err(StorageError::Peer(_))));
     }
 
@@ -294,8 +363,19 @@ mod tests {
         let dir = tempdir().unwrap();
         let a = Identity::generate();
         let log = KeyLog::new(dir.path(), a.peer_id());
-        log.append(&a, [7u8; 32], KeyBody::Rotate { parent_epochs: vec![], nonce: [9u8; 32] }).unwrap();
-        let mut f = std::fs::OpenOptions::new().append(true).open(log.path()).unwrap();
+        log.append(
+            &a,
+            [7u8; 32],
+            KeyBody::Rotate {
+                parent_epochs: vec![],
+                nonce: [9u8; 32],
+            },
+        )
+        .unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(log.path())
+            .unwrap();
         std::io::Write::write_all(&mut f, br#"{"seq":2,"author":1"#).unwrap();
         assert_eq!(log.read_verified(&a.verifying_key()).unwrap().len(), 1);
     }

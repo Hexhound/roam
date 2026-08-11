@@ -65,11 +65,20 @@ async fn engine_records_and_advances_peer_acked_version() {
 
     // B advances its document, then re-advertises via a fresh Have. A must
     // ADVANCE B's acked version (new version dominates the old one).
-    eb.store().lock().await.edit_text("note", 0, "hello").unwrap();
-    let b_new = eb.store().lock().await.doc_version_bytes();
-    ea.handle(ib.peer_id(), Frame::Have { doc_version: b_new.clone() })
+    eb.store()
+        .lock()
         .await
+        .edit_text("note", 0, "hello")
         .unwrap();
+    let b_new = eb.store().lock().await.doc_version_bytes();
+    ea.handle(
+        ib.peer_id(),
+        Frame::Have {
+            doc_version: b_new.clone(),
+        },
+    )
+    .await
+    .unwrap();
     let after = ea.acked_versions().await;
     let b_v1 = after.get(&ib.peer_id()).unwrap().clone();
     assert!(
@@ -79,9 +88,14 @@ async fn engine_records_and_advances_peer_acked_version() {
     assert!(version_dominates(&b_v1, &b_new) && version_dominates(&b_new, &b_v1));
 
     // A STALE Have (B's older version) must NOT regress the recorded version.
-    ea.handle(ib.peer_id(), Frame::Have { doc_version: b_v0.clone() })
-        .await
-        .unwrap();
+    ea.handle(
+        ib.peer_id(),
+        Frame::Have {
+            doc_version: b_v0.clone(),
+        },
+    )
+    .await
+    .unwrap();
     let after_stale = ea.acked_versions().await;
     let b_v2 = after_stale.get(&ib.peer_id()).unwrap().clone();
     assert!(

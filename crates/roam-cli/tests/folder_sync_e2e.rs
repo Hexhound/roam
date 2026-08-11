@@ -104,11 +104,7 @@ async fn sync_until(endpoint: &Endpoint, mut done: impl FnMut() -> bool, label: 
 /// requests any missing blobs, waits briefly for the reply to arrive and fire
 /// `changed()`, then scans (which projects a now-local blob to disk). Used on
 /// the RECEIVING side of a binary-file scenario.
-async fn sync_until_with_blobs(
-    endpoint: &Endpoint,
-    mut done: impl FnMut() -> bool,
-    label: &str,
-) {
+async fn sync_until_with_blobs(endpoint: &Endpoint, mut done: impl FnMut() -> bool, label: &str) {
     let start = Instant::now();
     loop {
         endpoint.engine.request_missing_blobs().await;
@@ -157,10 +153,18 @@ async fn real_folder_create_delete_rename_syncs_over_iroh() {
     store_b.declare_founder(Role::Admin).unwrap();
     // Cross-trust: each device vouches for the other in its roster.
     store_a
-        .add_peer(identity_b.peer_id(), identity_b.verifying_key().to_bytes(), Role::Admin)
+        .add_peer(
+            identity_b.peer_id(),
+            identity_b.verifying_key().to_bytes(),
+            Role::Admin,
+        )
         .unwrap();
     store_b
-        .add_peer(identity_a.peer_id(), identity_a.verifying_key().to_bytes(), Role::Admin)
+        .add_peer(
+            identity_a.peer_id(),
+            identity_a.verifying_key().to_bytes(),
+            Role::Admin,
+        )
         .unwrap();
 
     // Transport routes: each transport knows the other peer's key.
@@ -318,7 +322,9 @@ async fn real_folder_create_delete_rename_syncs_over_iroh() {
     let pic_a = vault_a.join("pic.png");
     let pic_b = vault_b.join("pic.png");
     // Non-UTF-8 payload with an asset extension → routes to the blob store.
-    let pixels: Vec<u8> = vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0xff, 0x00, 0x7f];
+    let pixels: Vec<u8> = vec![
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0xff, 0x00, 0x7f,
+    ];
     std::fs::write(&pic_a, &pixels).unwrap();
     scan(&a).await; // import_blob (bytes + Live Blob entry + marker) + gossip.
 
@@ -331,7 +337,11 @@ async fn real_folder_create_delete_rename_syncs_over_iroh() {
     let entry = entry_for(&b, &pic_b)
         .await
         .expect("B must have a file-set entry for pic.png");
-    assert_eq!(entry.status, EntryStatus::Live, "pic.png entry on B must be Live");
+    assert_eq!(
+        entry.status,
+        EntryStatus::Live,
+        "pic.png entry on B must be Live"
+    );
 
     // Delete the binary on A (raw fs remove → scan detects the local delete via
     // the presence marker and writes a Blob tombstone), gossip it.

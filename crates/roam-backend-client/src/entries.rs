@@ -114,10 +114,18 @@ mod tests {
         // Found the vault as admin so this device may vouch/revoke peers.
         store.declare_founder(Role::Admin).unwrap();
         store
-            .add_peer(active.peer_id(), active.verifying_key().to_bytes(), Role::Admin)
+            .add_peer(
+                active.peer_id(),
+                active.verifying_key().to_bytes(),
+                Role::Admin,
+            )
             .unwrap();
         store
-            .add_peer(revoked.peer_id(), revoked.verifying_key().to_bytes(), Role::Admin)
+            .add_peer(
+                revoked.peer_id(),
+                revoked.verifying_key().to_bytes(),
+                Role::Admin,
+            )
             .unwrap();
         store
             .revoke_peer(revoked.peer_id(), revoked.verifying_key().to_bytes())

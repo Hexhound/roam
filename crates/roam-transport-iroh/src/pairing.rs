@@ -113,7 +113,9 @@ impl PairingToken {
 
     /// Decode a token string (whitespace-trimmed) back into a [`PairingToken`].
     pub fn decode(s: &str) -> Result<Self> {
-        let bytes = B64.decode(s.trim()).context("decode pairing token base64")?;
+        let bytes = B64
+            .decode(s.trim())
+            .context("decode pairing token base64")?;
         serde_json::from_slice(&bytes).context("decode pairing token json")
     }
 }
@@ -309,7 +311,10 @@ impl PairingHost<'_> {
                 .export_all_rosters()
                 .context("export transitive roster")?,
             keylog_author: self.identity.peer_id(),
-            keylog_jsonl: self.store.export_own_keylog().context("export own keylog")?,
+            keylog_jsonl: self
+                .store
+                .export_own_keylog()
+                .context("export own keylog")?,
             founder,
         };
         write_msg(&mut send, &accept)
@@ -452,7 +457,10 @@ async fn read_msg<T: DeserializeOwned>(recv: &mut RecvStream) -> Result<T> {
         .await
         .context("read message length prefix")?;
     let len = u32::from_be_bytes(len_buf) as usize;
-    anyhow::ensure!(len <= MAX_MSG_LEN, "pairing message too large ({len} bytes)");
+    anyhow::ensure!(
+        len <= MAX_MSG_LEN,
+        "pairing message too large ({len} bytes)"
+    );
     let mut body = vec![0u8; len];
     recv.read_exact(&mut body)
         .await
@@ -558,11 +566,7 @@ mod tests {
             .await
             .unwrap();
         let joiner_vault_path = db.path().to_path_buf();
-        let join = tokio::spawn(join_pairing(
-            ib.clone(),
-            joiner_vault_path.clone(),
-            token,
-        ));
+        let join = tokio::spawn(join_pairing(ib.clone(), joiner_vault_path.clone(), token));
 
         host.accept_auto().await.unwrap();
         let (sb, _vk, founder) = join.await.unwrap().unwrap();
@@ -592,7 +596,11 @@ mod tests {
         sa.declare_founder(Role::Admin).unwrap();
         // Host rotates while alone -> mints epoch 1, wrapped to itself.
         let rotated = sa.rotate_epoch(&id_key, &epoch0, None).unwrap();
-        assert!(sa.keychain(&id_key, &epoch0).unwrap().epoch_key(&rotated).is_some());
+        assert!(sa
+            .keychain(&id_key, &epoch0)
+            .unwrap()
+            .epoch_key(&rotated)
+            .is_some());
 
         let (token, host) = host_pairing(&ia, vault, vault_key, Role::Admin, &mut sa)
             .await
@@ -658,7 +666,10 @@ mod tests {
 
         // The joiner must not have received an accept.
         let joiner_got_accept = bad_join.await.unwrap().unwrap_or(false);
-        assert!(!joiner_got_accept, "rejected joiner must not receive a JoinAccept");
+        assert!(
+            !joiner_got_accept,
+            "rejected joiner must not receive a JoinAccept"
+        );
 
         assert!(
             !sa.roster().iter().any(|p| p.peer_id == b_peer),
@@ -710,7 +721,10 @@ mod tests {
         assert!(host_res.is_err(), "a mismatched peer_id must be rejected");
 
         let joiner_got_accept = bad_join.await.unwrap().unwrap_or(false);
-        assert!(!joiner_got_accept, "rejected joiner must not receive a JoinAccept");
+        assert!(
+            !joiner_got_accept,
+            "rejected joiner must not receive a JoinAccept"
+        );
 
         assert!(
             sa.roster().is_empty(),

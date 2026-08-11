@@ -3,8 +3,8 @@
 
 use roam_storage::Identity;
 use roam_storage::Role;
-use roam_storage::EPOCH0_ID;
 use roam_storage::Store;
+use roam_storage::EPOCH0_ID;
 use tempfile::tempdir;
 
 const ID_KEY: [u8; 32] = [0x1au8; 32];
@@ -12,10 +12,30 @@ const EPOCH0: [u8; 32] = [0x2bu8; 32];
 
 /// Cross-vouch A<->B and sync both roster + key-logs both directions.
 fn full_sync(a: &mut Store, ia: &Identity, b: &mut Store, ib: &Identity) {
-    a.import_roster(ib.peer_id(), &ib.verifying_key(), b.export_own_roster().unwrap()).ok();
-    b.import_roster(ia.peer_id(), &ia.verifying_key(), a.export_own_roster().unwrap()).ok();
-    a.import_keylog(ib.peer_id(), &ib.verifying_key(), b.export_own_keylog().unwrap()).ok();
-    b.import_keylog(ia.peer_id(), &ia.verifying_key(), a.export_own_keylog().unwrap()).ok();
+    a.import_roster(
+        ib.peer_id(),
+        &ib.verifying_key(),
+        b.export_own_roster().unwrap(),
+    )
+    .ok();
+    b.import_roster(
+        ia.peer_id(),
+        &ia.verifying_key(),
+        a.export_own_roster().unwrap(),
+    )
+    .ok();
+    a.import_keylog(
+        ib.peer_id(),
+        &ib.verifying_key(),
+        b.export_own_keylog().unwrap(),
+    )
+    .ok();
+    b.import_keylog(
+        ia.peer_id(),
+        &ia.verifying_key(),
+        a.export_own_keylog().unwrap(),
+    )
+    .ok();
 }
 
 #[test]
@@ -31,13 +51,18 @@ fn scenario1_rotate_then_disconnect_then_peer_catches_up() {
     // vouches (and, post-sync, the peer's grants) actually fold into the roster.
     a.declare_founder(Role::Admin).unwrap();
     b.declare_founder(Role::Admin).unwrap();
-    a.add_peer(ib.peer_id(), ib.verifying_key().to_bytes(), Role::Admin).unwrap();
-    b.add_peer(ia.peer_id(), ia.verifying_key().to_bytes(), Role::Admin).unwrap();
+    a.add_peer(ib.peer_id(), ib.verifying_key().to_bytes(), Role::Admin)
+        .unwrap();
+    b.add_peer(ia.peer_id(), ia.verifying_key().to_bytes(), Role::Admin)
+        .unwrap();
     let epoch = a.rotate_epoch(&ID_KEY, &EPOCH0, None).unwrap();
 
     full_sync(&mut a, &ia, &mut b, &ib);
     let kc_b = b.keychain(&ID_KEY, &EPOCH0).unwrap();
-    assert!(kc_b.epoch_key(&epoch).is_some(), "B caught up to the rotated epoch via key-log");
+    assert!(
+        kc_b.epoch_key(&epoch).is_some(),
+        "B caught up to the rotated epoch via key-log"
+    );
 }
 
 #[test]
@@ -52,8 +77,10 @@ fn scenario3_concurrent_rotations_form_siblings_and_a_deterministic_head() {
     // vouches (and, post-sync, the peer's grants) actually fold into the roster.
     a.declare_founder(Role::Admin).unwrap();
     b.declare_founder(Role::Admin).unwrap();
-    a.add_peer(ib.peer_id(), ib.verifying_key().to_bytes(), Role::Admin).unwrap();
-    b.add_peer(ia.peer_id(), ia.verifying_key().to_bytes(), Role::Admin).unwrap();
+    a.add_peer(ib.peer_id(), ib.verifying_key().to_bytes(), Role::Admin)
+        .unwrap();
+    b.add_peer(ia.peer_id(), ia.verifying_key().to_bytes(), Role::Admin)
+        .unwrap();
     full_sync(&mut a, &ia, &mut b, &ib);
 
     let ea = a.rotate_epoch(&ID_KEY, &EPOCH0, None).unwrap();
@@ -79,17 +106,32 @@ fn forward_secrecy_a_revoked_peer_cannot_open_the_new_epoch() {
     // vouches (and, post-sync, the peer's grants) actually fold into the roster.
     a.declare_founder(Role::Admin).unwrap();
     b.declare_founder(Role::Admin).unwrap();
-    a.add_peer(ib.peer_id(), ib.verifying_key().to_bytes(), Role::Admin).unwrap();
-    b.add_peer(ia.peer_id(), ia.verifying_key().to_bytes(), Role::Admin).unwrap();
+    a.add_peer(ib.peer_id(), ib.verifying_key().to_bytes(), Role::Admin)
+        .unwrap();
+    b.add_peer(ia.peer_id(), ia.verifying_key().to_bytes(), Role::Admin)
+        .unwrap();
     full_sync(&mut a, &ia, &mut b, &ib);
 
-    a.revoke_peer(ib.peer_id(), ib.verifying_key().to_bytes()).unwrap();
+    a.revoke_peer(ib.peer_id(), ib.verifying_key().to_bytes())
+        .unwrap();
     let epoch = a.rotate_epoch(&ID_KEY, &EPOCH0, None).unwrap();
 
-    b.import_keylog(ia.peer_id(), &ia.verifying_key(), a.export_own_keylog().unwrap()).unwrap();
+    b.import_keylog(
+        ia.peer_id(),
+        &ia.verifying_key(),
+        a.export_own_keylog().unwrap(),
+    )
+    .unwrap();
     let kc_b = b.keychain(&ID_KEY, &EPOCH0).unwrap();
-    assert!(kc_b.epoch_key(&epoch).is_none(), "revoked peer cannot open the post-revocation epoch");
-    assert!(a.keychain(&ID_KEY, &EPOCH0).unwrap().epoch_key(&epoch).is_some());
+    assert!(
+        kc_b.epoch_key(&epoch).is_none(),
+        "revoked peer cannot open the post-revocation epoch"
+    );
+    assert!(a
+        .keychain(&ID_KEY, &EPOCH0)
+        .unwrap()
+        .epoch_key(&epoch)
+        .is_some());
 }
 
 #[test]
@@ -99,7 +141,10 @@ fn backcompat_a_vault_with_no_keylog_is_epoch0_only() {
     let kc = store.keychain(&ID_KEY, &EPOCH0).unwrap();
     assert_eq!(kc.head, EPOCH0_ID);
     assert_eq!(kc.epochs.len(), 1, "only the genesis epoch exists");
-    assert!(store.vault_state(&ID_KEY, &EPOCH0).unwrap().is_empty(), "Synced");
+    assert!(
+        store.vault_state(&ID_KEY, &EPOCH0).unwrap().is_empty(),
+        "Synced"
+    );
 }
 
 #[test]
@@ -111,7 +156,9 @@ fn paper_recovery_reconstructs_a_rotated_epoch_key() {
     store.declare_founder(Role::Admin).unwrap();
 
     let paper = PaperKey::from_passphrase("twelve word printed recovery phrase");
-    let epoch = store.rotate_epoch(&ID_KEY, &EPOCH0, Some(paper.public())).unwrap();
+    let epoch = store
+        .rotate_epoch(&ID_KEY, &EPOCH0, Some(paper.public()))
+        .unwrap();
 
     let kc = store.keychain(&ID_KEY, &EPOCH0).unwrap();
     let epoch_key = kc.epoch_key(&epoch).unwrap();
@@ -121,7 +168,10 @@ fn paper_recovery_reconstructs_a_rotated_epoch_key() {
     let paper_blob = find_paper_blob(&text, &epoch);
     let recovered = PaperKey::from_passphrase("twelve word printed recovery phrase");
     let unwrapped = roam_storage::unwrap(&recovered.secret(), &paper_blob).unwrap();
-    assert_eq!(unwrapped, epoch_key, "paper passphrase recovers the epoch key");
+    assert_eq!(
+        unwrapped, epoch_key,
+        "paper passphrase recovers the epoch key"
+    );
 }
 
 /// Pull the base64 `blob` of the `Recipient::Paper` Wrap for `epoch` out of a

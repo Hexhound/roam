@@ -311,8 +311,8 @@ impl RosterLog {
         key: &VerifyingKey,
         bytes: &[u8],
     ) -> Result<Vec<RosterEntry>, StorageError> {
-        let text = std::str::from_utf8(bytes)
-            .map_err(|e| StorageError::MalformedEntry(e.to_string()))?;
+        let text =
+            std::str::from_utf8(bytes).map_err(|e| StorageError::MalformedEntry(e.to_string()))?;
         self.verify_text(key, text)
     }
 
@@ -454,13 +454,28 @@ mod tests {
         let (f, f_key) = pid(10);
         let (b, b_key) = pid(20);
         let mut entries = vec![
-            RosterEntry { seq: 1, op: RosterOp::Add { role: Role::Admin }, subject_peer: f, subject_key: f_key, added_by: f },
-            RosterEntry { seq: 1, op: RosterOp::Add { role: Role::Admin }, subject_peer: b, subject_key: b_key, added_by: b },
+            RosterEntry {
+                seq: 1,
+                op: RosterOp::Add { role: Role::Admin },
+                subject_peer: f,
+                subject_key: f_key,
+                added_by: f,
+            },
+            RosterEntry {
+                seq: 1,
+                op: RosterOp::Add { role: Role::Admin },
+                subject_peer: b,
+                subject_key: b_key,
+                added_by: b,
+            },
         ];
         let peers = merge_roster(&mut entries, Some(f));
         let frec = peers.iter().find(|p| p.peer_id == f).unwrap();
         assert_eq!(frec.role, Role::Admin);
-        assert!(peers.iter().all(|p| p.peer_id != b), "self-add cannot bootstrap admin");
+        assert!(
+            peers.iter().all(|p| p.peer_id != b),
+            "self-add cannot bootstrap admin"
+        );
     }
 
     #[test]
@@ -469,12 +484,33 @@ mod tests {
         let (w, w_key) = pid(20);
         let (c, c_key) = pid(30);
         let mut entries = vec![
-            RosterEntry { seq: 1, op: RosterOp::Add { role: Role::Admin }, subject_peer: f, subject_key: f_key, added_by: f },
-            RosterEntry { seq: 2, op: RosterOp::Add { role: Role::Writer }, subject_peer: w, subject_key: w_key, added_by: f },
-            RosterEntry { seq: 1, op: RosterOp::Add { role: Role::Admin }, subject_peer: c, subject_key: c_key, added_by: w },
+            RosterEntry {
+                seq: 1,
+                op: RosterOp::Add { role: Role::Admin },
+                subject_peer: f,
+                subject_key: f_key,
+                added_by: f,
+            },
+            RosterEntry {
+                seq: 2,
+                op: RosterOp::Add { role: Role::Writer },
+                subject_peer: w,
+                subject_key: w_key,
+                added_by: f,
+            },
+            RosterEntry {
+                seq: 1,
+                op: RosterOp::Add { role: Role::Admin },
+                subject_peer: c,
+                subject_key: c_key,
+                added_by: w,
+            },
         ];
         let peers = merge_roster(&mut entries, Some(f));
-        assert!(peers.iter().all(|p| p.peer_id != c), "a non-admin cannot grant anything");
+        assert!(
+            peers.iter().all(|p| p.peer_id != c),
+            "a non-admin cannot grant anything"
+        );
     }
 
     #[test]
@@ -483,10 +519,34 @@ mod tests {
         let (a2, a2_key) = pid(20);
         let (b, b_key) = pid(30);
         let mut entries = vec![
-            RosterEntry { seq: 1, op: RosterOp::Add { role: Role::Admin }, subject_peer: f, subject_key: f_key, added_by: f },
-            RosterEntry { seq: 2, op: RosterOp::Add { role: Role::Admin }, subject_peer: a2, subject_key: a2_key, added_by: f },
-            RosterEntry { seq: 3, op: RosterOp::Add { role: Role::Admin }, subject_peer: b, subject_key: b_key, added_by: f },
-            RosterEntry { seq: 1, op: RosterOp::SetRole { role: Role::Reader }, subject_peer: b, subject_key: b_key, added_by: a2 },
+            RosterEntry {
+                seq: 1,
+                op: RosterOp::Add { role: Role::Admin },
+                subject_peer: f,
+                subject_key: f_key,
+                added_by: f,
+            },
+            RosterEntry {
+                seq: 2,
+                op: RosterOp::Add { role: Role::Admin },
+                subject_peer: a2,
+                subject_key: a2_key,
+                added_by: f,
+            },
+            RosterEntry {
+                seq: 3,
+                op: RosterOp::Add { role: Role::Admin },
+                subject_peer: b,
+                subject_key: b_key,
+                added_by: f,
+            },
+            RosterEntry {
+                seq: 1,
+                op: RosterOp::SetRole { role: Role::Reader },
+                subject_peer: b,
+                subject_key: b_key,
+                added_by: a2,
+            },
         ];
         let peers = merge_roster(&mut entries, Some(f));
         let brec = peers.iter().find(|p| p.peer_id == b).unwrap();
@@ -499,11 +559,41 @@ mod tests {
         let (b, b_key) = pid(20);
         let (c, c_key) = pid(30);
         let mut entries = vec![
-            RosterEntry { seq: 1, op: RosterOp::Add { role: Role::Admin }, subject_peer: a, subject_key: a_key, added_by: a },
-            RosterEntry { seq: 2, op: RosterOp::Add { role: Role::Admin }, subject_peer: b, subject_key: b_key, added_by: a },
-            RosterEntry { seq: 1, op: RosterOp::Add { role: Role::Admin }, subject_peer: c, subject_key: c_key, added_by: b },
-            RosterEntry { seq: 3, op: RosterOp::SetRole { role: Role::Reader }, subject_peer: b, subject_key: b_key, added_by: a },
-            RosterEntry { seq: 4, op: RosterOp::Revoke, subject_peer: b, subject_key: b_key, added_by: a },
+            RosterEntry {
+                seq: 1,
+                op: RosterOp::Add { role: Role::Admin },
+                subject_peer: a,
+                subject_key: a_key,
+                added_by: a,
+            },
+            RosterEntry {
+                seq: 2,
+                op: RosterOp::Add { role: Role::Admin },
+                subject_peer: b,
+                subject_key: b_key,
+                added_by: a,
+            },
+            RosterEntry {
+                seq: 1,
+                op: RosterOp::Add { role: Role::Admin },
+                subject_peer: c,
+                subject_key: c_key,
+                added_by: b,
+            },
+            RosterEntry {
+                seq: 3,
+                op: RosterOp::SetRole { role: Role::Reader },
+                subject_peer: b,
+                subject_key: b_key,
+                added_by: a,
+            },
+            RosterEntry {
+                seq: 4,
+                op: RosterOp::Revoke,
+                subject_peer: b,
+                subject_key: b_key,
+                added_by: a,
+            },
         ];
         let peers = merge_roster(&mut entries, Some(a));
         let brec = peers.iter().find(|p| p.peer_id == b).unwrap();
@@ -519,9 +609,27 @@ mod tests {
         let (f, f_key) = pid(10);
         let (b, b_key) = pid(20);
         let mut entries = vec![
-            RosterEntry { seq: 1, op: RosterOp::Add { role: Role::Admin }, subject_peer: f, subject_key: f_key, added_by: f },
-            RosterEntry { seq: 2, op: RosterOp::Add { role: Role::Reader }, subject_peer: b, subject_key: b_key, added_by: f },
-            RosterEntry { seq: 3, op: RosterOp::SetRole { role: Role::Writer }, subject_peer: b, subject_key: b_key, added_by: f },
+            RosterEntry {
+                seq: 1,
+                op: RosterOp::Add { role: Role::Admin },
+                subject_peer: f,
+                subject_key: f_key,
+                added_by: f,
+            },
+            RosterEntry {
+                seq: 2,
+                op: RosterOp::Add { role: Role::Reader },
+                subject_peer: b,
+                subject_key: b_key,
+                added_by: f,
+            },
+            RosterEntry {
+                seq: 3,
+                op: RosterOp::SetRole { role: Role::Writer },
+                subject_peer: b,
+                subject_key: b_key,
+                added_by: f,
+            },
         ];
         let peers = merge_roster(&mut entries, Some(f));
         let brec = peers.iter().find(|p| p.peer_id == b).unwrap();
@@ -536,11 +644,21 @@ mod tests {
         let log = RosterLog::new(dir.path(), a.peer_id());
 
         let e1 = log
-            .append(&a, RosterOp::Add { role: Role::Admin }, b.peer_id(), b.verifying_key().to_bytes())
+            .append(
+                &a,
+                RosterOp::Add { role: Role::Admin },
+                b.peer_id(),
+                b.verifying_key().to_bytes(),
+            )
             .unwrap();
         assert_eq!(e1.seq, 1);
         let e2 = log
-            .append(&a, RosterOp::Revoke, b.peer_id(), b.verifying_key().to_bytes())
+            .append(
+                &a,
+                RosterOp::Revoke,
+                b.peer_id(),
+                b.verifying_key().to_bytes(),
+            )
             .unwrap();
         assert_eq!(e2.seq, 2);
 
@@ -557,8 +675,13 @@ mod tests {
         let a = Identity::generate();
         let b = Identity::generate();
         let log = RosterLog::new(dir.path(), a.peer_id());
-        log.append(&a, RosterOp::Add { role: Role::Admin }, b.peer_id(), b.verifying_key().to_bytes())
-            .unwrap();
+        log.append(
+            &a,
+            RosterOp::Add { role: Role::Admin },
+            b.peer_id(),
+            b.verifying_key().to_bytes(),
+        )
+        .unwrap();
 
         // Flip subject_peer, keep the old signature -> must fail verification.
         let path = log.path();
@@ -580,14 +703,36 @@ mod tests {
         // drops the entry; this test is about revoke terminality, not the binding.
         let x = u64::from_le_bytes(key[0..8].try_into().unwrap());
         let mut entries = vec![
-            RosterEntry { seq: 1, op: RosterOp::Add { role: Role::Writer }, subject_peer: x, subject_key: key, added_by: 1 },
-            RosterEntry { seq: 2, op: RosterOp::Revoke, subject_peer: x, subject_key: key, added_by: 1 },
+            RosterEntry {
+                seq: 1,
+                op: RosterOp::Add { role: Role::Writer },
+                subject_peer: x,
+                subject_key: key,
+                added_by: 1,
+            },
+            RosterEntry {
+                seq: 2,
+                op: RosterOp::Revoke,
+                subject_peer: x,
+                subject_key: key,
+                added_by: 1,
+            },
             // Stale Add from a DIFFERENT, higher-id author must NOT resurrect X.
-            RosterEntry { seq: 1, op: RosterOp::Add { role: Role::Writer }, subject_peer: x, subject_key: key, added_by: 2 },
+            RosterEntry {
+                seq: 1,
+                op: RosterOp::Add { role: Role::Writer },
+                subject_peer: x,
+                subject_key: key,
+                added_by: 2,
+            },
         ];
         let peers = merge_roster(&mut entries, Some(1));
         let rec = peers.iter().find(|p| p.peer_id == x).unwrap();
-        assert_eq!(rec.status, PeerStatus::Revoked, "revocation must be terminal across authors");
+        assert_eq!(
+            rec.status,
+            PeerStatus::Revoked,
+            "revocation must be terminal across authors"
+        );
     }
 
     #[test]
@@ -607,8 +752,13 @@ mod tests {
         let a = Identity::generate();
         let b = Identity::generate();
         let log = RosterLog::new(dir.path(), a.peer_id());
-        log.append(&a, RosterOp::Add { role: Role::Admin }, b.peer_id(), b.verifying_key().to_bytes())
-            .unwrap();
+        log.append(
+            &a,
+            RosterOp::Add { role: Role::Admin },
+            b.peer_id(),
+            b.verifying_key().to_bytes(),
+        )
+        .unwrap();
 
         let mut f = std::fs::OpenOptions::new()
             .append(true)

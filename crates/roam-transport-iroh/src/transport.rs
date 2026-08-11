@@ -155,7 +155,10 @@ impl Transport for IrohTransport {
                 Ok(())
             }
             Err(e) => {
-                crate::dlog!("send peer={peer} frame={}: FAILED ({e}); evicting conn", frame.kind());
+                crate::dlog!(
+                    "send peer={peer} frame={}: FAILED ({e}); evicting conn",
+                    frame.kind()
+                );
                 // The cached stream is dead (idle timeout, reset, peer restart).
                 // Evict it so the NEXT `dial` opens a fresh connection instead of
                 // reusing this corpse forever — otherwise a long-running daemon
@@ -192,7 +195,9 @@ impl Transport for IrohTransport {
             return Ok(());
         }
 
-        let key = self.node_key(peer).ok_or(TransportError::Unreachable(peer))?;
+        let key = self
+            .node_key(peer)
+            .ok_or(TransportError::Unreachable(peer))?;
         let node_id =
             EndpointId::from_bytes(&key).map_err(|e| TransportError::Io(e.to_string()))?;
         // Prefer a seeded direct address; fall back to a bare node id (discovery).
@@ -381,11 +386,10 @@ mod tests {
         ta.dial(id_b.peer_id()).await.unwrap();
         ta.send(id_b.peer_id(), Frame::Ping).await.unwrap();
 
-        let (from, frame) =
-            tokio::time::timeout(std::time::Duration::from_secs(10), b_in.next())
-                .await
-                .unwrap()
-                .unwrap();
+        let (from, frame) = tokio::time::timeout(std::time::Duration::from_secs(10), b_in.next())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(from, id_a.peer_id());
         assert_eq!(frame, Frame::Ping);
     }
@@ -411,11 +415,8 @@ mod tests {
         transport
             .add_route(peer.peer_id(), peer.verifying_key().to_bytes())
             .await;
-        let dial = tokio::time::timeout(
-            Duration::from_millis(300),
-            transport.dial(peer.peer_id()),
-        )
-        .await;
+        let dial =
+            tokio::time::timeout(Duration::from_millis(300), transport.dial(peer.peer_id())).await;
         match dial {
             // Still attempting to connect ⇒ the route resolved. Good.
             Err(_elapsed) => {}
@@ -430,11 +431,8 @@ mod tests {
 
         // Forget the route: dial is refused with Unreachable again.
         transport.remove_route(peer.peer_id()).await;
-        let after = tokio::time::timeout(
-            Duration::from_millis(300),
-            transport.dial(peer.peer_id()),
-        )
-        .await;
+        let after =
+            tokio::time::timeout(Duration::from_millis(300), transport.dial(peer.peer_id())).await;
         assert!(
             matches!(after, Ok(Err(TransportError::Unreachable(_)))),
             "remove_route did not undo the route: {after:?}"

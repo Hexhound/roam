@@ -220,10 +220,16 @@ impl<T: Transport + 'static> Engine<T> {
         };
 
         if pushes.is_empty() {
-            crate::dlog!("flush_local: nothing to push (own_log={} bytes)", own_log.len());
+            crate::dlog!(
+                "flush_local: nothing to push (own_log={} bytes)",
+                own_log.len()
+            );
         }
         for (peer, jsonl) in pushes {
-            crate::dlog!("flush_local: pushing {} op-bytes to peer={peer}", jsonl.len());
+            crate::dlog!(
+                "flush_local: pushing {} op-bytes to peer={peer}",
+                jsonl.len()
+            );
             self.send(
                 peer,
                 Frame::Ops {
@@ -280,12 +286,17 @@ impl<T: Transport + 'static> Engine<T> {
         // 2. Connected ∩ Active, under the connected lock (store guard dropped).
         let peers: Vec<u64> = {
             let connected = self.connected.lock().await;
-            connected.iter().copied().filter(|p| active.contains(p)).collect()
+            connected
+                .iter()
+                .copied()
+                .filter(|p| active.contains(p))
+                .collect()
         };
         // 3. Sends happen lock-free.
         for peer in peers {
             for hash in &wanted {
-                self.send(peer, Frame::BlobWant { hash: hash.clone() }).await;
+                self.send(peer, Frame::BlobWant { hash: hash.clone() })
+                    .await;
             }
         }
     }
@@ -328,7 +339,12 @@ impl<T: Transport + 'static> Engine<T> {
 
     /// Vouch for `peer` (holding `key`) locally, then gossip the updated roster
     /// to every connected peer so they learn the new device (transitive mesh).
-    pub async fn add_peer(&self, peer: u64, key: [u8; 32], role: roam_storage::Role) -> anyhow::Result<()> {
+    pub async fn add_peer(
+        &self,
+        peer: u64,
+        key: [u8; 32],
+        role: roam_storage::Role,
+    ) -> anyhow::Result<()> {
         {
             let mut store = self.store.lock().await;
             store.add_peer(peer, key, role)?;
@@ -450,7 +466,10 @@ impl<T: Transport + 'static> Engine<T> {
                 self.push_logs(peer).await;
             }
             Frame::Ops { author, jsonl } => {
-                crate::dlog!("handle Ops from peer={peer} author={author} ({} bytes)", jsonl.len());
+                crate::dlog!(
+                    "handle Ops from peer={peer} author={author} ({} bytes)",
+                    jsonl.len()
+                );
                 if author == self.peer_id() {
                     return Ok(());
                 }
@@ -578,7 +597,10 @@ impl<T: Transport + 'static> Engine<T> {
                 };
                 self.send(
                     peer,
-                    Frame::KeylogOps { author: self.peer_id(), jsonl: own_keylog },
+                    Frame::KeylogOps {
+                        author: self.peer_id(),
+                        jsonl: own_keylog,
+                    },
                 )
                 .await;
                 for (author, jsonl) in keylogs {
@@ -665,7 +687,13 @@ impl<T: Transport + 'static> Engine<T> {
         }
         self.connected.lock().await.insert(peer);
 
-        self.send(peer, Frame::Hello { vault: self.vault.0 }).await;
+        self.send(
+            peer,
+            Frame::Hello {
+                vault: self.vault.0,
+            },
+        )
+        .await;
         self.send(
             peer,
             Frame::RosterHave {
@@ -706,10 +734,19 @@ impl<T: Transport + 'static> Engine<T> {
         let keylog_have: Vec<(u64, u64)> = std::iter::once((self.peer_id(), 0u64))
             .chain(offer.keylogs.iter().map(|(a, _)| (*a, 0u64)))
             .collect();
-        self.send(peer, Frame::KeylogHave { authors: keylog_have }).await;
         self.send(
             peer,
-            Frame::KeylogOps { author: self.peer_id(), jsonl: offer.own_keylog },
+            Frame::KeylogHave {
+                authors: keylog_have,
+            },
+        )
+        .await;
+        self.send(
+            peer,
+            Frame::KeylogOps {
+                author: self.peer_id(),
+                jsonl: offer.own_keylog,
+            },
         )
         .await;
         for (author, jsonl) in offer.keylogs {
@@ -776,7 +813,11 @@ impl<T: Transport + 'static> Engine<T> {
             .filter(|p| p.status == PeerStatus::Active && p.peer_id != me)
             .filter_map(|p| {
                 let jsonl = store.export_keylog(p.peer_id).ok()?;
-                if jsonl.is_empty() { None } else { Some((p.peer_id, jsonl)) }
+                if jsonl.is_empty() {
+                    None
+                } else {
+                    Some((p.peer_id, jsonl))
+                }
             })
             .collect()
     }

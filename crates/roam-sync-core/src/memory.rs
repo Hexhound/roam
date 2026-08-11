@@ -85,9 +85,12 @@ impl Transport for MemoryTransport {
         }
         let tx = {
             let map = self.board.inbounds.lock().unwrap();
-            map.get(&peer).cloned().ok_or(TransportError::Unreachable(peer))?
+            map.get(&peer)
+                .cloned()
+                .ok_or(TransportError::Unreachable(peer))?
         };
-        tx.send((self.me, frame)).map_err(|_| TransportError::Closed)
+        tx.send((self.me, frame))
+            .map_err(|_| TransportError::Closed)
     }
 
     async fn dial(&self, peer: u64) -> Result<(), TransportError> {
@@ -102,7 +105,12 @@ impl Transport for MemoryTransport {
     }
 
     fn incoming(&self) -> BoxStream<'static, (u64, Frame)> {
-        let rx = self.rx.lock().unwrap().take().expect("incoming() called once");
+        let rx = self
+            .rx
+            .lock()
+            .unwrap()
+            .take()
+            .expect("incoming() called once");
         tokio_stream_wrapper(rx).boxed()
     }
 
@@ -151,6 +159,9 @@ mod tests {
     async fn send_to_unknown_peer_errors() {
         let board = MemorySwitchboard::new();
         let a = board.endpoint(1);
-        assert!(matches!(a.send(99, Frame::Ping).await, Err(TransportError::Unreachable(99))));
+        assert!(matches!(
+            a.send(99, Frame::Ping).await,
+            Err(TransportError::Unreachable(99))
+        ));
     }
 }

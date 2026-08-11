@@ -27,10 +27,7 @@ pub fn plan_from_marker(marker: &Marker) -> CheckpointPlan {
 /// Bytes reclaimable = sum of sizes of on-disk blobs NOT in `referenced`.
 /// `on_disk` is `(hash, size_bytes)`; `referenced` is every hash still reachable
 /// in the retained range.
-pub fn reclaimable_blob_bytes(
-    on_disk: &[(String, u64)],
-    referenced: &HashSet<String>,
-) -> u64 {
+pub fn reclaimable_blob_bytes(on_disk: &[(String, u64)], referenced: &HashSet<String>) -> u64 {
     on_disk
         .iter()
         .filter(|(h, _)| !referenced.contains(h))
@@ -46,7 +43,11 @@ mod tests {
         let mut log_lens = BTreeMap::new();
         log_lens.insert(1u64, 3);
         log_lens.insert(2u64, 5);
-        Marker { ts_ms: 42, frontier: "FRONT".into(), log_lens }
+        Marker {
+            ts_ms: 42,
+            frontier: "FRONT".into(),
+            log_lens,
+        }
     }
 
     #[test]

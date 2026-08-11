@@ -201,7 +201,10 @@ mod tests {
         // When `renamed_from` is `None` it must be OMITTED from the JSON so old
         // readers see exactly the old shape (no new key at all).
         let value = sample(EntryStatus::Live).to_value();
-        assert!(!value.contains("renamed_from"), "None must not serialize a key: {value}");
+        assert!(
+            !value.contains("renamed_from"),
+            "None must not serialize a key: {value}"
+        );
     }
 
     #[test]
@@ -291,8 +294,14 @@ mod tests {
             renamed_from: None,
             tombstoned_at: None,
         };
-        assert!(blob.to_value().contains("\"kind\":\"blob\""), "{}", blob.to_value());
-        assert!(sample(EntryStatus::Live).to_value().contains("\"kind\":\"text\""));
+        assert!(
+            blob.to_value().contains("\"kind\":\"blob\""),
+            "{}",
+            blob.to_value()
+        );
+        assert!(sample(EntryStatus::Live)
+            .to_value()
+            .contains("\"kind\":\"text\""));
     }
 
     #[test]

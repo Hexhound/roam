@@ -61,7 +61,10 @@ impl OpLog {
         // Whether this append creates the file (vs. extends an existing one).
         let is_create = !self.path.exists();
 
-        let mut file = OpenOptions::new().create(true).append(true).open(&self.path)?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
         file.write_all(&json)?;
         file.sync_all()?;
 
@@ -100,9 +103,13 @@ impl OpLog {
     /// Verify raw log `bytes` (as received from a peer) WITHOUT touching disk.
     /// Same rules as [`OpLog::read_verified`]; lets a caller check bytes before
     /// persisting them. Invalid UTF-8 is a malformed log.
-    pub fn verify_bytes(&self, key: &VerifyingKey, bytes: &[u8]) -> Result<Vec<Entry>, StorageError> {
-        let text = std::str::from_utf8(bytes)
-            .map_err(|e| StorageError::MalformedEntry(e.to_string()))?;
+    pub fn verify_bytes(
+        &self,
+        key: &VerifyingKey,
+        bytes: &[u8],
+    ) -> Result<Vec<Entry>, StorageError> {
+        let text =
+            std::str::from_utf8(bytes).map_err(|e| StorageError::MalformedEntry(e.to_string()))?;
         self.verify_text(key, text)
     }
 
@@ -139,7 +146,10 @@ impl OpLog {
             if !key.verify(&update, &sig) {
                 return Err(StorageError::BadSignature(parsed.peer));
             }
-            out.push(Entry { peer_id: parsed.peer, update });
+            out.push(Entry {
+                peer_id: parsed.peer,
+                update,
+            });
         }
         Ok(out)
     }
@@ -162,7 +172,10 @@ mod tests {
 
         let entries = log.read_verified(&id.verifying_key()).unwrap();
         let payloads: Vec<&[u8]> = entries.iter().map(|e| e.update.as_slice()).collect();
-        assert_eq!(payloads, vec![b"update-one".as_ref(), b"update-two".as_ref()]);
+        assert_eq!(
+            payloads,
+            vec![b"update-one".as_ref(), b"update-two".as_ref()]
+        );
     }
 
     #[test]
@@ -200,7 +213,10 @@ mod tests {
 
         // Simulate a crash mid-append: append a partial line with NO newline.
         let path = log.path();
-        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
         std::io::Write::write_all(&mut file, br#"{"peer":1,"sig":"broke"#).unwrap();
 
         // The two complete entries survive; the torn tail is dropped.

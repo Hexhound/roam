@@ -187,8 +187,12 @@ async fn three_device_admin_writer_reader_role_enforcement() {
     // ---- Stores + BUNDLE-BOOTSTRAP trust (single founder = Admin). ----
     let mut admin_store = Store::open(admin_store_dir.path(), admin_id.clone()).unwrap();
     admin_store.declare_founder(Role::Admin).unwrap();
-    admin_store.add_peer(writer_id.peer_id(), writer_key, Role::Writer).unwrap();
-    admin_store.add_peer(reader_id.peer_id(), reader_key, Role::Reader).unwrap();
+    admin_store
+        .add_peer(writer_id.peer_id(), writer_key, Role::Writer)
+        .unwrap();
+    admin_store
+        .add_peer(reader_id.peer_id(), reader_key, Role::Reader)
+        .unwrap();
 
     // The Admin's transitive roster after BOTH adds: every device learns every
     // other (so the Writer<->Reader edge is trusted from the start).
@@ -196,16 +200,32 @@ async fn three_device_admin_writer_reader_role_enforcement() {
 
     let mut writer_store = Store::open(writer_store_dir.path(), writer_id.clone()).unwrap();
     writer_store.pin_founder(admin_id.peer_id()).unwrap();
-    writer_store.import_roster_bundle(roster_bundle.clone()).unwrap();
+    writer_store
+        .import_roster_bundle(roster_bundle.clone())
+        .unwrap();
 
     let mut reader_store = Store::open(reader_store_dir.path(), reader_id.clone()).unwrap();
     reader_store.pin_founder(admin_id.peer_id()).unwrap();
-    reader_store.import_roster_bundle(roster_bundle.clone()).unwrap();
+    reader_store
+        .import_roster_bundle(roster_bundle.clone())
+        .unwrap();
 
     // Sanity: roles materialized exactly as granted.
-    assert_eq!(admin_store.self_role(), Some(Role::Admin), "admin self-role");
-    assert_eq!(writer_store.self_role(), Some(Role::Writer), "writer self-role");
-    assert_eq!(reader_store.self_role(), Some(Role::Reader), "reader self-role");
+    assert_eq!(
+        admin_store.self_role(),
+        Some(Role::Admin),
+        "admin self-role"
+    );
+    assert_eq!(
+        writer_store.self_role(),
+        Some(Role::Writer),
+        "writer self-role"
+    );
+    assert_eq!(
+        reader_store.self_role(),
+        Some(Role::Reader),
+        "reader self-role"
+    );
     assert!(writer_store.may_write(), "writer may write");
     assert!(!reader_store.may_write(), "reader may NOT write");
 
@@ -223,26 +243,57 @@ async fn three_device_admin_writer_reader_role_enforcement() {
         (writer_id.peer_id(), writer_key),
     ]);
     let admin_tp = IrohTransport::spawn(&admin_id, admin_routes).await.unwrap();
-    let writer_tp = IrohTransport::spawn(&writer_id, writer_routes).await.unwrap();
-    let reader_tp = IrohTransport::spawn(&reader_id, reader_routes).await.unwrap();
+    let writer_tp = IrohTransport::spawn(&writer_id, writer_routes)
+        .await
+        .unwrap();
+    let reader_tp = IrohTransport::spawn(&reader_id, reader_routes)
+        .await
+        .unwrap();
 
     // Loopback reachability: full-mesh addr exchange.
-    admin_tp.add_addr(writer_id.peer_id(), writer_tp.endpoint_addr()).await;
-    admin_tp.add_addr(reader_id.peer_id(), reader_tp.endpoint_addr()).await;
-    writer_tp.add_addr(admin_id.peer_id(), admin_tp.endpoint_addr()).await;
-    writer_tp.add_addr(reader_id.peer_id(), reader_tp.endpoint_addr()).await;
-    reader_tp.add_addr(admin_id.peer_id(), admin_tp.endpoint_addr()).await;
-    reader_tp.add_addr(writer_id.peer_id(), writer_tp.endpoint_addr()).await;
+    admin_tp
+        .add_addr(writer_id.peer_id(), writer_tp.endpoint_addr())
+        .await;
+    admin_tp
+        .add_addr(reader_id.peer_id(), reader_tp.endpoint_addr())
+        .await;
+    writer_tp
+        .add_addr(admin_id.peer_id(), admin_tp.endpoint_addr())
+        .await;
+    writer_tp
+        .add_addr(reader_id.peer_id(), reader_tp.endpoint_addr())
+        .await;
+    reader_tp
+        .add_addr(admin_id.peer_id(), admin_tp.endpoint_addr())
+        .await;
+    reader_tp
+        .add_addr(writer_id.peer_id(), writer_tp.endpoint_addr())
+        .await;
 
     // ---- Engines + bridges. ----
     let admin = make_device(
-        admin_id.clone(), vault_id, admin_store, admin_tp, admin_vault_dir, admin_store_dir,
+        admin_id.clone(),
+        vault_id,
+        admin_store,
+        admin_tp,
+        admin_vault_dir,
+        admin_store_dir,
     );
     let writer = make_device(
-        writer_id.clone(), vault_id, writer_store, writer_tp, writer_vault_dir, writer_store_dir,
+        writer_id.clone(),
+        vault_id,
+        writer_store,
+        writer_tp,
+        writer_vault_dir,
+        writer_store_dir,
     );
     let reader = make_device(
-        reader_id.clone(), vault_id, reader_store, reader_tp, reader_vault_dir, reader_store_dir,
+        reader_id.clone(),
+        vault_id,
+        reader_store,
+        reader_tp,
+        reader_vault_dir,
+        reader_store_dir,
     );
 
     tokio::spawn(admin.engine.clone().run());
@@ -272,8 +323,20 @@ async fn three_device_admin_writer_reader_role_enforcement() {
     // ================================================================
     std::fs::write(writer.note(), "hello world").unwrap();
     scan(&writer).await; // import writer's edit + gossip
-    converge_note(&mesh, &admin, "hello world", "admin to receive writer's edit").await;
-    converge_note(&mesh, &reader, "hello world", "reader to receive writer's edit").await;
+    converge_note(
+        &mesh,
+        &admin,
+        "hello world",
+        "admin to receive writer's edit",
+    )
+    .await;
+    converge_note(
+        &mesh,
+        &reader,
+        "hello world",
+        "reader to receive writer's edit",
+    )
+    .await;
 
     // ================================================================
     // Phase 3 — READER edit is REVERTED locally (author-side enforcement).
@@ -287,8 +350,20 @@ async fn three_device_admin_writer_reader_role_enforcement() {
     // ================================================================
     std::fs::write(reader.note(), "hello world READER-TAMPER").unwrap();
     // Admin and Writer must NEVER see the reader's tampered text.
-    note_stays(&mesh, &admin, "hello world", "reader edit must not reach admin").await;
-    note_stays(&mesh, &writer, "hello world", "reader edit must not reach writer").await;
+    note_stays(
+        &mesh,
+        &admin,
+        "hello world",
+        "reader edit must not reach admin",
+    )
+    .await;
+    note_stays(
+        &mesh,
+        &writer,
+        "hello world",
+        "reader edit must not reach writer",
+    )
+    .await;
     // The reader's OWN note reverted (the mesh pumping above scanned it repeatedly).
     assert_eq!(
         note_text(&reader),
@@ -304,7 +379,9 @@ async fn three_device_admin_writer_reader_role_enforcement() {
     {
         let store = admin.engine.store();
         let mut guard = store.lock().await;
-        guard.set_role(writer_id.peer_id(), writer_key, Role::Reader).unwrap();
+        guard
+            .set_role(writer_id.peer_id(), writer_key, Role::Reader)
+            .unwrap();
         assert_eq!(
             guard.role_of(writer_id.peer_id()),
             Some(Role::Reader),
@@ -322,7 +399,11 @@ async fn three_device_admin_writer_reader_role_enforcement() {
         let store = reader.engine.store();
         let mut guard = store.lock().await;
         guard
-            .import_roster(admin_id.peer_id(), &admin_id.verifying_key(), admin_roster_bytes)
+            .import_roster(
+                admin_id.peer_id(),
+                &admin_id.verifying_key(),
+                admin_roster_bytes,
+            )
             .unwrap();
         assert_eq!(
             guard.role_of(writer_id.peer_id()),
@@ -334,7 +415,19 @@ async fn three_device_admin_writer_reader_role_enforcement() {
     // The ex-Writer (still believing it is a Writer) edits again and gossips.
     std::fs::write(writer.note(), "hello world DEMOTED-EDIT").unwrap();
     scan(&writer).await; // authors + gossips (its store still says Writer)
-    // Dropped mesh-wide: neither Admin nor Reader accepts the now-Reader's ops.
-    note_stays(&mesh, &admin, "hello world", "demoted writer's edit must not reach admin").await;
-    note_stays(&mesh, &reader, "hello world", "demoted writer's edit must not reach reader").await;
+                         // Dropped mesh-wide: neither Admin nor Reader accepts the now-Reader's ops.
+    note_stays(
+        &mesh,
+        &admin,
+        "hello world",
+        "demoted writer's edit must not reach admin",
+    )
+    .await;
+    note_stays(
+        &mesh,
+        &reader,
+        "hello world",
+        "demoted writer's edit must not reach reader",
+    )
+    .await;
 }

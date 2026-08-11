@@ -66,7 +66,10 @@ pub fn diff_to_ops(old: &str, new: &str) -> Vec<TextOp> {
 fn coarse_replace(old_len: usize, new: &str) -> Vec<TextOp> {
     let mut ops = Vec::new();
     if old_len > 0 {
-        ops.push(TextOp::Delete { pos: 0, len: old_len });
+        ops.push(TextOp::Delete {
+            pos: 0,
+            len: old_len,
+        });
     }
     if !new.is_empty() {
         ops.push(TextOp::Insert {
@@ -181,7 +184,11 @@ mod tests {
     /// Assert the ops reproduce `new` from `old` under the splice model.
     fn assert_roundtrip(old: &str, new: &str) -> Vec<TextOp> {
         let ops = diff_to_ops(old, new);
-        assert_eq!(apply(old, &ops), new, "roundtrip failed: {old:?} -> {new:?}");
+        assert_eq!(
+            apply(old, &ops),
+            new,
+            "roundtrip failed: {old:?} -> {new:?}"
+        );
         ops
     }
 
@@ -317,7 +324,13 @@ mod tests {
         let old = "café 世界";
         let new = "🚀 nouveau";
         let ops = diff_to_ops_bounded(old, new, 2);
-        assert_eq!(ops[0], TextOp::Delete { pos: 0, len: old.chars().count() });
+        assert_eq!(
+            ops[0],
+            TextOp::Delete {
+                pos: 0,
+                len: old.chars().count()
+            }
+        );
         assert_eq!(apply(old, &ops), new);
     }
 

@@ -33,7 +33,9 @@ pub fn wrap(recipient_pub: &[u8; 32], key: &[u8; 32]) -> Vec<u8> {
 
     let cipher = XChaCha20Poly1305::new((&subkey).into());
     let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
-    let ct = cipher.encrypt(&nonce, key.as_slice()).expect("aead encrypt");
+    let ct = cipher
+        .encrypt(&nonce, key.as_slice())
+        .expect("aead encrypt");
 
     let mut out = Vec::with_capacity(EPH_PUB_LEN + NONCE_LEN + ct.len());
     out.extend_from_slice(&eph_pub.to_bytes());

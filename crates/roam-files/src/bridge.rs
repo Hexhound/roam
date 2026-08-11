@@ -832,95 +832,95 @@ impl FolderBridge {
         // Steps 1b + 2 author fileset entries / tombstones (CRDT writes) — a
         // read-only Reader never mutates the CRDT, so both are skipped for it.
         if !read_only {
-        // --- Step 1b: heal present files with NO file-set entry at all. ---
-        // `import_file` writes its Live entry AFTER the `ops.is_empty()` early
-        // return, so an unchanged present file that has no entry (pre-file-set
-        // migration, or a lost entry op) would stay entry-less forever and never
-        // propagate to peers. Heal ONLY a totally-absent entry: a `Tombstoned`
-        // entry is owned by Step 3 (delete-wins/resurrection) and a `Live` one
-        // is already fine — this must not disturb the "no-op import keeps a
-        // remote Tombstoned entry" behavior. Require a sidecar so only TEXT files
-        // are healed here (a blob is entried by `import_blob` directly and carries
-        // a `.roamblob` marker, not a `.roammeta` sidecar).
-        for key in &present {
-            if store.get_entry(FILESET_MAP_ID, key).is_some() {
-                continue;
-            }
-            if !sidecar_path(&self.meta_dir, key).exists() {
-                continue;
-            }
-            store.set_entry(
-                FILESET_MAP_ID,
-                key,
-                &FileEntry {
-                    kind: EntryKind::Text,
-                    status: EntryStatus::Live,
-                    content_hash: text_hash(&store.text(key)),
-                    renamed_from: None,
-                    tombstoned_at: None,
+            // --- Step 1b: heal present files with NO file-set entry at all. ---
+            // `import_file` writes its Live entry AFTER the `ops.is_empty()` early
+            // return, so an unchanged present file that has no entry (pre-file-set
+            // migration, or a lost entry op) would stay entry-less forever and never
+            // propagate to peers. Heal ONLY a totally-absent entry: a `Tombstoned`
+            // entry is owned by Step 3 (delete-wins/resurrection) and a `Live` one
+            // is already fine — this must not disturb the "no-op import keeps a
+            // remote Tombstoned entry" behavior. Require a sidecar so only TEXT files
+            // are healed here (a blob is entried by `import_blob` directly and carries
+            // a `.roamblob` marker, not a `.roammeta` sidecar).
+            for key in &present {
+                if store.get_entry(FILESET_MAP_ID, key).is_some() {
+                    continue;
                 }
-                .to_value(),
-            )?;
-        }
-
-        // --- Step 2: tombstone locally-deleted files. ---
-        // Snapshot the entries so this is a single pass (import above may have
-        // mutated them). An unchanged import in Step 1 is a no-op that does NOT
-        // rewrite its entry, so a remote tombstone on a present-but-unchanged
-        // file survives Step 1 to be handled in Step 3.
-        for (key, value) in store.entries(FILESET_MAP_ID) {
-            let entry = FileEntry::from_value(&value)?;
-            if entry.status != EntryStatus::Live || present.contains(&key) {
-                continue;
-            }
-            // `key_to_path` inverts container_id → absolute path, splitting the
-            // `/`-separated vault-relative key and joining each component so the
-            // result uses native separators on every platform (B1).
-            let file = key_to_path(&self.vault_root, &key);
-
-            // BLOB local-delete detection (blob-aware variant of the text rule
-            // below). A blob has NO sidecar, and — now that pull-transfer (D4)
-            // and projection (D5) exist — bytes being present in the local store
-            // NO LONGER implies this device ever had the file on disk: a fetched
-            // remote-new blob has local bytes BEFORE it is ever projected. The
-            // device-local PRESENCE MARKER is the correct "we had it on disk"
-            // signal instead (written by import_blob and by project_blob):
-            //   Live Blob + file absent + marker PRESENT → locally deleted →
-            //     tombstone (the blob-ref IS the entry's own content_hash) and
-            //     drop the marker (this device no longer has the file on disk).
-            //   Live Blob + file absent + marker ABSENT  → a remote-new blob-ref
-            //     never projected here (bytes may or may not have transferred
-            //     yet) — leave it for Step 3, do NOT tombstone (never had it).
-            if entry.kind == EntryKind::Blob {
-                if blob_marker_path(&self.meta_dir, &key).exists() {
-                    write_tombstone(store, &key, EntryKind::Blob, entry.content_hash.clone())?;
-                    remove_if_present(&blob_marker_path(&self.meta_dir, &key))?;
-                    outcomes.push((file, SyncOutcome::changed_no_ops()));
+                if !sidecar_path(&self.meta_dir, key).exists() {
+                    continue;
                 }
-                continue;
+                store.set_entry(
+                    FILESET_MAP_ID,
+                    key,
+                    &FileEntry {
+                        kind: EntryKind::Text,
+                        status: EntryStatus::Live,
+                        content_hash: text_hash(&store.text(key)),
+                        renamed_from: None,
+                        tombstoned_at: None,
+                    }
+                    .to_value(),
+                )?;
             }
 
-            let sidecar = sidecar_path(&self.meta_dir, &key);
-            if !sidecar.exists() {
-                // Absent file with no sidecar: a remote-new entry this device
-                // never had — leave it for Step 3, do NOT tombstone.
-                continue;
+            // --- Step 2: tombstone locally-deleted files. ---
+            // Snapshot the entries so this is a single pass (import above may have
+            // mutated them). An unchanged import in Step 1 is a no-op that does NOT
+            // rewrite its entry, so a remote tombstone on a present-but-unchanged
+            // file survives Step 1 to be handled in Step 3.
+            for (key, value) in store.entries(FILESET_MAP_ID) {
+                let entry = FileEntry::from_value(&value)?;
+                if entry.status != EntryStatus::Live || present.contains(&key) {
+                    continue;
+                }
+                // `key_to_path` inverts container_id → absolute path, splitting the
+                // `/`-separated vault-relative key and joining each component so the
+                // result uses native separators on every platform (B1).
+                let file = key_to_path(&self.vault_root, &key);
+
+                // BLOB local-delete detection (blob-aware variant of the text rule
+                // below). A blob has NO sidecar, and — now that pull-transfer (D4)
+                // and projection (D5) exist — bytes being present in the local store
+                // NO LONGER implies this device ever had the file on disk: a fetched
+                // remote-new blob has local bytes BEFORE it is ever projected. The
+                // device-local PRESENCE MARKER is the correct "we had it on disk"
+                // signal instead (written by import_blob and by project_blob):
+                //   Live Blob + file absent + marker PRESENT → locally deleted →
+                //     tombstone (the blob-ref IS the entry's own content_hash) and
+                //     drop the marker (this device no longer has the file on disk).
+                //   Live Blob + file absent + marker ABSENT  → a remote-new blob-ref
+                //     never projected here (bytes may or may not have transferred
+                //     yet) — leave it for Step 3, do NOT tombstone (never had it).
+                if entry.kind == EntryKind::Blob {
+                    if blob_marker_path(&self.meta_dir, &key).exists() {
+                        write_tombstone(store, &key, EntryKind::Blob, entry.content_hash.clone())?;
+                        remove_if_present(&blob_marker_path(&self.meta_dir, &key))?;
+                        outcomes.push((file, SyncOutcome::changed_no_ops()));
+                    }
+                    continue;
+                }
+
+                let sidecar = sidecar_path(&self.meta_dir, &key);
+                if !sidecar.exists() {
+                    // Absent file with no sidecar: a remote-new entry this device
+                    // never had — leave it for Step 3, do NOT tombstone.
+                    continue;
+                }
+                // Locally deleted: this device knew the file (sidecar present) and
+                // it is now gone. The tombstone hash must be the content THIS DEVICE
+                // last synced (the sidecar's last_synced_hash), NOT the current
+                // store text — a remote edit may have merged in already, and hashing
+                // the post-merge text would defeat the resurrection guard (the
+                // concurrent edit would be silently deleted). Degrade to the current
+                // store text only if the sidecar is unreadable.
+                let content_hash = match Sidecar::load(&self.meta_dir, &key) {
+                    Ok(Some(sidecar)) => sidecar.last_synced_hash,
+                    _ => text_hash(&store.text(&key)),
+                };
+                write_tombstone(store, &key, entry.kind, content_hash)?;
+                remove_if_present(&sidecar)?;
+                outcomes.push((file, SyncOutcome::changed_no_ops()));
             }
-            // Locally deleted: this device knew the file (sidecar present) and
-            // it is now gone. The tombstone hash must be the content THIS DEVICE
-            // last synced (the sidecar's last_synced_hash), NOT the current
-            // store text — a remote edit may have merged in already, and hashing
-            // the post-merge text would defeat the resurrection guard (the
-            // concurrent edit would be silently deleted). Degrade to the current
-            // store text only if the sidecar is unreadable.
-            let content_hash = match Sidecar::load(&self.meta_dir, &key) {
-                Ok(Some(sidecar)) => sidecar.last_synced_hash,
-                _ => text_hash(&store.text(&key)),
-            };
-            write_tombstone(store, &key, entry.kind, content_hash)?;
-            remove_if_present(&sidecar)?;
-            outcomes.push((file, SyncOutcome::changed_no_ops()));
-        }
         } // end `if !read_only` (Steps 1b + 2)
 
         // --- Step 3: apply remote state onto disk. ---
@@ -968,9 +968,7 @@ impl FolderBridge {
                             // Only report an ACTUAL reprojection; the steady-state
                             // no-op (guard skips, `changed: false`) must not add a
                             // duplicate outcome alongside Step 1's import.
-                            Ok(outcome) if outcome.changed => {
-                                outcomes.push((file, outcome))
-                            }
+                            Ok(outcome) if outcome.changed => outcomes.push((file, outcome)),
                             Ok(_) => {}
                             // Residual safety: if some path left disk dirty (e.g.
                             // Step 1's import was skipped), the disk carries
@@ -1141,7 +1139,10 @@ impl FolderBridge {
 
     /// Whole-vault restore (granularity C, coarse): resurrect every currently
     /// tombstoned file.
-    pub fn restore_all(&self, store: &mut Store) -> Result<Vec<(PathBuf, SyncOutcome)>, FilesError> {
+    pub fn restore_all(
+        &self,
+        store: &mut Store,
+    ) -> Result<Vec<(PathBuf, SyncOutcome)>, FilesError> {
         if !store.may_write() {
             return Err(FilesError::ReadOnly);
         }
@@ -2171,7 +2172,10 @@ mod tests {
             }
         );
         assert_eq!(
-            Sidecar::load(meta, "note.md").unwrap().unwrap().last_synced_text,
+            Sidecar::load(meta, "note.md")
+                .unwrap()
+                .unwrap()
+                .last_synced_text,
             "same"
         );
     }
@@ -2291,7 +2295,10 @@ mod tests {
 
         b.import_file(&mut store, &file).unwrap();
         let container = container_id(&dir.path().join("vault"), &file).unwrap();
-        assert_eq!(fileset_entry(&store, &container).unwrap().kind, EntryKind::Text);
+        assert_eq!(
+            fileset_entry(&store, &container).unwrap().kind,
+            EntryKind::Text
+        );
 
         std::fs::remove_file(&file).unwrap();
         b.project_file(&mut store, &file).unwrap();
@@ -2309,7 +2316,10 @@ mod tests {
 
         b.import_file(&mut store, &file).unwrap();
         let container = container_id(&vault, &file).unwrap();
-        assert_eq!(fileset_entry(&store, &container).unwrap().kind, EntryKind::Text);
+        assert_eq!(
+            fileset_entry(&store, &container).unwrap().kind,
+            EntryKind::Text
+        );
         assert_eq!(store.text(&container), "readme body\n");
     }
 
@@ -2328,7 +2338,10 @@ mod tests {
 
         b.import_file(&mut store, &file).unwrap();
         let container = container_id(&vault, &file).unwrap();
-        assert_eq!(fileset_entry(&store, &container).unwrap().kind, EntryKind::Blob);
+        assert_eq!(
+            fileset_entry(&store, &container).unwrap().kind,
+            EntryKind::Blob
+        );
     }
 
     #[test]
@@ -2451,7 +2464,10 @@ mod tests {
 
         let good_c = container_id(&vault, &good).unwrap();
         assert_eq!(store.text(&good_c), "good");
-        assert_eq!(fileset_entry(&store, &good_c).unwrap().kind, EntryKind::Text);
+        assert_eq!(
+            fileset_entry(&store, &good_c).unwrap().kind,
+            EntryKind::Text
+        );
 
         let bad_c = container_id(&vault, &bad).unwrap();
         assert_eq!(fileset_entry(&store, &bad_c).unwrap().kind, EntryKind::Blob);
@@ -3250,7 +3266,10 @@ mod tests {
         b.import_file(&mut store, &file).unwrap();
 
         let container = container_id(&vault, &file).unwrap();
-        assert_eq!(fileset_entry(&store, &container).unwrap().renamed_from, None);
+        assert_eq!(
+            fileset_entry(&store, &container).unwrap().renamed_from,
+            None
+        );
     }
 
     #[test]
@@ -3332,13 +3351,13 @@ mod tests {
         assert_eq!(entry.kind, EntryKind::Blob);
         assert_eq!(entry.status, EntryStatus::Live);
         // content_hash doubles as the blob-ref: the blake3 of the file's bytes.
-        assert_eq!(
-            entry.content_hash,
-            roam_storage::BlobStore::hash(&payload)
-        );
+        assert_eq!(entry.content_hash, roam_storage::BlobStore::hash(&payload));
         // The bytes are in the blob store, keyed by that hash.
         assert!(store.blobs().has(&entry.content_hash));
-        assert_eq!(store.blobs().get(&entry.content_hash).unwrap(), Some(payload));
+        assert_eq!(
+            store.blobs().get(&entry.content_hash).unwrap(),
+            Some(payload)
+        );
         // No text container was created for the blob.
         assert_eq!(store.text(&container), "");
     }
@@ -3354,7 +3373,10 @@ mod tests {
 
         let log_before = store.export_own_log().unwrap().len();
         let outcome = b.import_file(&mut store, &file).unwrap();
-        assert!(!outcome.changed, "unchanged binary re-import must be a no-op");
+        assert!(
+            !outcome.changed,
+            "unchanged binary re-import must be a no-op"
+        );
         assert_eq!(
             store.export_own_log().unwrap().len(),
             log_before,
@@ -3415,7 +3437,10 @@ mod tests {
         // A full scan discovers + imports the blob (Live Blob entry).
         b.scan(&mut store).unwrap();
         let container = container_id(&vault, &file).unwrap();
-        assert_eq!(fileset_entry(&store, &container).unwrap().status, EntryStatus::Live);
+        assert_eq!(
+            fileset_entry(&store, &container).unwrap().status,
+            EntryStatus::Live
+        );
 
         // Delete the file on disk, then scan: blob-aware local-delete detection
         // (bytes still in the blob store = this device once had it, file now
@@ -3454,8 +3479,14 @@ mod tests {
         // Idempotent: a second scan with no change makes no further mutation and
         // leaves BOTH entries Live (the blob is not falsely tombstoned).
         b.scan(&mut store).unwrap();
-        assert_eq!(fileset_entry(&store, &note_c).unwrap().status, EntryStatus::Live);
-        assert_eq!(fileset_entry(&store, &pic_c).unwrap().status, EntryStatus::Live);
+        assert_eq!(
+            fileset_entry(&store, &note_c).unwrap().status,
+            EntryStatus::Live
+        );
+        assert_eq!(
+            fileset_entry(&store, &pic_c).unwrap().status,
+            EntryStatus::Live
+        );
     }
 
     #[test]
@@ -3495,7 +3526,10 @@ mod tests {
         let entry = fileset_entry(&store, &container).unwrap();
         assert_eq!(entry.status, EntryStatus::Live);
         assert_eq!(entry.content_hash, phantom);
-        assert!(!file.exists(), "a bytes-absent blob-ref must not project a file");
+        assert!(
+            !file.exists(),
+            "a bytes-absent blob-ref must not project a file"
+        );
     }
 
     // --- D5: project fetched blob bytes onto disk. ---
@@ -3542,7 +3576,9 @@ mod tests {
         bridge.delete_file(&mut store, &file).unwrap();
 
         // Even with a self-only (trivially stable) GcContext, the entry is RETAINED.
-        bridge.scan_gc(&mut store, None, Some(&self_only_gc())).unwrap();
+        bridge
+            .scan_gc(&mut store, None, Some(&self_only_gc()))
+            .unwrap();
         let entries = store.entries(FILESET_MAP_ID);
         let key = container_id(&vault, &file).unwrap();
         assert!(
@@ -3654,7 +3690,10 @@ mod tests {
         let payload: Vec<u8> = vec![0x89, 0x50, 0x4e, 0x47, 0x00, 0xff, 0x7f];
         let hash = store.blobs().put(&payload).unwrap();
         seed_live_blob_entry(&mut store, &container, &hash);
-        assert!(!file.exists(), "precondition: file absent before projection");
+        assert!(
+            !file.exists(),
+            "precondition: file absent before projection"
+        );
 
         b.scan(&mut store).unwrap();
 
@@ -3746,7 +3785,10 @@ mod tests {
         write_tombstone(&mut store, &container, EntryKind::Blob, hash.clone()).unwrap();
         b.scan(&mut store).unwrap();
 
-        assert!(!file.exists(), "a remote blob-delete must remove the disk file");
+        assert!(
+            !file.exists(),
+            "a remote blob-delete must remove the disk file"
+        );
         assert_eq!(
             fileset_entry(&store, &container).unwrap().status,
             EntryStatus::Tombstoned,
@@ -3813,7 +3855,10 @@ mod tests {
             fileset_entry(&store, &container).unwrap().status,
             EntryStatus::Tombstoned
         );
-        assert!(store.blobs().has(&hash), "bytes still present while tombstoned");
+        assert!(
+            store.blobs().has(&hash),
+            "bytes still present while tombstoned"
+        );
 
         // The reaper is retired: even a self-only (trivially stable) GcContext
         // no longer drops the tombstone entry or reclaims its blob. Retention is
@@ -3845,7 +3890,10 @@ mod tests {
         let v1 = roam_storage::BlobStore::hash(&v1_bytes);
         std::fs::write(&big, [0x00u8, 0xFF, 0x00, 0xFF, 0x00]).unwrap();
         bridge.import_file(&mut store, &big).unwrap();
-        assert!(!store.blobs().has(&v1), "big blob's prior version released on edit");
+        assert!(
+            !store.blobs().has(&v1),
+            "big blob's prior version released on edit"
+        );
 
         // Small blob (3 bytes <= 4): both versions kept.
         let small = vault.join("small.bin");

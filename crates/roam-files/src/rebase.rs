@@ -389,7 +389,10 @@ mod tests {
         let (merged, conflicts) = merge_local_onto_remote("abc", "LOCabc", "REMabc");
         assert_eq!(merged, "REMLOCabc");
         // Co-located inserts (no ancestor char removed) are NOT a conflict.
-        assert!(conflicts.is_empty(), "co-located inserts must not conflict: {conflicts:?}");
+        assert!(
+            conflicts.is_empty(),
+            "co-located inserts must not conflict: {conflicts:?}"
+        );
     }
 
     #[test]
@@ -416,7 +419,10 @@ mod tests {
         // ancestor regions. Both survive AND no conflict is flagged.
         let (merged, conflicts) = merge_local_onto_remote("abcd", "Xbcd", "abcY");
         assert_eq!(merged, "XbcY");
-        assert!(conflicts.is_empty(), "disjoint edits must not conflict: {conflicts:?}");
+        assert!(
+            conflicts.is_empty(),
+            "disjoint edits must not conflict: {conflicts:?}"
+        );
     }
 
     #[test]
@@ -424,7 +430,10 @@ mod tests {
         // R == A: only the local side edited, so there is nothing to conflict
         // with even though the local edit replaces a region.
         let (_merged, conflicts) = merge_local_onto_remote("abc", "aYc", "abc");
-        assert!(conflicts.is_empty(), "single-sided edit is never a conflict: {conflicts:?}");
+        assert!(
+            conflicts.is_empty(),
+            "single-sided edit is never a conflict: {conflicts:?}"
+        );
     }
 
     // --- Independent-oracle losslessness proptest -------------------------
@@ -533,8 +542,16 @@ mod tests {
             "merge is not deterministic"
         );
         // (d) degenerate boundaries: no-remote → local-applied; no-local → remote.
-        assert_eq!(merge_local_onto_remote(&a_str, &l, &a_str).0, l, "no-remote boundary");
-        assert_eq!(merge_local_onto_remote(&a_str, &a_str, &r).0, r, "no-local boundary");
+        assert_eq!(
+            merge_local_onto_remote(&a_str, &l, &a_str).0,
+            l,
+            "no-remote boundary"
+        );
+        assert_eq!(
+            merge_local_onto_remote(&a_str, &a_str, &r).0,
+            r,
+            "no-local boundary"
+        );
     }
 
     proptest! {

@@ -60,6 +60,9 @@ mod tests {
         let blob = keywrap::wrap(&paper.public(), &epoch_key);
 
         let recovered = PaperKey::from_passphrase("recover me later");
-        assert_eq!(keywrap::unwrap(&recovered.secret(), &blob).unwrap(), epoch_key);
+        assert_eq!(
+            keywrap::unwrap(&recovered.secret(), &blob).unwrap(),
+            epoch_key
+        );
     }
 }

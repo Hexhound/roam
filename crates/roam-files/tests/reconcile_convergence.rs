@@ -890,7 +890,11 @@ fn relay(via: &Device, author: &Device, to: &Device) {
         .any(|p| p.peer_id == author.identity.peer_id())
     {
         store
-            .add_peer(author.identity.peer_id(), author_key.to_bytes(), Role::Writer)
+            .add_peer(
+                author.identity.peer_id(),
+                author_key.to_bytes(),
+                Role::Writer,
+            )
             .unwrap();
     }
     store
@@ -1090,7 +1094,11 @@ fn stable_tombstone_is_retained_and_stays_deleted() {
 
     // All trusted peers have acked, but the reaper no longer runs: A KEEPS the
     // tombstone entry (retention is now client-driven via Store::checkpoint).
-    gc_scan(&a, &[&b, &c], &[(&b, peer_version(&b)), (&c, peer_version(&c))]);
+    gc_scan(
+        &a,
+        &[&b, &c],
+        &[(&b, peer_version(&b)), (&c, peer_version(&c))],
+    );
     assert_eq!(
         a.entry(&container).map(|e| e.status),
         Some(EntryStatus::Tombstoned),
@@ -1148,8 +1156,14 @@ fn offline_peer_converges_to_deleted_and_tombstone_is_retained() {
     for _ in 0..2 {
         round(&a, &b);
     }
-    assert_eq!(a.entry(&container).map(|e| e.status), Some(EntryStatus::Tombstoned));
-    assert_eq!(b.entry(&container).map(|e| e.status), Some(EntryStatus::Tombstoned));
+    assert_eq!(
+        a.entry(&container).map(|e| e.status),
+        Some(EntryStatus::Tombstoned)
+    );
+    assert_eq!(
+        b.entry(&container).map(|e| e.status),
+        Some(EntryStatus::Tombstoned)
+    );
 
     // A and B both try to GC with C in the trusted set but with NO acked version
     // for C (it was offline). Both must REFUSE to drop the tombstone.
@@ -1170,12 +1184,22 @@ fn offline_peer_converges_to_deleted_and_tombstone_is_retained() {
     // file on disk; the tombstone reconciles to absent).
     sync(&a, &c);
     c.scan();
-    assert!(!c.vault_file(rel).exists(), "reconnected C must converge to deleted");
-    assert_eq!(c.entry(&container).map(|e| e.status), Some(EntryStatus::Tombstoned));
+    assert!(
+        !c.vault_file(rel).exists(),
+        "reconnected C must converge to deleted"
+    );
+    assert_eq!(
+        c.entry(&container).map(|e| e.status),
+        Some(EntryStatus::Tombstoned)
+    );
 
     // Even now that C has acked, the reaper is retired: A RETAINS the tombstone
     // entry (the resurrection guard, not GC, is what keeps the delete safe).
-    gc_scan(&a, &[&b, &c], &[(&b, peer_version(&b)), (&c, peer_version(&c))]);
+    gc_scan(
+        &a,
+        &[&b, &c],
+        &[(&b, peer_version(&b)), (&c, peer_version(&c))],
+    );
     assert_eq!(
         a.entry(&container).map(|e| e.status),
         Some(EntryStatus::Tombstoned),
@@ -1188,7 +1212,10 @@ fn offline_peer_converges_to_deleted_and_tombstone_is_retained() {
     }
     for d in [&a, &b, &c] {
         assert!(!d.vault_file(rel).exists());
-        assert_eq!(d.entry(&container).map(|e| e.status), Some(EntryStatus::Tombstoned));
+        assert_eq!(
+            d.entry(&container).map(|e| e.status),
+            Some(EntryStatus::Tombstoned)
+        );
     }
 }
 
@@ -1204,7 +1231,11 @@ fn gc_scan_is_a_noop_and_all_peers_retain_the_tombstone() {
 
     // A runs a gc_scan with all peers acked; the reaper is retired so the entry
     // is RETAINED, matching B and C which never GC'd.
-    gc_scan(&a, &[&b, &c], &[(&b, peer_version(&b)), (&c, peer_version(&c))]);
+    gc_scan(
+        &a,
+        &[&b, &c],
+        &[(&b, peer_version(&b)), (&c, peer_version(&c))],
+    );
     assert_eq!(
         a.entry(&container).map(|e| e.status),
         Some(EntryStatus::Tombstoned),
