@@ -97,6 +97,24 @@ pub async fn reconcile_once<B: Backend>(
     };
     let mut report = DecryptReport::default();
 
+    // Snapshot reconcile FIRST: fetch/verify/adopt any backend snapshot we lack.
+    // Adoption is additive; recording each held snapshot lets us stop advertising
+    // (below) the entries it subsumes.
+    import_needed_snapshots(store, backend, &bucket, &kc, &mut report, debug).await?;
+
+    // Entries a held snapshot subsumes must never re-enter our fetch set — we hold
+    // the snapshot that covers them. This is the fix for the RBSR re-pull fight:
+    // without it, ops we compacted locally reappear in `need` every pass until the
+    // backend prunes.
+    let subsumed_entry_ids: BTreeSet<String> = {
+        let guard = store.lock().await;
+        guard
+            .held_snapshots()?
+            .into_iter()
+            .flat_map(|h| h.subsumed)
+            .collect()
+    };
+
     // `local_entries_vec` is ordered by (peer, ascending index); keep it ordered
     // for the upload loop so any mid-loop `put_entry` failure leaves a clean
     // contiguous prefix per peer (never a hole that would strand later entries
@@ -135,6 +153,11 @@ pub async fn reconcile_once<B: Backend>(
     // are ids we lack (fetch); `have_*` are ids the backend lacks (upload).
     let (have_entry_ids, need_entry_ids) =
         reconcile_set(backend, &bucket, SetKind::Entries, &local_entry_ids).await?;
+    // Drop subsumed ids from the fetch set: a held snapshot already covers them.
+    let need_entry_ids: BTreeSet<String> = need_entry_ids
+        .difference(&subsumed_entry_ids)
+        .cloned()
+        .collect();
     let (have_blob_ids, need_blob_ids) = {
         let local_blob_id_set: BTreeSet<String> = local_blob_ids.keys().cloned().collect();
         reconcile_set(backend, &bucket, SetKind::Blobs, &local_blob_id_set).await?
@@ -241,6 +264,94 @@ pub async fn reconcile_once<B: Backend>(
     Ok(())
 }
 
+/// Reconcile the snapshot id-set against the backend; for each snapshot we lack,
+/// fetch it, verify the author's signature + ciphertext binding, decrypt, adopt
+/// it (additively), and record it as held. A snapshot that fails verification or
+/// can't be decrypted yet is skipped — never adopted — so a forged or
+/// wrong-epoch snapshot can't corrupt state.
+async fn import_needed_snapshots<B: Backend>(
+    store: &Arc<Mutex<Store>>,
+    backend: &Arc<B>,
+    bucket: &str,
+    kc: &Keychain,
+    report: &mut DecryptReport,
+    debug: bool,
+) -> anyhow::Result<()> {
+    let held: BTreeSet<String> = {
+        let guard = store.lock().await;
+        guard.held_snapshots()?.into_iter().map(|h| h.id).collect()
+    };
+    let (_have, need) = reconcile_set(backend, bucket, SetKind::Snapshots, &held).await?;
+    if need.is_empty() {
+        return Ok(());
+    }
+
+    // Verifying keys we trust to author a snapshot: every roster peer plus self.
+    let author_keys: std::collections::HashMap<u64, VerifyingKey> = {
+        let guard = store.lock().await;
+        let mut m = std::collections::HashMap::new();
+        for r in guard.roster() {
+            if let Ok(k) = VerifyingKey::from_bytes(&r.verifying_key) {
+                m.insert(r.peer_id, k);
+            }
+        }
+        if let Ok(k) = VerifyingKey::from_bytes(&guard.identity_verifying_bytes()) {
+            m.insert(guard.peer_id(), k);
+        }
+        m
+    };
+
+    for id in &need {
+        let Some(framed) = backend.get_snapshot(bucket, id).await? else {
+            continue;
+        };
+        let Some((manifest_json, sealed)) = crate::snapshot_msg::unframe(&framed) else {
+            eprintln!("backend sync: snapshot {id} has a malformed frame; skipping");
+            continue;
+        };
+        let manifest: crate::snapshot_msg::SnapshotManifest =
+            match serde_json::from_slice(manifest_json) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("backend sync: snapshot {id} manifest parse failed: {e}");
+                    continue;
+                }
+            };
+        // Authority + integrity: signed by a trusted roster author, and the sig
+        // binds exactly these sealed bytes.
+        let Some(vk) = author_keys.get(&manifest.author) else {
+            eprintln!("backend sync: snapshot {id} author not in roster; skipping");
+            continue;
+        };
+        if !manifest.verify(vk) {
+            eprintln!("backend sync: snapshot {id} signature invalid; skipping");
+            continue;
+        }
+        if <[u8; 32]>::from(blake3::hash(sealed)) != manifest.snapshot_ct_hash {
+            eprintln!("backend sync: snapshot {id} ciphertext hash mismatch; skipping");
+            continue;
+        }
+        // Decrypt through the keychain's read rule (may be pending if the epoch
+        // key hasn't arrived; that self-heals next pass).
+        let Some(plaintext) = open_classified(kc, sealed)? else {
+            report.undecryptable += 1;
+            continue;
+        };
+        {
+            let mut guard = store.lock().await;
+            guard.adopt_snapshot(&plaintext)?;
+            guard.record_held_snapshot(id, &manifest.subsumed_entry_ids)?;
+        }
+        if debug {
+            eprintln!(
+                "[be-sync]   adopted snapshot {id} subsuming {} entries",
+                manifest.subsumed_entry_ids.len()
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Seal `plaintext` under the head epoch — the same rule the entry/blob upload
 /// paths use (tagged epoch seal above epoch 0, legacy `VaultKey::seal` at 0).
 fn seal_under_head(kc: &Keychain, key: &VaultKey, plaintext: &[u8]) -> Vec<u8> {
@@ -325,6 +436,12 @@ async fn maybe_produce_snapshot<B: Backend>(
     let manifest_json = serde_json::to_vec(&manifest)?;
     let framed = crate::snapshot_msg::frame(&manifest_json, &sealed);
     backend.put_snapshot(bucket, &snapshot_id, framed).await?;
+    // Record it as held so future passes advertise it and stop advertising the
+    // entries it subsumes.
+    store
+        .lock()
+        .await
+        .record_held_snapshot(&snapshot_id, &manifest.subsumed_entry_ids)?;
     if debug {
         eprintln!(
             "[be-sync]   uploaded snapshot {snapshot_id} subsuming {} entries, {} blob refs",
@@ -466,6 +583,54 @@ mod tests {
         let v1 = s.lock().await.doc_version_bytes();
         reconcile_once(&s, &backend, &key).await.unwrap();
         assert_eq!(s.lock().await.doc_version_bytes(), v1);
+    }
+
+    #[tokio::test]
+    async fn consumer_fetches_verifies_and_adopts_a_snapshot() {
+        std::env::set_var("ROAM_SNAPSHOT_LAG_DAYS", "0");
+        let key = VaultKey([9u8; 32]);
+        let backend = Arc::new(MemoryBackend::default());
+        let a_dir = tempfile::tempdir().unwrap();
+        let b_dir = tempfile::tempdir().unwrap();
+        let a = store_at(a_dir.path()).await;
+        let b = store_at(b_dir.path()).await;
+
+        let (a_peer, a_key) = {
+            let g = a.lock().await;
+            (g.peer_id(), g.identity_verifying_bytes())
+        };
+        let (b_peer, b_key) = {
+            let g = b.lock().await;
+            (g.peer_id(), g.identity_verifying_bytes())
+        };
+        // Mutual roster so B can verify A's snapshot author signature.
+        a.lock().await.add_peer(b_peer, b_key, Role::Admin).unwrap();
+        b.lock().await.add_peer(a_peer, a_key, Role::Admin).unwrap();
+
+        a.lock().await.set_entry("files", "k", "hello").unwrap();
+        reconcile_once(&a, &backend, &key).await.unwrap();
+
+        // Backend asks -> A uploads a snapshot on the next pass.
+        backend.set_snapshot_wanted(&key.bucket_id(), true);
+        reconcile_once(&a, &backend, &key).await.unwrap();
+        assert_eq!(
+            backend
+                .list_snapshots(&key.bucket_id())
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // B is fresh: one pass bootstraps it to head via the snapshot alone.
+        reconcile_once(&b, &backend, &key).await.unwrap();
+        assert_eq!(
+            b.lock().await.get_entry("files", "k"),
+            Some("hello".to_string())
+        );
+        // B recorded the snapshot as held (so it will advertise it + stop
+        // advertising the entries it subsumes next pass).
+        assert_eq!(b.lock().await.held_snapshots().unwrap().len(), 1);
     }
 
     #[tokio::test]

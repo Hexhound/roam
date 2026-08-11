@@ -1283,6 +1283,46 @@ impl Store {
         }))
     }
 
+    /// Record that this device holds backend snapshot `id`, which subsumes the
+    /// given entry-ids. Append-only sidecar (`<root>/snapshots/held.jsonl`),
+    /// deduped by id. Drives the backend loop's snapshot advertising +
+    /// stop-advertising-subsumed logic.
+    pub fn record_held_snapshot(&self, id: &str, subsumed: &[String]) -> Result<(), StorageError> {
+        if self.held_snapshots()?.iter().any(|h| h.id == id) {
+            return Ok(());
+        }
+        let dir = self.root.join("snapshots");
+        std::fs::create_dir_all(&dir)?;
+        let held = HeldSnapshot {
+            id: id.to_string(),
+            subsumed: subsumed.to_vec(),
+        };
+        let mut line = serde_json::to_vec(&held)?;
+        line.push(b'\n');
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("held.jsonl"))?;
+        f.write_all(&line)?;
+        Ok(())
+    }
+
+    /// The backend snapshots this device holds (see [`Store::record_held_snapshot`]).
+    pub fn held_snapshots(&self) -> Result<Vec<HeldSnapshot>, StorageError> {
+        let path = self.root.join("snapshots").join("held.jsonl");
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut out = Vec::new();
+        for line in text.lines().filter(|l| !l.trim().is_empty()) {
+            out.push(serde_json::from_str(line)?);
+        }
+        Ok(out)
+    }
+
     /// Adopt a snapshot received from a peer or the backend. **Additive**: it
     /// merges the snapshot's state into the live doc and NEVER truncates this
     /// device's op-logs. A device can therefore only ever "lose" history it never
@@ -1353,6 +1393,15 @@ pub struct BackendSnapshot {
     /// Content hashes of blobs the snapshot state references (sorted, deduped).
     /// The caller maps each to a backend blob-id via `VaultKey::blob_id`.
     pub blob_refs: Vec<String>,
+}
+
+/// A backend snapshot this device holds (authored or adopted), plus the entry-ids
+/// it subsumes. Persisted so the backend sync loop can advertise held snapshots
+/// and stop advertising the entries they replace (killing the RBSR re-pull fight).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HeldSnapshot {
+    pub id: String,
+    pub subsumed: Vec<String>,
 }
 
 /// Mirrors `roam_files::fileset::FILESET_MAP_ID`. Kept as a literal to avoid a
