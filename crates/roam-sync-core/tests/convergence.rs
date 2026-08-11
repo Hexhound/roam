@@ -1,5 +1,5 @@
 use proptest::prelude::*;
-use roam_storage::{Identity, Store, VaultId};
+use roam_storage::{Identity, Role, Store, VaultId};
 use roam_sync_core::engine::Engine;
 use roam_sync_core::memory::MemorySwitchboard;
 use std::sync::Arc;
@@ -10,7 +10,7 @@ use tempfile::tempdir;
 // we seed the roster directly to test the engine in isolation).
 fn seed_pair(store: &mut Store, me: &Identity, peer: &Identity) {
     store
-        .add_peer(peer.peer_id(), peer.verifying_key().to_bytes())
+        .add_peer(peer.peer_id(), peer.verifying_key().to_bytes(), Role::Admin)
         .unwrap();
     let _ = me;
 }
@@ -26,6 +26,8 @@ async fn two_engines_converge_on_connect() {
 
     let mut sa = Store::open(da.path(), ida.clone()).unwrap();
     let mut sb = Store::open(db.path(), idb.clone()).unwrap();
+    sa.declare_founder(Role::Admin).unwrap();
+    sb.declare_founder(Role::Admin).unwrap();
     seed_pair(&mut sa, &ida, &idb);
     seed_pair(&mut sb, &idb, &ida);
 
@@ -75,6 +77,8 @@ async fn keylog_gossips_a_rotated_epoch_to_a_trusted_peer() {
 
     let mut sa = Store::open(da.path(), ida.clone()).unwrap();
     let mut sb = Store::open(db.path(), idb.clone()).unwrap();
+    sa.declare_founder(Role::Admin).unwrap();
+    sb.declare_founder(Role::Admin).unwrap();
     // Cross-vouch: each engine vouches for the other.
     seed_pair(&mut sa, &ida, &idb);
     seed_pair(&mut sb, &idb, &ida);
@@ -153,10 +157,11 @@ proptest! {
             let mut stores: Vec<Store> = Vec::with_capacity(N);
             for (i, dir) in dirs.iter().enumerate() {
                 let mut store = Store::open(dir.path(), ids[i].clone()).unwrap();
+                store.declare_founder(Role::Admin).unwrap();
                 for (j, peer) in ids.iter().enumerate() {
                     if i != j {
                         store
-                            .add_peer(peer.peer_id(), peer.verifying_key().to_bytes())
+                            .add_peer(peer.peer_id(), peer.verifying_key().to_bytes(), Role::Admin)
                             .unwrap();
                     }
                 }

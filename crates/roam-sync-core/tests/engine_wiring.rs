@@ -6,7 +6,7 @@
 //! gossiped. `changed()` lets a single consumer (the CLI) await inbound applies.
 
 use futures::StreamExt;
-use roam_storage::{Identity, Store, VaultId};
+use roam_storage::{Identity, Role, Store, VaultId};
 use roam_sync_core::engine::Engine;
 use roam_sync_core::frame::Frame;
 use roam_sync_core::memory::MemorySwitchboard;
@@ -18,7 +18,7 @@ use tempfile::tempdir;
 /// Seed `store`'s roster so it vouches for `peer` (mirrors convergence tests).
 fn seed(store: &mut Store, peer: &Identity) {
     store
-        .add_peer(peer.peer_id(), peer.verifying_key().to_bytes())
+        .add_peer(peer.peer_id(), peer.verifying_key().to_bytes(), Role::Admin)
         .unwrap();
 }
 
@@ -33,6 +33,8 @@ async fn flush_local_gossips_direct_store_edits() {
 
     let mut sa = Store::open(da.path(), ia.clone()).unwrap();
     let mut sb = Store::open(db.path(), ib.clone()).unwrap();
+    sa.declare_founder(Role::Admin).unwrap();
+    sb.declare_founder(Role::Admin).unwrap();
     seed(&mut sa, &ib);
     seed(&mut sb, &ia);
 
@@ -77,6 +79,7 @@ async fn flush_local_is_a_safe_noop_when_nothing_new() {
     let _ = db;
 
     let mut sa = Store::open(da.path(), ia.clone()).unwrap();
+    sa.declare_founder(Role::Admin).unwrap();
     seed(&mut sa, &ib);
 
     let ea = Arc::new(Engine::new(
@@ -126,6 +129,8 @@ async fn reconnect_active_catches_up_an_unconnected_peer() {
 
     let mut sa = Store::open(da.path(), ia.clone()).unwrap();
     let mut sb = Store::open(db.path(), ib.clone()).unwrap();
+    sa.declare_founder(Role::Admin).unwrap();
+    sb.declare_founder(Role::Admin).unwrap();
     seed(&mut sa, &ib);
     seed(&mut sb, &ia);
 
@@ -174,6 +179,8 @@ async fn changed_fires_on_inbound_ops() {
 
     let mut sa = Store::open(da.path(), ia.clone()).unwrap();
     let mut sb = Store::open(db.path(), ib.clone()).unwrap();
+    sa.declare_founder(Role::Admin).unwrap();
+    sb.declare_founder(Role::Admin).unwrap();
     seed(&mut sa, &ib);
     seed(&mut sb, &ia);
 
@@ -226,6 +233,8 @@ async fn repeated_edits_do_not_duplicate_on_peer() {
 
     let mut sa = Store::open(da.path(), ia.clone()).unwrap();
     let mut sb = Store::open(db.path(), ib.clone()).unwrap();
+    sa.declare_founder(Role::Admin).unwrap();
+    sb.declare_founder(Role::Admin).unwrap();
     seed(&mut sa, &ib);
     seed(&mut sb, &ia);
 

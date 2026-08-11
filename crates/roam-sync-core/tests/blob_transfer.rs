@@ -8,7 +8,7 @@
 
 use futures::StreamExt;
 use roam_files::{EntryKind, EntryStatus, FileEntry, FILESET_MAP_ID};
-use roam_storage::{BlobStore, Identity, Store, VaultId};
+use roam_storage::{BlobStore, Identity, Role, Store, VaultId};
 use roam_sync_core::engine::Engine;
 use roam_sync_core::frame::Frame;
 use roam_sync_core::memory::MemorySwitchboard;
@@ -20,7 +20,7 @@ use tempfile::tempdir;
 /// Seed `store`'s roster so it vouches for `peer`.
 fn seed(store: &mut Store, peer: &Identity) {
     store
-        .add_peer(peer.peer_id(), peer.verifying_key().to_bytes())
+        .add_peer(peer.peer_id(), peer.verifying_key().to_bytes(), Role::Admin)
         .unwrap();
 }
 
@@ -50,6 +50,8 @@ async fn pull_round_trip_transfers_blob_bytes_and_fires_changed() {
 
     let mut sa = Store::open(da.path(), ia.clone()).unwrap();
     let mut sb = Store::open(db.path(), ib.clone()).unwrap();
+    sa.declare_founder(Role::Admin).unwrap();
+    sb.declare_founder(Role::Admin).unwrap();
     seed(&mut sa, &ib);
     seed(&mut sb, &ia);
 
@@ -101,6 +103,7 @@ async fn corrupt_blob_data_is_rejected_no_poison() {
     let _ = da;
 
     let mut sb = Store::open(db.path(), ib.clone()).unwrap();
+    sb.declare_founder(Role::Admin).unwrap();
     seed(&mut sb, &ia);
     // B genuinely wants this hash (a Live Blob entry references it).
     let claimed = BlobStore::hash(b"the real bytes");
@@ -132,8 +135,9 @@ async fn a_does_not_serve_a_revoked_peers_blob_want() {
     let (ia, ib) = (Identity::generate(), Identity::generate());
 
     let mut sa = Store::open(da.path(), ia.clone()).unwrap();
+    sa.declare_founder(Role::Admin).unwrap();
     // A trusts then revokes B: B is in the roster, but Revoked.
-    sa.add_peer(ib.peer_id(), ib.verifying_key().to_bytes()).unwrap();
+    sa.add_peer(ib.peer_id(), ib.verifying_key().to_bytes(), Role::Admin).unwrap();
     sa.revoke_peer(ib.peer_id(), ib.verifying_key().to_bytes()).unwrap();
     let hash = sa.blobs().put(b"secret blob").unwrap();
 
@@ -157,7 +161,8 @@ async fn a_serves_an_active_peers_blob_want() {
     let (ia, ib) = (Identity::generate(), Identity::generate());
 
     let mut sa = Store::open(da.path(), ia.clone()).unwrap();
-    sa.add_peer(ib.peer_id(), ib.verifying_key().to_bytes()).unwrap();
+    sa.declare_founder(Role::Admin).unwrap();
+    sa.add_peer(ib.peer_id(), ib.verifying_key().to_bytes(), Role::Admin).unwrap();
     let payload = b"served blob".to_vec();
     let hash = sa.blobs().put(&payload).unwrap();
 
@@ -188,7 +193,8 @@ async fn blob_want_for_absent_blob_serves_nothing() {
     let (ia, ib) = (Identity::generate(), Identity::generate());
 
     let mut sa = Store::open(da.path(), ia.clone()).unwrap();
-    sa.add_peer(ib.peer_id(), ib.verifying_key().to_bytes()).unwrap();
+    sa.declare_founder(Role::Admin).unwrap();
+    sa.add_peer(ib.peer_id(), ib.verifying_key().to_bytes(), Role::Admin).unwrap();
 
     let ea = Arc::new(Engine::new(ia.clone(), vault, sa, Arc::new(board.endpoint(ia.peer_id()))));
     let tb = board.endpoint(ib.peer_id());
@@ -213,6 +219,7 @@ async fn blob_data_for_already_held_blob_is_a_noop() {
 
     let payload = b"already here".to_vec();
     let mut sb = Store::open(db.path(), ib.clone()).unwrap();
+    sb.declare_founder(Role::Admin).unwrap();
     seed(&mut sb, &ia);
     let hash = sb.blobs().put(&payload).unwrap();
     sb.set_entry(FILESET_MAP_ID, "file-1", &blob_entry_value(&hash)).unwrap();
@@ -245,6 +252,7 @@ async fn request_missing_blobs_sends_nothing_when_complete() {
     let (ia, ib) = (Identity::generate(), Identity::generate());
 
     let mut sb = Store::open(db.path(), ib.clone()).unwrap();
+    sb.declare_founder(Role::Admin).unwrap();
     seed(&mut sb, &ia);
     // A Live Blob entry whose bytes B ALREADY holds → nothing is missing.
     let hash = sb.blobs().put(b"complete").unwrap();
