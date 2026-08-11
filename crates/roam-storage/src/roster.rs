@@ -263,6 +263,37 @@ impl RosterLog {
         Ok(entry)
     }
 
+    /// Peek the key this log's author vouches for ITSELF: the `subject_key` of the
+    /// first entry whose `subject_peer == author` (a self-`Add`). Read WITHOUT
+    /// verification — the caller derives the peer-id binding and re-verifies the
+    /// whole log against this key before trusting it. Used to bootstrap trust in a
+    /// pinned founder whose self-signed log is the only proof of its key. Returns
+    /// `None` if the log is absent or carries no self entry.
+    pub fn peek_self_key(&self) -> Result<Option<[u8; 32]>, StorageError> {
+        let text = match std::fs::read_to_string(&self.path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        for line in text.lines().filter(|l| !l.trim().is_empty()) {
+            let parsed: RosterLine = match serde_json::from_str(line) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            if parsed.subject_peer != self.author {
+                continue;
+            }
+            let key_bytes = match B64.decode(parsed.subject_key.as_bytes()) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            if let Ok(arr) = <[u8; 32]>::try_from(key_bytes) {
+                return Ok(Some(arr));
+            }
+        }
+        Ok(None)
+    }
+
     /// Read every entry, verifying each signature against `key` (the author's).
     /// Same fail-closed + torn-tail rules as `OpLog::read_verified`.
     pub fn read_verified(&self, key: &VerifyingKey) -> Result<Vec<RosterEntry>, StorageError> {
