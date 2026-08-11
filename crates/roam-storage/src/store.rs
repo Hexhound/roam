@@ -1068,24 +1068,24 @@ impl Store {
         let already = split_log_lines_bytes(&existing)
             .iter()
             .any(|l| l.as_slice() == line);
-        if !already {
-            let path = self.root.join("ops").join(format!("ops-{author}.jsonl"));
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            let mut with_nl = line.to_vec();
-            if !with_nl.ends_with(b"\n") {
-                with_nl.push(b'\n');
-            }
-            use std::io::Write;
-            let mut f = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)?;
-            f.write_all(&with_nl)?;
-            f.sync_all()?;
+        if already {
+            return Ok(());
         }
-        let whole = self.export_peer_log(author)?;
+        // Build the candidate whole log IN MEMORY and hand it to `import_peer`,
+        // which verifies (`verify_bytes`) BEFORE it persists. Never append the
+        // raw fetched line to disk ourselves: a corrupt/forged/bit-flipped line
+        // would otherwise land on disk unverified, and since `verify_bytes`
+        // rejects the WHOLE log on the first bad line, every future import would
+        // fail — permanently poisoning that peer's log. Keeping the write inside
+        // `import_peer` means a bad line leaves the on-disk file untouched.
+        let mut whole = existing;
+        if !whole.is_empty() && !whole.ends_with(b"\n") {
+            whole.push(b'\n');
+        }
+        whole.extend_from_slice(line);
+        if !whole.ends_with(b"\n") {
+            whole.push(b'\n');
+        }
         self.import_peer(author, key, whole)
     }
 
@@ -2584,5 +2584,56 @@ mod tests {
         );
         // And the doc converged to the final value despite the reordering.
         assert_eq!(s.get_entry("files", "k"), Some("v2".to_string()));
+    }
+
+    #[test]
+    fn a_bad_fetched_line_never_poisons_the_peer_log() {
+        // The backend fetch path feeds attacker-influenced bytes (a malicious or
+        // buggy backend, a bit-flip) into `dedup_append_peer_line`. Because
+        // `verify_bytes` rejects the WHOLE log on the first bad line, a single
+        // unverified line persisted to disk would permanently break every future
+        // import of that peer. So a bad line must leave the on-disk log untouched.
+        let dir = tempdir().unwrap();
+        let author = Identity::generate();
+        let mut s = Store::open(dir.path(), Identity::generate()).unwrap();
+        s.declare_founder(Role::Admin).unwrap();
+        s.add_peer(
+            author.peer_id(),
+            author.verifying_key().to_bytes(),
+            Role::Admin,
+        )
+        .unwrap();
+
+        // Seed one GOOD line so there is a non-empty log to (not) corrupt.
+        let adir = tempdir().unwrap();
+        let mut astore = Store::open(adir.path(), author.clone()).unwrap();
+        astore.declare_founder(Role::Admin).unwrap();
+        astore.set_entry("files", "k", "good").unwrap();
+        let good = split_log_lines_bytes(&astore.export_own_log().unwrap());
+        let vk = author.verifying_key();
+        s.dedup_append_peer_line(author.peer_id(), &vk, &good[0])
+            .unwrap();
+
+        let before = s.export_peer_log(author.peer_id()).unwrap();
+
+        // A garbage line claiming to be from `author` with an invalid signature.
+        let bad = format!(
+            "{{\"peer\":{},\"sig\":\"AAAA\",\"update\":\"AAAA\"}}\n",
+            author.peer_id()
+        );
+        let result = s.dedup_append_peer_line(author.peer_id(), &vk, bad.as_bytes());
+        assert!(
+            result.is_err(),
+            "a bad line must be rejected, not persisted"
+        );
+
+        let after = s.export_peer_log(author.peer_id()).unwrap();
+        assert_eq!(
+            before, after,
+            "on-disk peer log must be byte-identical after a rejected bad line"
+        );
+
+        // The good state still reads back — no collateral damage.
+        assert_eq!(s.get_entry("files", "k"), Some("good".to_string()));
     }
 }
