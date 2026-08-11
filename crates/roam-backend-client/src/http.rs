@@ -21,6 +21,9 @@ impl HttpBackend {
     fn blob_url(&self, bucket: &str, id: &str) -> String {
         format!("{}/b/{bucket}/blobs/{id}", self.base)
     }
+    fn snapshot_url(&self, bucket: &str, id: &str) -> String {
+        format!("{}/b/{bucket}/snapshots/{id}", self.base)
+    }
 }
 
 async fn get_bytes(client: &reqwest::Client, url: &str) -> anyhow::Result<Option<Vec<u8>>> {
@@ -59,6 +62,22 @@ impl Backend for HttpBackend {
     }
     async fn put_blob(&self, bucket: &str, id: &str, ct: Vec<u8>) -> anyhow::Result<PutOutcome> {
         put_bytes(&self.client, &self.blob_url(bucket, id), ct).await
+    }
+    async fn get_snapshot(&self, bucket: &str, id: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        get_bytes(&self.client, &self.snapshot_url(bucket, id)).await
+    }
+    async fn put_snapshot(
+        &self,
+        bucket: &str,
+        id: &str,
+        ct: Vec<u8>,
+    ) -> anyhow::Result<PutOutcome> {
+        put_bytes(&self.client, &self.snapshot_url(bucket, id), ct).await
+    }
+    async fn list_snapshots(&self, bucket: &str) -> anyhow::Result<Vec<String>> {
+        // The backend surfaces snapshot ids through the manifest endpoint, so a
+        // dedicated list route is unnecessary.
+        Ok(self.manifest(bucket).await?.snapshot_ids)
     }
     async fn reconcile(
         &self,

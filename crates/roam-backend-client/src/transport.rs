@@ -10,6 +10,15 @@ pub use roam_rbsr::SetKind;
 pub struct Manifest {
     pub entry_ids: Vec<String>,
     pub blob_ids: Vec<String>,
+    /// Snapshot ids the backend holds. `serde(default)` so a manifest from a
+    /// pre-snapshot backend (no such field) still decodes.
+    #[serde(default)]
+    pub snapshot_ids: Vec<String>,
+    /// The backend is asking an Admin client to produce a fresh snapshot (its
+    /// entry tail has grown past the configured threshold). `serde(default)` so
+    /// a pre-snapshot backend's manifest still decodes to `false`.
+    #[serde(default)]
+    pub snapshot_wanted: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,6 +36,11 @@ pub trait Backend: Send + Sync {
     async fn put_entry(&self, bucket: &str, id: &str, ct: Vec<u8>) -> anyhow::Result<PutOutcome>;
     async fn get_blob(&self, bucket: &str, id: &str) -> anyhow::Result<Option<Vec<u8>>>;
     async fn put_blob(&self, bucket: &str, id: &str, ct: Vec<u8>) -> anyhow::Result<PutOutcome>;
+    async fn get_snapshot(&self, bucket: &str, id: &str) -> anyhow::Result<Option<Vec<u8>>>;
+    async fn put_snapshot(&self, bucket: &str, id: &str, ct: Vec<u8>)
+        -> anyhow::Result<PutOutcome>;
+    /// All snapshot ids the backend currently holds for `bucket`.
+    async fn list_snapshots(&self, bucket: &str) -> anyhow::Result<Vec<String>>;
 
     /// One RBSR round: hand the backend a negentropy message for `kind`'s id set,
     /// get its reply. Bytes are opaque negentropy protocol frames.
@@ -39,13 +53,40 @@ pub trait Backend: Send + Sync {
 pub struct MemoryBackend {
     entries: Mutex<BTreeMap<String, BTreeMap<String, Vec<u8>>>>,
     blobs: Mutex<BTreeMap<String, BTreeMap<String, Vec<u8>>>>,
+    snapshots: Mutex<BTreeMap<String, BTreeMap<String, Vec<u8>>>>,
+    /// Buckets for which the backend is currently requesting a snapshot.
+    snapshot_wanted: Mutex<std::collections::BTreeSet<String>>,
+    /// Per-entry-id `get_entry` call counts (test instrumentation).
+    entry_gets: Mutex<BTreeMap<String, usize>>,
 }
 
 impl MemoryBackend {
+    /// Test hook: mark (or clear) a bucket as wanting a snapshot, mirroring the
+    /// real backend's size-threshold signal.
+    pub fn set_snapshot_wanted(&self, bucket: &str, wanted: bool) {
+        let mut guard = self.snapshot_wanted.lock().unwrap();
+        if wanted {
+            guard.insert(bucket.to_string());
+        } else {
+            guard.remove(bucket);
+        }
+    }
+
+    /// Test hook: how many times `get_entry` was called for `id` (any bucket).
+    pub fn entry_get_count(&self, id: &str) -> usize {
+        self.entry_gets
+            .lock()
+            .unwrap()
+            .get(id)
+            .copied()
+            .unwrap_or(0)
+    }
+
     fn id_set(&self, bucket: &str, kind: SetKind) -> Vec<[u8; 32]> {
         let map = match kind {
             SetKind::Entries => &self.entries,
             SetKind::Blobs => &self.blobs,
+            SetKind::Snapshots => &self.snapshots,
         };
         let guard = map.lock().unwrap();
         let Some(b) = guard.get(bucket) else {
@@ -106,12 +147,28 @@ impl Backend for MemoryBackend {
             .get(bucket)
             .map(|b| b.keys().cloned().collect())
             .unwrap_or_default();
+        let snapshot_ids = self
+            .snapshots
+            .lock()
+            .unwrap()
+            .get(bucket)
+            .map(|b| b.keys().cloned().collect())
+            .unwrap_or_default();
+        let snapshot_wanted = self.snapshot_wanted.lock().unwrap().contains(bucket);
         Ok(Manifest {
             entry_ids,
             blob_ids,
+            snapshot_ids,
+            snapshot_wanted,
         })
     }
     async fn get_entry(&self, bucket: &str, id: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        *self
+            .entry_gets
+            .lock()
+            .unwrap()
+            .entry(id.to_string())
+            .or_insert(0) += 1;
         Ok(get(&self.entries, bucket, id))
     }
     async fn put_entry(&self, bucket: &str, id: &str, ct: Vec<u8>) -> anyhow::Result<PutOutcome> {
@@ -122,6 +179,26 @@ impl Backend for MemoryBackend {
     }
     async fn put_blob(&self, bucket: &str, id: &str, ct: Vec<u8>) -> anyhow::Result<PutOutcome> {
         Ok(put(&self.blobs, bucket, id, ct))
+    }
+    async fn get_snapshot(&self, bucket: &str, id: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        Ok(get(&self.snapshots, bucket, id))
+    }
+    async fn put_snapshot(
+        &self,
+        bucket: &str,
+        id: &str,
+        ct: Vec<u8>,
+    ) -> anyhow::Result<PutOutcome> {
+        Ok(put(&self.snapshots, bucket, id, ct))
+    }
+    async fn list_snapshots(&self, bucket: &str) -> anyhow::Result<Vec<String>> {
+        Ok(self
+            .snapshots
+            .lock()
+            .unwrap()
+            .get(bucket)
+            .map(|b| b.keys().cloned().collect())
+            .unwrap_or_default())
     }
     async fn reconcile(
         &self,
@@ -149,6 +226,26 @@ mod tests {
             b.put_entry("bkt", "e1", b"ct".to_vec()).await.unwrap(),
             PutOutcome::Exists
         );
+    }
+
+    #[tokio::test]
+    async fn memory_backend_stores_and_lists_snapshots() {
+        let b = MemoryBackend::default();
+        assert_eq!(
+            b.put_snapshot("bkt", "sid", vec![1, 2, 3]).await.unwrap(),
+            PutOutcome::Created
+        );
+        assert_eq!(
+            b.get_snapshot("bkt", "sid").await.unwrap(),
+            Some(vec![1, 2, 3])
+        );
+        assert_eq!(
+            b.list_snapshots("bkt").await.unwrap(),
+            vec!["sid".to_string()]
+        );
+        // Snapshot ids also surface through the manifest, isolated per bucket.
+        assert_eq!(b.manifest("bkt").await.unwrap().snapshot_ids, vec!["sid"]);
+        assert!(b.list_snapshots("other").await.unwrap().is_empty());
     }
 
     #[tokio::test]

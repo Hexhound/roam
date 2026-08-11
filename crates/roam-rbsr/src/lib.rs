@@ -11,6 +11,7 @@ use negentropy::{Id, Negentropy, NegentropyStorageVector};
 pub enum SetKind {
     Entries,
     Blobs,
+    Snapshots,
 }
 
 impl SetKind {
@@ -19,6 +20,7 @@ impl SetKind {
         match self {
             SetKind::Entries => "entries",
             SetKind::Blobs => "blobs",
+            SetKind::Snapshots => "snapshots",
         }
     }
 }
@@ -118,6 +120,13 @@ mod tests {
         let mut b = [0u8; 32];
         b[0] = n;
         b
+    }
+
+    #[test]
+    fn setkind_str_segments_are_stable() {
+        assert_eq!(SetKind::Entries.as_str(), "entries");
+        assert_eq!(SetKind::Blobs.as_str(), "blobs");
+        assert_eq!(SetKind::Snapshots.as_str(), "snapshots");
     }
 
     /// Drive a full client↔server session to convergence, returning the client's

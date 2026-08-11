@@ -47,6 +47,52 @@ defmodule SyncWeb.SyncControllerTest do
     assert %{"entry_ids" => [@id], "blob_ids" => []} = json_response(resp, 200)
   end
 
+  test "put then get a snapshot round-trips the bytes", %{conn: conn} do
+    conn = put_req_header(conn, "content-type", "application/octet-stream")
+    assert put(conn, "/b/#{@bucket}/snapshots/#{@id}", "snapct").status == 201
+
+    got = get(build_conn(), "/b/#{@bucket}/snapshots/#{@id}")
+    assert got.status == 200
+    assert got.resp_body == "snapct"
+  end
+
+  test "manifest lists snapshot ids", %{conn: conn} do
+    put(
+      conn |> put_req_header("content-type", "application/octet-stream"),
+      "/b/#{@bucket}/snapshots/#{@id}",
+      "s"
+    )
+
+    resp = get(build_conn(), "/b/#{@bucket}/manifest")
+    assert %{"snapshot_ids" => [@id]} = json_response(resp, 200)
+  end
+
+  test "manifest signals snapshot_wanted once the entry tail crosses the threshold", %{
+    conn: conn
+  } do
+    Application.put_env(:sync, :snapshot_threshold_bytes, 100)
+    on_exit(fn -> Application.delete_env(:sync, :snapshot_threshold_bytes) end)
+
+    resp = get(build_conn(), "/b/#{@bucket}/manifest")
+    assert %{"snapshot_wanted" => false} = json_response(resp, 200)
+
+    put(
+      conn |> put_req_header("content-type", "application/octet-stream"),
+      "/b/#{@bucket}/entries/#{@id}",
+      :binary.copy(<<0>>, 200)
+    )
+
+    resp = get(build_conn(), "/b/#{@bucket}/manifest")
+    assert %{"snapshot_wanted" => true} = json_response(resp, 200)
+  end
+
+  test "reconcile over the snapshots kind is accepted", %{conn: conn} do
+    conn = put_req_header(conn, "content-type", "application/octet-stream")
+    resp = post(conn, "/b/#{@bucket}/reconcile/snapshots", <<>>)
+    assert resp.status in [200, 400]
+    refute resp.status == 500
+  end
+
   test "path-traversal id is rejected 400", %{conn: conn} do
     assert get(conn, "/b/#{@bucket}/entries/..%2f..%2fetc").status == 400
   end

@@ -1,0 +1,163 @@
+defmodule Sync.Backend.Retention do
+  @moduledoc """
+  Pure retention/GC planners plus a filesystem sweep for backend snapshots.
+
+  Zero-knowledge throughout: the sweep reads only the PLAINTEXT manifest prefix of
+  each framed snapshot object and file mtimes. It never touches the sealed
+  ciphertext body.
+
+  A snapshot object on disk is framed as
+  `u32-LE manifest_len ‖ manifest_json ‖ sealed_ciphertext` (see the Rust
+  `roam_backend_client::snapshot_msg::frame`). The manifest JSON carries opaque id
+  lists: `subsumed_entry_ids` (entries the snapshot replaces) and `blob_ref_ids`
+  (blobs it keeps alive).
+  """
+
+  alias Sync.Backend.Store
+
+  @default_keep 3
+  @default_grace_ms 7 * 24 * 60 * 60 * 1000
+
+  @doc "Snapshot ids to drop: keep the newest `n` by ts, drop the rest."
+  def snapshots_to_drop(snapshots, n) do
+    snapshots
+    |> Enum.sort_by(& &1.ts, :desc)
+    |> Enum.drop(n)
+    |> Enum.map(& &1.id)
+  end
+
+  @doc """
+  Subsumed entry ids past `grace` (by arrival age) that a retained snapshot
+  covers. An entry not subsumed by any retained snapshot is never returned.
+  """
+  def entries_to_delete(retained_subsumed, entry_ages, now, grace) do
+    retained_subsumed
+    |> Enum.filter(fn id ->
+      case Map.get(entry_ages, id) do
+        nil -> false
+        born -> now - born >= grace
+      end
+    end)
+    |> Enum.sort()
+  end
+
+  @doc "Blob ids referenced by NO retained snapshot, past `grace`."
+  def blobs_to_delete(retained_blob_refs, blob_ages, now, grace) do
+    blob_ages
+    |> Enum.filter(fn {id, born} ->
+      not MapSet.member?(retained_blob_refs, id) and now - born >= grace
+    end)
+    |> Enum.map(&elem(&1, 0))
+    |> Enum.sort()
+  end
+
+  @doc """
+  Sweep one bucket: drop snapshots past the newest `:keep` (default #{@default_keep}),
+  then delete subsumed entries and orphaned blobs older than `:grace_ms`
+  (default 7 days). Always keeps >= 1 snapshot (generational floor).
+
+  Opts: `:keep`, `:grace_ms`, `:now_ms` (inject for tests), `:data_root`.
+  Returns `%{snapshots: [ids], entries: [ids], blobs: [ids]}` of what was deleted.
+  """
+  def sweep(bucket, opts \\ []) do
+    keep = max(Keyword.get(opts, :keep, @default_keep), 1)
+    grace = Keyword.get(opts, :grace_ms, @default_grace_ms)
+    now = Keyword.get(opts, :now_ms, System.system_time(:millisecond))
+    root = Keyword.get(opts, :data_root, Store.data_root())
+
+    snaps = load_snapshots(root, bucket)
+    dropped_ids = snapshots_to_drop(snaps, keep)
+    dropped_set = MapSet.new(dropped_ids)
+    retained = Enum.reject(snaps, &MapSet.member?(dropped_set, &1.id))
+
+    # Delete the dropped snapshot files.
+    Enum.each(dropped_ids, &rm(root, bucket, "snapshots", &1))
+
+    retained_subsumed =
+      retained |> Enum.flat_map(& &1.subsumed) |> MapSet.new()
+
+    retained_blob_refs =
+      retained |> Enum.flat_map(& &1.blob_refs) |> MapSet.new()
+
+    entry_ages = file_ages(root, bucket, "entries")
+    del_entries = entries_to_delete(retained_subsumed, entry_ages, now, grace)
+    Enum.each(del_entries, &rm(root, bucket, "entries", &1))
+
+    blob_ages = file_ages(root, bucket, "blobs")
+    del_blobs = blobs_to_delete(retained_blob_refs, blob_ages, now, grace)
+    Enum.each(del_blobs, &rm(root, bucket, "blobs", &1))
+
+    %{snapshots: dropped_ids, entries: del_entries, blobs: del_blobs}
+  end
+
+  # --- internals ---
+
+  defp load_snapshots(root, bucket) do
+    dir = Path.join([root, bucket, "snapshots"])
+
+    case File.ls(dir) do
+      {:ok, names} ->
+        names
+        |> Enum.reject(&String.contains?(&1, ".tmp"))
+        |> Enum.flat_map(fn id ->
+          path = Path.join(dir, id)
+
+          with {:ok, bytes} <- File.read(path),
+               {:ok, manifest} <- parse_manifest(bytes) do
+            [
+              %{
+                id: id,
+                ts: mtime_ms(path),
+                subsumed: Map.get(manifest, "subsumed_entry_ids", []),
+                blob_refs: Map.get(manifest, "blob_ref_ids", [])
+              }
+            ]
+          else
+            # A file that doesn't parse as a frame is not a valid snapshot object;
+            # skip it rather than crash the sweep (fail-safe: never delete on doubt).
+            _ -> []
+          end
+        end)
+
+      {:error, _} ->
+        []
+    end
+  end
+
+  # Frame: u32-LE manifest_len ‖ manifest_json ‖ sealed_ct. Only the manifest is read.
+  defp parse_manifest(bytes) do
+    case bytes do
+      <<len::little-32, rest::binary>> when byte_size(rest) >= len ->
+        <<json::binary-size(len), _sealed::binary>> = rest
+        Jason.decode(json)
+
+      _ ->
+        :error
+    end
+  end
+
+  defp file_ages(root, bucket, kind) do
+    dir = Path.join([root, bucket, kind])
+
+    case File.ls(dir) do
+      {:ok, names} ->
+        names
+        |> Enum.reject(&String.contains?(&1, ".tmp"))
+        |> Map.new(fn id -> {id, mtime_ms(Path.join(dir, id))} end)
+
+      {:error, _} ->
+        %{}
+    end
+  end
+
+  defp mtime_ms(path) do
+    case File.stat(path, time: :posix) do
+      {:ok, %{mtime: secs}} -> secs * 1000
+      _ -> 0
+    end
+  end
+
+  defp rm(root, bucket, kind, id) do
+    File.rm(Path.join([root, bucket, kind, id]))
+  end
+end

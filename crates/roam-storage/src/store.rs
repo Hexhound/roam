@@ -431,6 +431,12 @@ impl Store {
 
     /// This device's ed25519 verifying-key bytes (for cross-vouching and for peers
     /// to trust our authored ops).
+    /// This device's identity — used by the backend client to sign artifacts it
+    /// authors (e.g. a snapshot manifest) with the device's own key.
+    pub fn identity(&self) -> &Identity {
+        &self.identity
+    }
+
     pub fn identity_verifying_bytes(&self) -> [u8; 32] {
         self.identity.verifying_key_bytes()
     }
@@ -1049,6 +1055,46 @@ impl Store {
         Ok(())
     }
 
+    /// Append one already-formed peer op-log line if absent (exact-bytes dedup),
+    /// then re-import the peer log. Order-independent: Loro buffers ops whose
+    /// deps are absent and converges once the missing ancestor lands. Used by
+    /// the backend content-id fetch path (`roam-backend-client::sync`), which
+    /// resolves entries out of causal order (RBSR discovery is set-based, not
+    /// sequential).
+    pub fn dedup_append_peer_line(
+        &mut self,
+        author: u64,
+        key: &VerifyingKey,
+        line: &[u8],
+    ) -> Result<(), StorageError> {
+        if author == self.identity.peer_id() {
+            return Ok(());
+        }
+        let existing = self.export_peer_log(author)?;
+        let already = split_log_lines_bytes(&existing)
+            .iter()
+            .any(|l| l.as_slice() == line);
+        if already {
+            return Ok(());
+        }
+        // Build the candidate whole log IN MEMORY and hand it to `import_peer`,
+        // which verifies (`verify_bytes`) BEFORE it persists. Never append the
+        // raw fetched line to disk ourselves: a corrupt/forged/bit-flipped line
+        // would otherwise land on disk unverified, and since `verify_bytes`
+        // rejects the WHOLE log on the first bad line, every future import would
+        // fail — permanently poisoning that peer's log. Keeping the write inside
+        // `import_peer` means a bad line leaves the on-disk file untouched.
+        let mut whole = existing;
+        if !whole.is_empty() && !whole.ends_with(b"\n") {
+            whole.push(b'\n');
+        }
+        whole.extend_from_slice(line);
+        if !whole.ends_with(b"\n") {
+            whole.push(b'\n');
+        }
+        self.import_peer(author, key, whole)
+    }
+
     /// Rewrite the `peers.json` materialized cache via a temp file + rename.
     ///
     /// Like the snapshot, this is a **rebuildable cache** (the signed roster logs
@@ -1173,6 +1219,131 @@ impl Store {
         Ok(freed)
     }
 
+    /// Build a shallow snapshot suitable for upload to the backend, at the newest
+    /// history marker with `ts_ms <= before_ts`. Read-only — emits no ops, mutates
+    /// nothing on disk. Returns `None` when no marker qualifies (nothing to
+    /// snapshot yet). The caller seals `bytes`, derives entry-ids from
+    /// `subsumed_lines`, and derives blob-ids from `blob_refs`.
+    ///
+    /// `before_ts` is an ABSOLUTE timestamp (like [`Store::checkpoint`]); a caller
+    /// wanting a "keep the last N days as a replayable tail" policy passes
+    /// `now_ms - retention_lag_ms`, and one wanting a head snapshot passes
+    /// `i64::MAX`.
+    pub fn build_backend_snapshot(
+        &self,
+        before_ts: i64,
+    ) -> Result<Option<BackendSnapshot>, StorageError> {
+        use roam_crdt::Frontier;
+        let idx = HistoryIndex::new(&self.root.join("history"));
+        let target = match idx.marker_before(before_ts)? {
+            Some(m) => m,
+            None => return Ok(None),
+        };
+
+        // Shallow snapshot at the target frontier.
+        let fbytes = B64
+            .decode(target.frontier.as_bytes())
+            .map_err(|e| StorageError::Base64(e.to_string()))?;
+        let frontier = Frontier::from_bytes(&fbytes)?;
+        let bytes = self.doc.shallow_snapshot(&frontier)?;
+        let frontier_digest: [u8; 32] = blake3::hash(&fbytes).into();
+
+        // Subsumed op-log lines: the first `count` lines of each peer's log are
+        // the ones this snapshot replaces (mirrors the checkpoint drop plan).
+        let plan = crate::checkpoint::plan_from_marker(&target);
+        let mut subsumed_lines = Vec::new();
+        for (peer, count) in &plan.drop_lines {
+            let log = if *peer == self.peer_id() {
+                self.export_own_log()?
+            } else {
+                self.export_peer_log(*peer)?
+            };
+            for line in split_log_lines_bytes(&log)
+                .into_iter()
+                .take(*count as usize)
+            {
+                subsumed_lines.push((*peer, line));
+            }
+        }
+
+        // Blobs referenced by the snapshot state — the keep-alive set for blob GC.
+        // (`referenced_hashes` also unions the latest state, which can only
+        // over-retain a blob, never orphan one still in use — safe.)
+        let mut blob_refs: Vec<String> = self
+            .referenced_hashes(&[target.frontier.clone()])?
+            .into_iter()
+            .collect();
+        blob_refs.sort();
+
+        Ok(Some(BackendSnapshot {
+            bytes,
+            frontier_digest,
+            subsumed_lines,
+            blob_refs,
+        }))
+    }
+
+    /// Record that this device holds backend snapshot `id`, which subsumes the
+    /// given entry-ids. Append-only sidecar (`<root>/snapshots/held.jsonl`),
+    /// deduped by id. Drives the backend loop's snapshot advertising +
+    /// stop-advertising-subsumed logic.
+    pub fn record_held_snapshot(&self, id: &str, subsumed: &[String]) -> Result<(), StorageError> {
+        if self.held_snapshots()?.iter().any(|h| h.id == id) {
+            return Ok(());
+        }
+        let dir = self.root.join("snapshots");
+        std::fs::create_dir_all(&dir)?;
+        let held = HeldSnapshot {
+            id: id.to_string(),
+            subsumed: subsumed.to_vec(),
+        };
+        let mut line = serde_json::to_vec(&held)?;
+        line.push(b'\n');
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("held.jsonl"))?;
+        f.write_all(&line)?;
+        Ok(())
+    }
+
+    /// The backend snapshots this device holds (see [`Store::record_held_snapshot`]).
+    pub fn held_snapshots(&self) -> Result<Vec<HeldSnapshot>, StorageError> {
+        let path = self.root.join("snapshots").join("held.jsonl");
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut out = Vec::new();
+        for line in text.lines().filter(|l| !l.trim().is_empty()) {
+            out.push(serde_json::from_str(line)?);
+        }
+        Ok(out)
+    }
+
+    /// Adopt a snapshot received from a peer or the backend. **Additive**: it
+    /// merges the snapshot's state into the live doc and NEVER truncates this
+    /// device's op-logs. A device can therefore only ever "lose" history it never
+    /// had — importing a snapshot cannot reach across and drop history a
+    /// well-stocked device holds locally (design invariant). Local space reclaim
+    /// remains the separate, explicit job of [`Store::checkpoint`].
+    pub fn adopt_snapshot(&mut self, bytes: &[u8]) -> Result<(), StorageError> {
+        self.doc.import(bytes)?;
+        self.doc.commit();
+        // Persist the merged state as the fast-load base so a reopen keeps it —
+        // the op-logs are untouched, so without this the adopted state would be
+        // lost on reload. No history marker: adopting a peer's snapshot is not a
+        // local checkpoint moment.
+        let path = self.root.join("snapshots").join("snapshot.loro");
+        snapshot::save(&path, &self.doc.snapshot()?)?;
+        // Advance `persisted` so these foreign ops are never re-exported into our
+        // own (own-key-signed) log — mirrors `import_peer`.
+        self.persisted = self.doc.version();
+        Ok(())
+    }
+
     /// The serialized entry value for `key` in `map_id` as of the newest retained
     /// marker at/before `before_ts`, or `None` if no such marker exists or that
     /// point can't be checked out (already compacted below the shallow base).
@@ -1205,6 +1376,34 @@ impl Store {
     }
 }
 
+/// A shallow snapshot ready for backend upload, plus the metadata the backend's
+/// zero-knowledge retention sweep needs (all opaque once ids are derived).
+/// Produced by [`Store::build_backend_snapshot`]; the caller seals `bytes` and
+/// maps `subsumed_lines`/`blob_refs` into backend ids.
+#[derive(Debug, Clone)]
+pub struct BackendSnapshot {
+    /// Loro shallow-snapshot bytes at the covered frontier (PLAINTEXT — the
+    /// caller seals before upload).
+    pub bytes: Vec<u8>,
+    /// blake3 of the covered frontier bytes; the snapshot's stable identity.
+    pub frontier_digest: [u8; 32],
+    /// `(peer, line)` for every op-log line this snapshot subsumes. The caller
+    /// derives each backend entry-id via `VaultKey::entry_id_content(peer, line)`.
+    pub subsumed_lines: Vec<(u64, Vec<u8>)>,
+    /// Content hashes of blobs the snapshot state references (sorted, deduped).
+    /// The caller maps each to a backend blob-id via `VaultKey::blob_id`.
+    pub blob_refs: Vec<String>,
+}
+
+/// A backend snapshot this device holds (authored or adopted), plus the entry-ids
+/// it subsumes. Persisted so the backend sync loop can advertise held snapshots
+/// and stop advertising the entries they replace (killing the RBSR re-pull fight).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HeldSnapshot {
+    pub id: String,
+    pub subsumed: Vec<String>,
+}
+
 /// Mirrors `roam_files::fileset::FILESET_MAP_ID`. Kept as a literal to avoid a
 /// storage->files dependency cycle; a roam-files test asserts they stay equal.
 const FILESET_MAP_ID: &str = "__roam_fileset__";
@@ -1213,6 +1412,25 @@ const FILESET_MAP_ID: &str = "__roam_fileset__";
 fn extract_content_hash(value: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(value).ok()?;
     v.get("content_hash")?.as_str().map(|s| s.to_string())
+}
+
+/// Split a JSONL byte buffer into its individual lines, each chunk keeping its
+/// trailing `\n` (a torn final line without a newline is its own chunk).
+/// Mirrors `roam_backend_client::entries::split_log_lines`, duplicated here so
+/// `roam-storage` (a dependency of that crate) never needs a reverse edge.
+fn split_log_lines_bytes(log: &[u8]) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    for (i, b) in log.iter().enumerate() {
+        if *b == b'\n' {
+            out.push(log[start..=i].to_vec());
+            start = i + 1;
+        }
+    }
+    if start < log.len() {
+        out.push(log[start..].to_vec());
+    }
+    out
 }
 
 /// Drop the first `n` non-empty lines from a JSONL file, rewriting atomically.
@@ -2472,5 +2690,167 @@ mod tests {
             .unwrap();
         let err = a2.import_peer(p.peer_id(), &p.verifying_key(), p_ops);
         assert!(err.is_err(), "reader-authored content ops must be refused");
+    }
+
+    #[test]
+    fn dedup_append_peer_line_is_idempotent_and_order_free() {
+        // Exercises the backend content-id fetch path's write primitive: lines
+        // can arrive one at a time, out of order, and with duplicates (RBSR
+        // discovery is set-based, not sequential) — the peer log must still end
+        // up holding exactly the distinct lines, and Loro must converge once
+        // both are present regardless of arrival order.
+        let dir = tempdir().unwrap();
+        let author = Identity::generate();
+        let mut s = Store::open(dir.path(), Identity::generate()).unwrap();
+        s.declare_founder(Role::Admin).unwrap();
+        s.add_peer(
+            author.peer_id(),
+            author.verifying_key().to_bytes(),
+            Role::Admin,
+        )
+        .unwrap();
+
+        // Build a real 2-line signed log: a throwaway store owned by `author`
+        // produces two ops, then we split its own log into lines.
+        let adir = tempdir().unwrap();
+        let mut astore = Store::open(adir.path(), author.clone()).unwrap();
+        astore.declare_founder(Role::Admin).unwrap();
+        astore.set_entry("files", "k", "v1").unwrap();
+        astore.set_entry("files", "k", "v2").unwrap();
+        let log = astore.export_own_log().unwrap();
+        let lines = split_log_lines_bytes(&log);
+        assert_eq!(
+            lines.len(),
+            2,
+            "two set_entry calls produce two op-log lines"
+        );
+
+        let vk = author.verifying_key();
+        // Out of order, plus a duplicate of an already-applied line.
+        s.dedup_append_peer_line(author.peer_id(), &vk, &lines[1])
+            .unwrap();
+        s.dedup_append_peer_line(author.peer_id(), &vk, &lines[0])
+            .unwrap();
+        s.dedup_append_peer_line(author.peer_id(), &vk, &lines[1])
+            .unwrap(); // dup: no-op
+
+        // Exactly 2 distinct lines retained on disk (dedup, not 3).
+        let stored = s.export_peer_log(author.peer_id()).unwrap();
+        assert_eq!(
+            stored.iter().filter(|&&b| b == b'\n').count(),
+            2,
+            "duplicate line must not be appended twice"
+        );
+        // And the doc converged to the final value despite the reordering.
+        assert_eq!(s.get_entry("files", "k"), Some("v2".to_string()));
+    }
+
+    #[test]
+    fn adopt_snapshot_is_additive_and_never_truncates_existing_history() {
+        // Producer builds a snapshot at head.
+        let pd = tempdir().unwrap();
+        let mut prod = Store::open(pd.path(), Identity::generate()).unwrap();
+        prod.declare_founder(Role::Admin).unwrap();
+        prod.set_entry("files", "k", "v1").unwrap();
+        prod.write_snapshot().unwrap();
+        let snap = prod.build_backend_snapshot(i64::MAX).unwrap().unwrap();
+
+        // A fresh consumer adopting it gains the producer's state.
+        let cd = tempdir().unwrap();
+        let mut cons = Store::open(cd.path(), Identity::generate()).unwrap();
+        cons.declare_founder(Role::Admin).unwrap();
+        cons.adopt_snapshot(&snap.bytes).unwrap();
+        assert_eq!(cons.get_entry("files", "k"), Some("v1".to_string()));
+
+        // A consumer that already holds richer local history keeps it after
+        // adopting the (older) snapshot — adoption is additive, never truncating.
+        cons.set_entry("files", "k2", "local").unwrap();
+        let own_before = cons.export_own_log().unwrap();
+        cons.adopt_snapshot(&snap.bytes).unwrap();
+        assert_eq!(cons.get_entry("files", "k2"), Some("local".to_string()));
+        assert_eq!(
+            cons.export_own_log().unwrap(),
+            own_before,
+            "adopting a snapshot must not touch our own op-log"
+        );
+    }
+
+    #[test]
+    fn build_backend_snapshot_produces_a_loadable_shallow_snapshot() {
+        let dir = tempdir().unwrap();
+        let mut s = Store::open(dir.path(), Identity::generate()).unwrap();
+        s.declare_founder(Role::Admin).unwrap();
+        for i in 0..5 {
+            s.set_entry("files", "k", &format!("v{i}")).unwrap();
+        }
+        // No history marker yet -> nothing to snapshot.
+        assert!(s.build_backend_snapshot(i64::MAX).unwrap().is_none());
+
+        // Record a marker at head, then snapshot at it.
+        s.write_snapshot().unwrap();
+        let snap = s
+            .build_backend_snapshot(i64::MAX)
+            .unwrap()
+            .expect("a marker now exists");
+
+        // Reloading the shallow snapshot into a fresh doc yields head state.
+        let restored = roam_crdt::Document::from_snapshot(99, &snap.bytes).unwrap();
+        assert_eq!(restored.get_entry("files", "k"), Some("v4".to_string()));
+
+        // Subsumed lines cover this peer's own op-log.
+        assert!(!snap.subsumed_lines.is_empty());
+        assert!(snap.subsumed_lines.iter().all(|(p, _)| *p == s.peer_id()));
+        assert_ne!(snap.frontier_digest, [0u8; 32]);
+    }
+
+    #[test]
+    fn a_bad_fetched_line_never_poisons_the_peer_log() {
+        // The backend fetch path feeds attacker-influenced bytes (a malicious or
+        // buggy backend, a bit-flip) into `dedup_append_peer_line`. Because
+        // `verify_bytes` rejects the WHOLE log on the first bad line, a single
+        // unverified line persisted to disk would permanently break every future
+        // import of that peer. So a bad line must leave the on-disk log untouched.
+        let dir = tempdir().unwrap();
+        let author = Identity::generate();
+        let mut s = Store::open(dir.path(), Identity::generate()).unwrap();
+        s.declare_founder(Role::Admin).unwrap();
+        s.add_peer(
+            author.peer_id(),
+            author.verifying_key().to_bytes(),
+            Role::Admin,
+        )
+        .unwrap();
+
+        // Seed one GOOD line so there is a non-empty log to (not) corrupt.
+        let adir = tempdir().unwrap();
+        let mut astore = Store::open(adir.path(), author.clone()).unwrap();
+        astore.declare_founder(Role::Admin).unwrap();
+        astore.set_entry("files", "k", "good").unwrap();
+        let good = split_log_lines_bytes(&astore.export_own_log().unwrap());
+        let vk = author.verifying_key();
+        s.dedup_append_peer_line(author.peer_id(), &vk, &good[0])
+            .unwrap();
+
+        let before = s.export_peer_log(author.peer_id()).unwrap();
+
+        // A garbage line claiming to be from `author` with an invalid signature.
+        let bad = format!(
+            "{{\"peer\":{},\"sig\":\"AAAA\",\"update\":\"AAAA\"}}\n",
+            author.peer_id()
+        );
+        let result = s.dedup_append_peer_line(author.peer_id(), &vk, bad.as_bytes());
+        assert!(
+            result.is_err(),
+            "a bad line must be rejected, not persisted"
+        );
+
+        let after = s.export_peer_log(author.peer_id()).unwrap();
+        assert_eq!(
+            before, after,
+            "on-disk peer log must be byte-identical after a rejected bad line"
+        );
+
+        // The good state still reads back — no collateral damage.
+        assert_eq!(s.get_entry("files", "k"), Some("good".to_string()));
     }
 }

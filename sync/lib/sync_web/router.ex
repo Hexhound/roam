@@ -40,6 +40,8 @@ defmodule SyncWeb.Router do
     put "/entries/:id", SyncController, :put_entry
     get "/blobs/:id", SyncController, :get_blob
     put "/blobs/:id", SyncController, :put_blob
+    get "/snapshots/:id", SyncController, :get_snapshot
+    put "/snapshots/:id", SyncController, :put_snapshot
     post "/reconcile/:kind", SyncController, :reconcile
   end
 

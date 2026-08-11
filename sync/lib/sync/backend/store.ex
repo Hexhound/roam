@@ -59,6 +59,38 @@ defmodule Sync.Backend.Store do
     end
   end
 
+  @doc "Total bytes stored for `kind` in `bucket` (excludes leftover temp files)."
+  @spec kind_bytes(String.t(), String.t()) :: non_neg_integer()
+  def kind_bytes(bucket, kind) do
+    dir = Path.join([data_root(), bucket, kind])
+
+    case File.ls(dir) do
+      {:ok, names} ->
+        names
+        |> Enum.reject(&String.contains?(&1, ".tmp"))
+        |> Enum.reduce(0, fn n, acc -> acc + file_size(Path.join(dir, n)) end)
+
+      {:error, _} ->
+        0
+    end
+  end
+
+  defp file_size(path) do
+    case File.stat(path) do
+      {:ok, %{size: s}} -> s
+      _ -> 0
+    end
+  end
+
+  @doc """
+  Whether the backend should ask an Admin client to snapshot: the entry tail has
+  grown past `threshold_bytes`. The backend can't build a snapshot itself
+  (zero-knowledge) — it can only signal demand.
+  """
+  @spec snapshot_wanted?(String.t(), non_neg_integer()) :: boolean()
+  def snapshot_wanted?(bucket, threshold_bytes),
+    do: kind_bytes(bucket, "entries") > threshold_bytes
+
   @doc "Concatenated 32-byte ids for the NIF: decode each base64url filename."
   @spec id_bytes(String.t(), String.t()) :: binary()
   def id_bytes(bucket, kind) do

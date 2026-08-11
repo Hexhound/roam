@@ -53,8 +53,8 @@ pub fn local_entries(
         } else {
             store.export_peer_log(peer_id)?
         };
-        for (index, line) in split_log_lines(&log).into_iter().enumerate() {
-            out.push((key.entry_id(peer_id, index as u64), line));
+        for line in split_log_lines(&log) {
+            out.push((key.entry_id_content(peer_id, &line), line));
         }
     }
     Ok(out)
@@ -141,5 +141,21 @@ mod tests {
             !peers.contains(&revoked.peer_id()),
             "must exclude the revoked peer"
         );
+    }
+
+    #[test]
+    fn local_entries_are_keyed_by_content_and_survive_truncation() {
+        use roam_storage::{Identity, Role, Store};
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Store::open(dir.path(), Identity::generate()).unwrap();
+        s.declare_founder(Role::Admin).unwrap();
+        s.set_entry("files", "k", "v1").unwrap();
+        s.set_entry("files", "k", "v2").unwrap();
+        let key = crate::crypto::VaultKey([9u8; 32]);
+        let listed = local_entries(&s, &key).unwrap();
+        assert_eq!(listed.len(), 2);
+        for (id, line) in &listed {
+            assert_eq!(*id, key.entry_id_content(s.peer_id(), line));
+        }
     }
 }

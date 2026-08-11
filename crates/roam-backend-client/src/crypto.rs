@@ -36,7 +36,10 @@ impl VaultKey {
 
     /// Backend namespace id. Opaque to the server.
     pub fn bucket_id(&self) -> String {
-        self.keyed(b"roam-bucket")
+        // v2: content-addressed entry ids + snapshots kind. A scheme bump moves the
+        // whole vault to a new backend namespace, so mixed-scheme reconciliation
+        // (positional vs content ids) can never happen.
+        self.keyed(b"roam-bucket-v2")
     }
 
     /// Deterministic per-entry id = keyed(vault_key, "entry" || peer_le || index_le).
@@ -56,6 +59,26 @@ impl VaultKey {
         let mut input = Vec::with_capacity(4 + content_hash.len());
         input.extend_from_slice(b"blob");
         input.extend_from_slice(content_hash.as_bytes());
+        self.keyed(&input)
+    }
+
+    /// Content-addressed entry id = keyed(id_key, "entry" || peer_le || blake3(line)).
+    /// Stable under op-log truncation: an entry's id is a function of its bytes, not
+    /// its offset. Replaces the positional `entry_id(peer, index)`.
+    pub fn entry_id_content(&self, peer_id: u64, line: &[u8]) -> String {
+        let mut input = Vec::with_capacity(5 + 8 + 32);
+        input.extend_from_slice(b"entry");
+        input.extend_from_slice(&peer_id.to_le_bytes());
+        input.extend_from_slice(blake3::hash(line).as_bytes());
+        self.keyed(&input)
+    }
+
+    /// Snapshot backend id = keyed(id_key, "snapshot" || frontier_digest). Two
+    /// devices snapshotting at the same frontier derive the same id (dedup).
+    pub fn snapshot_id(&self, frontier_digest: &[u8; 32]) -> String {
+        let mut input = Vec::with_capacity(8 + 32);
+        input.extend_from_slice(b"snapshot");
+        input.extend_from_slice(frontier_digest);
         self.keyed(&input)
     }
 
@@ -142,6 +165,13 @@ mod tests {
     }
 
     #[test]
+    fn bucket_id_carries_scheme_version() {
+        let k = VaultKey([1u8; 32]);
+        assert_eq!(k.bucket_id(), k.bucket_id());
+        assert_eq!(k.bucket_id().len(), 43);
+    }
+
+    #[test]
     fn entry_id_matches_across_devices_for_same_peer_and_index() {
         assert_eq!(key().entry_id(42, 3), key().entry_id(42, 3));
         assert_ne!(key().entry_id(42, 3), key().entry_id(42, 4));
@@ -208,5 +238,17 @@ mod tests {
     fn id_key_is_stable_and_public() {
         let k = key();
         assert_eq!(k.id_key(), k.id_key());
+    }
+
+    #[test]
+    fn content_entry_id_is_stable_under_reordering() {
+        let k = VaultKey([3u8; 32]);
+        let line_a = b"{\"peer\":1,\"sig\":\"s\",\"update\":\"u1\"}\n";
+        let line_b = b"{\"peer\":1,\"sig\":\"s\",\"update\":\"u2\"}\n";
+        assert_eq!(k.entry_id_content(1, line_a), k.entry_id_content(1, line_a));
+        assert_ne!(k.entry_id_content(1, line_a), k.entry_id_content(1, line_b));
+        assert_ne!(k.entry_id_content(1, line_a), k.entry_id_content(2, line_a));
+        assert_eq!(k.snapshot_id(&[1u8; 32]), k.snapshot_id(&[1u8; 32]));
+        assert_ne!(k.snapshot_id(&[1u8; 32]), k.snapshot_id(&[2u8; 32]));
     }
 }
