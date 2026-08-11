@@ -74,6 +74,9 @@ pub struct Store {
     /// marker is recorded on every `write_snapshot`, capturing the op-log
     /// frontier + per-peer log lengths for later checkpoint compaction.
     history: HistoryIndex,
+    /// The pinned vault founder's `peer_id` (`<root>/founder`), if any. Seeds the
+    /// monotone `ever_admin` closure in `merge_roster` so grant certificates fold.
+    founder: Option<u64>,
 }
 
 impl Store {
@@ -89,8 +92,11 @@ impl Store {
         let roster_dir = root.join("roster");
         let snap_path = root.join("snapshots").join("snapshot.loro");
 
-        // 1. Rebuild the trusted peer set from the signed roster logs (fixpoint).
-        let peers = Self::rebuild_peers(root, identity.peer_id(), &identity.verifying_key())?;
+        // 1. Rebuild the trusted peer set from the signed roster logs (fixpoint),
+        //    seeded by the pinned founder so grant certificates actually fold.
+        let founder = crate::founder::read_founder(root)?;
+        let peers =
+            Self::rebuild_peers(root, identity.peer_id(), &identity.verifying_key(), founder)?;
 
         // 2. Base document: from snapshot if present, else empty.
         let doc = match snapshot::load(&snap_path)? {
@@ -138,6 +144,7 @@ impl Store {
             peers,
             blobs,
             history,
+            founder,
         };
         store.write_peers_cache()?;
         Ok(store)
@@ -153,6 +160,7 @@ impl Store {
         root: &Path,
         self_id: u64,
         self_key: &VerifyingKey,
+        founder: Option<u64>,
     ) -> Result<Vec<PeerRecord>, StorageError> {
         let roster_dir = root.join("roster");
 
@@ -190,8 +198,7 @@ impl Store {
             all_entries.extend(entries);
         }
 
-        // TODO(Task 3): thread the real founder id through rebuild_peers.
-        Ok(merge_roster(&mut all_entries, None))
+        Ok(merge_roster(&mut all_entries, founder))
     }
 
     pub fn text(&self, id: &str) -> String {
@@ -419,6 +426,43 @@ impl Store {
         self.refresh_peers()
     }
 
+    /// Genesis: pin THIS device as founder and self-vouch it with `role`. Refuses if
+    /// a founder is already pinned (re-declaring would fork trust).
+    pub fn declare_founder(&mut self, role: Role) -> Result<(), StorageError> {
+        if crate::founder::read_founder(&self.root)?.is_some() {
+            return Err(StorageError::Peer("vault founder already pinned".into()));
+        }
+        let me = self.identity.peer_id();
+        crate::founder::write_founder(&self.root, me)?;
+        self.founder = Some(me);
+        let key = self.identity.verifying_key().to_bytes();
+        self.own_roster
+            .append(&self.identity, RosterOp::Add { role }, me, key)?;
+        self.refresh_peers()
+    }
+
+    /// Write a founder pin delivered out-of-band (joiner). Idempotent if it matches;
+    /// refuses a conflicting re-pin.
+    pub fn pin_founder(&mut self, peer_id: u64) -> Result<(), StorageError> {
+        match crate::founder::read_founder(&self.root)? {
+            Some(existing) if existing == peer_id => Ok(()),
+            Some(existing) => Err(StorageError::Peer(format!(
+                "founder already pinned to {existing}, refusing to re-pin to {peer_id}"
+            ))),
+            None => {
+                crate::founder::write_founder(&self.root, peer_id)?;
+                self.founder = Some(peer_id);
+                self.refresh_peers()
+            }
+        }
+    }
+
+    /// This device's own materialized role (None if not yet in the roster).
+    pub fn self_role(&self) -> Option<Role> {
+        let me = self.identity.peer_id();
+        self.peers.iter().find(|p| p.peer_id == me).map(|p| p.role)
+    }
+
     /// Reject a roster mutation whose `peer_id` does not match the key it is
     /// bound to. Everywhere in roam a `peer_id` is the first 8 little-endian
     /// bytes of the ed25519 verifying key (see `Identity::generate`), so this is
@@ -439,6 +483,7 @@ impl Store {
             &self.root,
             self.identity.peer_id(),
             &self.identity.verifying_key(),
+            self.founder,
         )?;
         self.write_peers_cache()
     }
@@ -1002,7 +1047,10 @@ mod tests {
         b.edit_text("note", 0, "BBB").unwrap();
 
         // The roster is the trust boundary: each device must vouch for the other
-        // before its ops are accepted.
+        // before its ops are accepted. Each vault's founder is itself (admin), so
+        // its own `add_peer` vouches actually fold into the roster.
+        a.declare_founder(Role::Admin).unwrap();
+        b.declare_founder(Role::Admin).unwrap();
         a.add_peer(id_b.peer_id(), id_b.verifying_key().to_bytes()).unwrap();
         b.add_peer(id_a.peer_id(), id_a.verifying_key().to_bytes()).unwrap();
 
@@ -1067,7 +1115,8 @@ mod tests {
         let mut a = Store::open(dir_a.path(), id_a).unwrap();
         let mut b = Store::open(dir_b.path(), id_b.clone()).unwrap();
 
-        // Trust b before importing its ops.
+        // Trust b before importing its ops (a is its vault's founder-admin).
+        a.declare_founder(Role::Admin).unwrap();
         a.add_peer(id_b.peer_id(), id_b.verifying_key().to_bytes()).unwrap();
 
         b.edit_text("note", 0, "one").unwrap();
@@ -1094,6 +1143,7 @@ mod tests {
         let mut a = Store::open(dir_a.path(), id_a.clone()).unwrap();
         let mut b = Store::open(dir_b.path(), id_b.clone()).unwrap();
 
+        a.declare_founder(Role::Admin).unwrap();
         a.add_peer(id_b.peer_id(), id_b.verifying_key().to_bytes()).unwrap();
         a.edit_text("note", 0, "A").unwrap();
         b.edit_text("note", 0, "B").unwrap();
@@ -1153,6 +1203,9 @@ mod tests {
         assert!(matches!(err, Err(StorageError::Peer(_))), "mismatched peer_id must be refused");
         assert!(store.roster().is_empty(), "a refused add must not touch the roster");
 
+        // Become the vault founder-admin so our own `add_peer` vouches fold.
+        store.declare_founder(Role::Admin).unwrap();
+
         // The matching pair succeeds.
         store
             .add_peer(b.peer_id(), b.verifying_key().to_bytes())
@@ -1169,6 +1222,7 @@ mod tests {
 
         {
             let mut store = Store::open(&vault, a.clone()).unwrap();
+            store.declare_founder(Role::Admin).unwrap();
             store.add_peer(b.peer_id(), b.verifying_key().to_bytes()).unwrap();
         }
         let reopened = Store::open(&vault, a).unwrap();
@@ -1191,6 +1245,7 @@ mod tests {
         {
             let mut a = Store::open(&vault_a, a_id.clone()).unwrap();
             let mut b = Store::open(dir_b.path(), b_id.clone()).unwrap();
+            a.declare_founder(Role::Admin).unwrap();
             a.add_peer(b_id.peer_id(), b_id.verifying_key().to_bytes()).unwrap();
             b.edit_text("note", 0, "from-b").unwrap();
             a.import_peer(b_id.peer_id(), &b_id.verifying_key(), b.export_own_log().unwrap()).unwrap();
@@ -1227,6 +1282,7 @@ mod tests {
 
         let mut a = Store::open(dir_a.path(), id_a).unwrap();
         let mut b = Store::open(dir_b.path(), id_b.clone()).unwrap();
+        a.declare_founder(Role::Admin).unwrap();
         a.add_peer(id_b.peer_id(), id_b.verifying_key().to_bytes())
             .unwrap();
 
@@ -1262,6 +1318,7 @@ mod tests {
 
         let mut a = Store::open(dir_a.path(), id_a).unwrap();
         let mut b = Store::open(dir_b.path(), id_b.clone()).unwrap();
+        a.declare_founder(Role::Admin).unwrap();
         a.add_peer(id_b.peer_id(), id_b.verifying_key().to_bytes())
             .unwrap();
 
@@ -1298,6 +1355,7 @@ mod tests {
 
         let mut a = Store::open(dir_a.path(), id_a).unwrap();
         let mut b = Store::open(dir_b.path(), id_b.clone()).unwrap();
+        a.declare_founder(Role::Admin).unwrap();
         a.add_peer(id_b.peer_id(), id_b.verifying_key().to_bytes())
             .unwrap();
 
@@ -1334,6 +1392,7 @@ mod tests {
 
         let mut a = Store::open(dir_a.path(), id_a).unwrap();
         let mut b = Store::open(dir_b.path(), id_b.clone()).unwrap();
+        a.declare_founder(Role::Admin).unwrap();
         a.add_peer(id_b.peer_id(), id_b.verifying_key().to_bytes())
             .unwrap();
 
@@ -1373,6 +1432,7 @@ mod tests {
 
         let mut a = Store::open(dir_a.path(), id_a).unwrap();
         let mut b = Store::open(dir_b.path(), id_b.clone()).unwrap();
+        a.declare_founder(Role::Admin).unwrap();
         a.add_peer(id_b.peer_id(), id_b.verifying_key().to_bytes())
             .unwrap();
 
@@ -1433,6 +1493,8 @@ mod tests {
 
         // The roster is the trust boundary: each device must vouch for the other
         // before its ops are accepted.
+        a.declare_founder(Role::Admin).unwrap();
+        b.declare_founder(Role::Admin).unwrap();
         a.add_peer(id_b.peer_id(), id_b.verifying_key().to_bytes()).unwrap();
         b.add_peer(id_a.peer_id(), id_a.verifying_key().to_bytes()).unwrap();
 
@@ -1508,6 +1570,7 @@ mod tests {
 
         let mut a = Store::open(dir_a.path(), id_a.clone()).unwrap();
         let mut b = Store::open(dir_b.path(), id_b.clone()).unwrap();
+        b.declare_founder(Role::Admin).unwrap();
         b.add_peer(id_a.peer_id(), id_a.verifying_key().to_bytes()).unwrap();
 
         // A sets then removes the key; both ops ride A's own signed log.
@@ -1565,6 +1628,7 @@ mod tests {
         let mut a = Store::open(dir_a.path(), id_a).unwrap();
         let mut b = Store::open(dir_b.path(), id_b.clone()).unwrap();
         // b is a trusted peer; the import must still fail on the wrong key alone.
+        a.declare_founder(Role::Admin).unwrap();
         a.add_peer(id_b.peer_id(), id_b.verifying_key().to_bytes()).unwrap();
         b.edit_text("note", 0, "peerdata").unwrap();
 
@@ -1642,6 +1706,10 @@ mod tests {
 
         let mut a = Store::open(dir_a.path(), id_a.clone()).unwrap();
         let mut b = Store::open(dir_b.path(), id_b.clone()).unwrap();
+        // Each device is the founder-admin of its own vault so its `add_peer`
+        // vouches actually fold into the roster (and back-fill can target the peer).
+        a.declare_founder(Role::Admin).unwrap();
+        b.declare_founder(Role::Admin).unwrap();
 
         let epoch = a.rotate_epoch(&id_key, &epoch0, None).unwrap();
         a.add_peer(id_b.peer_id(), id_b.verifying_key().to_bytes()).unwrap();
@@ -1685,6 +1753,28 @@ mod tests {
         assert_eq!(store.text("note"), before, "dry run does not mutate state");
         let markers_after = crate::history::HistoryIndex::new(&dir.path().join("history")).markers().unwrap().len();
         assert_eq!(markers_before, markers_after, "dry run does not rewrite history");
+    }
+
+    #[test]
+    fn declare_founder_makes_this_device_admin() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = Identity::generate();
+        let mut store = Store::open(dir.path(), id.clone()).unwrap();
+        store.declare_founder(Role::Admin).unwrap();
+        let me = store.roster().into_iter().find(|p| p.peer_id == id.peer_id()).unwrap();
+        assert_eq!(me.role, Role::Admin);
+        assert_eq!(store.self_role(), Some(Role::Admin));
+        let store2 = Store::open(dir.path(), id).unwrap();
+        assert_eq!(store2.self_role(), Some(Role::Admin));
+    }
+
+    #[test]
+    fn declare_founder_twice_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = Identity::generate();
+        let mut store = Store::open(dir.path(), id).unwrap();
+        store.declare_founder(Role::Admin).unwrap();
+        assert!(store.declare_founder(Role::Admin).is_err());
     }
 
     #[test]

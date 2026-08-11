@@ -3,6 +3,7 @@
 mod blob;
 pub mod checkpoint;
 mod error;
+mod founder;
 mod history;
 mod history_util;
 mod identity;

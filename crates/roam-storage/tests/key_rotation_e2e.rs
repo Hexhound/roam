@@ -2,6 +2,7 @@
 //! directly through the export/import key-log + roster APIs (no transport).
 
 use roam_storage::Identity;
+use roam_storage::Role;
 use roam_storage::EPOCH0_ID;
 use roam_storage::Store;
 use tempfile::tempdir;
@@ -26,6 +27,10 @@ fn scenario1_rotate_then_disconnect_then_peer_catches_up() {
     let mut a = Store::open(da.path(), ia.clone()).unwrap();
     let mut b = Store::open(db.path(), ib.clone()).unwrap();
 
+    // Each device is the founder-admin of its own vault so its `add_peer`
+    // vouches (and, post-sync, the peer's grants) actually fold into the roster.
+    a.declare_founder(Role::Admin).unwrap();
+    b.declare_founder(Role::Admin).unwrap();
     a.add_peer(ib.peer_id(), ib.verifying_key().to_bytes()).unwrap();
     b.add_peer(ia.peer_id(), ia.verifying_key().to_bytes()).unwrap();
     let epoch = a.rotate_epoch(&ID_KEY, &EPOCH0, None).unwrap();
@@ -43,6 +48,10 @@ fn scenario3_concurrent_rotations_form_siblings_and_a_deterministic_head() {
     let ib = Identity::generate();
     let mut a = Store::open(da.path(), ia.clone()).unwrap();
     let mut b = Store::open(db.path(), ib.clone()).unwrap();
+    // Each device is the founder-admin of its own vault so its `add_peer`
+    // vouches (and, post-sync, the peer's grants) actually fold into the roster.
+    a.declare_founder(Role::Admin).unwrap();
+    b.declare_founder(Role::Admin).unwrap();
     a.add_peer(ib.peer_id(), ib.verifying_key().to_bytes()).unwrap();
     b.add_peer(ia.peer_id(), ia.verifying_key().to_bytes()).unwrap();
     full_sync(&mut a, &ia, &mut b, &ib);
@@ -66,6 +75,10 @@ fn forward_secrecy_a_revoked_peer_cannot_open_the_new_epoch() {
     let ib = Identity::generate();
     let mut a = Store::open(da.path(), ia.clone()).unwrap();
     let mut b = Store::open(db.path(), ib.clone()).unwrap();
+    // Each device is the founder-admin of its own vault so its `add_peer`
+    // vouches (and, post-sync, the peer's grants) actually fold into the roster.
+    a.declare_founder(Role::Admin).unwrap();
+    b.declare_founder(Role::Admin).unwrap();
     a.add_peer(ib.peer_id(), ib.verifying_key().to_bytes()).unwrap();
     b.add_peer(ia.peer_id(), ia.verifying_key().to_bytes()).unwrap();
     full_sync(&mut a, &ia, &mut b, &ib);
