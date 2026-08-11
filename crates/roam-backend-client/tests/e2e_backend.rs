@@ -5,7 +5,7 @@
 use roam_backend_client::crypto::VaultKey;
 use roam_backend_client::http::HttpBackend;
 use roam_backend_client::sync::reconcile_once;
-use roam_storage::{Identity, Store, VerifyingKey};
+use roam_storage::{Identity, Role, Store, VerifyingKey};
 use std::process::{Child, Command};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -80,8 +80,12 @@ async fn b_converges_via_backend_only_then_race_is_noop() {
         let g = b.lock().await;
         (g.peer_id(), g.identity_verifying_bytes())
     };
-    a.lock().await.add_peer(bp, bk).unwrap();
-    b.lock().await.add_peer(ap, ak).unwrap();
+    // Each device founds its own vault as admin so its own `add_peer` vouch folds
+    // and local writes (set_entry) are permitted.
+    a.lock().await.declare_founder(Role::Admin).unwrap();
+    b.lock().await.declare_founder(Role::Admin).unwrap();
+    a.lock().await.add_peer(bp, bk, Role::Admin).unwrap();
+    b.lock().await.add_peer(ap, ak, Role::Admin).unwrap();
 
     a.lock().await.set_entry("files", "k", "v1").unwrap();
     reconcile_once(&a, &backend, &key).await.unwrap();

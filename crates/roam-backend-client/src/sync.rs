@@ -305,12 +305,15 @@ mod tests {
     use super::*;
     use crate::crypto::VaultKey;
     use crate::transport::MemoryBackend;
-    use roam_storage::{Identity, Store};
+    use roam_storage::{Identity, Role, Store};
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
     async fn store_at(dir: &std::path::Path) -> Arc<Mutex<Store>> {
-        Arc::new(Mutex::new(Store::open(dir, Identity::generate()).unwrap()))
+        let mut store = Store::open(dir, Identity::generate()).unwrap();
+        // Found this vault as admin so local writes + `add_peer` vouches are allowed.
+        store.declare_founder(Role::Admin).unwrap();
+        Arc::new(Mutex::new(store))
     }
 
     #[tokio::test]
@@ -330,8 +333,8 @@ mod tests {
             let g = b.lock().await;
             (g.peer_id(), g.identity_verifying_bytes())
         };
-        a.lock().await.add_peer(b_peer, b_key).unwrap();
-        b.lock().await.add_peer(a_peer, a_key).unwrap();
+        a.lock().await.add_peer(b_peer, b_key, Role::Admin).unwrap();
+        b.lock().await.add_peer(a_peer, a_key, Role::Admin).unwrap();
 
         a.lock().await.set_entry("files", "note", "hello").unwrap();
 
@@ -377,8 +380,8 @@ mod tests {
             let g = b.lock().await;
             (g.peer_id(), g.identity_verifying_bytes())
         };
-        a.lock().await.add_peer(b_peer, b_key).unwrap();
-        b.lock().await.add_peer(a_peer, a_key).unwrap();
+        a.lock().await.add_peer(b_peer, b_key, Role::Admin).unwrap();
+        b.lock().await.add_peer(a_peer, a_key, Role::Admin).unwrap();
 
         // Several edits so A's own log holds multiple lines.
         a.lock().await.set_entry("files", "note", "one").unwrap();
@@ -420,8 +423,8 @@ mod tests {
             let g = b.lock().await;
             (g.peer_id(), g.identity_verifying_bytes())
         };
-        a.lock().await.add_peer(b_peer, b_key).unwrap();
-        b.lock().await.add_peer(a_peer, a_key).unwrap();
+        a.lock().await.add_peer(b_peer, b_key, Role::Admin).unwrap();
+        b.lock().await.add_peer(a_peer, a_key, Role::Admin).unwrap();
 
         let hash = a.lock().await.blobs().put(b"blobdata").unwrap();
 

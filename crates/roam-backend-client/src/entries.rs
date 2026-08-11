@@ -103,7 +103,7 @@ mod tests {
 
     #[test]
     fn held_peers_excludes_revoked() {
-        use roam_storage::Identity;
+        use roam_storage::{Identity, Role};
 
         let dir = tempfile::tempdir().unwrap();
         let me = Identity::generate();
@@ -111,11 +111,13 @@ mod tests {
         let revoked = Identity::generate();
 
         let mut store = Store::open(dir.path(), me.clone()).unwrap();
+        // Found the vault as admin so this device may vouch/revoke peers.
+        store.declare_founder(Role::Admin).unwrap();
         store
-            .add_peer(active.peer_id(), active.verifying_key().to_bytes())
+            .add_peer(active.peer_id(), active.verifying_key().to_bytes(), Role::Admin)
             .unwrap();
         store
-            .add_peer(revoked.peer_id(), revoked.verifying_key().to_bytes())
+            .add_peer(revoked.peer_id(), revoked.verifying_key().to_bytes(), Role::Admin)
             .unwrap();
         store
             .revoke_peer(revoked.peer_id(), revoked.verifying_key().to_bytes())

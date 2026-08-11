@@ -15,7 +15,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use roam_files::{FilesError, FolderBridge, GcContext, SyncOutcome};
-use roam_storage::{Identity, PeerStatus, Store, VaultId};
+use roam_storage::{Identity, PeerStatus, Role, Store, VaultId};
 use roam_sync_core::engine::Engine;
 use roam_transport_iroh::{host_pairing, join_pairing, IrohTransport, PairingToken};
 use tokio::io::{AsyncBufReadExt, BufReader, Lines, Stdin};
@@ -42,6 +42,9 @@ enum Command {
         /// Identity keyfile (stored OUTSIDE the vault).
         #[arg(long)]
         identity: PathBuf,
+        /// Founder's self-declared role: reader|writer|admin.
+        #[arg(long, default_value = "admin")]
+        role: String,
     },
     /// Host a pairing exchange: print a token, wait for one join to approve.
     PairToken {
@@ -49,6 +52,9 @@ enum Command {
         vault: PathBuf,
         #[arg(long)]
         identity: PathBuf,
+        /// Role to grant the invitee (chosen by the host): reader|writer|admin.
+        #[arg(long, default_value = "admin")]
+        role: String,
     },
     /// Join another vault using a pairing token.
     Pair {
@@ -141,13 +147,35 @@ enum Command {
         folder: PathBuf,
         paths: Vec<PathBuf>,
     },
+    /// Change a peer's role (admin only).
+    Grant {
+        #[arg(long)]
+        vault: PathBuf,
+        #[arg(long)]
+        identity: PathBuf,
+        /// Target peer id.
+        peer: u64,
+        /// New role: reader|writer|admin.
+        role: String,
+        /// The target's verifying key (base64 standard), for the peer_id<->key binding.
+        #[arg(long)]
+        key: String,
+    },
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     match Cli::parse().command {
-        Command::Init { vault, identity } => init(&vault, &identity).await,
-        Command::PairToken { vault, identity } => pair_token(&vault, &identity).await,
+        Command::Init {
+            vault,
+            identity,
+            role,
+        } => init(&vault, &identity, &role).await,
+        Command::PairToken {
+            vault,
+            identity,
+            role,
+        } => pair_token(&vault, &identity, &role).await,
         Command::Pair {
             vault,
             identity,
@@ -178,6 +206,23 @@ async fn main() -> Result<()> {
             folder,
             paths,
         } => restore(&vault, &identity, &folder, paths).await,
+        Command::Grant {
+            vault,
+            identity,
+            peer,
+            role,
+            key,
+        } => grant(&vault, &identity, peer, &role, &key).await,
+    }
+}
+
+/// Parse a role string into a [`Role`].
+fn parse_role(s: &str) -> anyhow::Result<Role> {
+    match s.to_ascii_lowercase().as_str() {
+        "reader" => Ok(Role::Reader),
+        "writer" => Ok(Role::Writer),
+        "admin" => Ok(Role::Admin),
+        other => anyhow::bail!("unknown role '{other}' (reader|writer|admin)"),
     }
 }
 
@@ -237,16 +282,21 @@ fn load_vault_key(vault: &Path) -> Result<[u8; 32]> {
         .context("vault-key file is not 32 bytes")
 }
 
-async fn init(vault: &Path, identity_path: &Path) -> Result<()> {
+async fn init(vault: &Path, identity_path: &Path, role: &str) -> Result<()> {
     // Refuse to re-init: overwriting `vault-id` would orphan already-paired
     // peers (their roster + ops are keyed to the original vault).
     if vault_id_path(vault).exists() {
         anyhow::bail!("vault already initialized (vault-id exists); refusing to overwrite");
     }
+    let founder_role = parse_role(role)?;
     let identity = Identity::generate();
     identity.save(identity_path).context("save identity")?;
     // Opening the store materializes the vault directory + peers/oplog files.
-    Store::open(vault, identity.clone()).context("open vault store")?;
+    let mut store = Store::open(vault, identity.clone()).context("open vault store")?;
+    // Genesis: pin ourselves as founder + self-vouch with the chosen role.
+    store
+        .declare_founder(founder_role)
+        .context("declare founder")?;
     let vault_id = VaultId::generate();
     save_vault_id(vault, &vault_id)?;
     // Mint the shared vault key (backend decryption secret). Reuse
@@ -258,16 +308,18 @@ async fn init(vault: &Path, identity_path: &Path) -> Result<()> {
     save_vault_key(vault, &vault_key)?;
     println!("initialized vault at {}", vault.display());
     println!("peer_id: {}", identity.peer_id());
+    println!("founder role: {}", format!("{founder_role:?}").to_lowercase());
     Ok(())
 }
 
-async fn pair_token(vault: &Path, identity_path: &Path) -> Result<()> {
+async fn pair_token(vault: &Path, identity_path: &Path, role: &str) -> Result<()> {
+    let invitee_role = parse_role(role)?;
     let identity = Identity::load(identity_path).context("load identity")?;
     let vault_id = load_vault_id(vault)?;
     let vault_key = load_vault_key(vault)?;
     let mut store = Store::open(vault, identity.clone()).context("open vault store")?;
 
-    let (token, host) = host_pairing(&identity, vault_id, vault_key, &mut store)
+    let (token, host) = host_pairing(&identity, vault_id, vault_key, invitee_role, &mut store)
         .await
         .context("start pairing host")?;
     println!("pairing token (share out of band):\n{token}");
@@ -298,7 +350,9 @@ async fn pair(vault: &Path, identity_path: &Path, token: String) -> Result<()> {
     let host_peer = decoded.peer_id;
     let vault_id = VaultId(decoded.vault);
 
-    let (_store, vault_key) = join_pairing(identity, vault.to_path_buf(), token)
+    // Pairing already persisted `<vault>/founder` itself, so we just consume the
+    // founder peer_id from the tuple (bound but otherwise unused here).
+    let (_store, vault_key, _founder) = join_pairing(identity, vault.to_path_buf(), token)
         .await
         .context("join pairing")?;
     save_vault_id(vault, &vault_id)?;
@@ -892,7 +946,8 @@ async fn status(vault: &Path, identity_path: Option<PathBuf>) -> Result<()> {
             PeerStatus::Active => "active",
             PeerStatus::Revoked => "revoked",
         };
-        println!("  peer {} [{}]", peer.peer_id, status);
+        let role = format!("{:?}", peer.role).to_lowercase();
+        println!("  peer {} [{}] role={}", peer.peer_id, status, role);
     }
     println!("note: {} bytes", store.text("note").len());
     println!("doc version: {} bytes", store.doc_version_bytes().len());
@@ -1055,6 +1110,31 @@ async fn restore(vault: &Path, identity_path: &Path, folder: &Path, paths: Vec<P
     for (p, _) in &outcomes {
         println!("  {}", p.display());
     }
+    Ok(())
+}
+
+/// Change a peer's role (admin only). Binds the target's peer_id to its verifying
+/// key and records a signed `SetRole` under our own admin authority.
+async fn grant(
+    vault: &Path,
+    identity_path: &Path,
+    peer: u64,
+    role: &str,
+    key_b64: &str,
+) -> anyhow::Result<()> {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine};
+    let identity = Identity::load(identity_path).context("load identity")?;
+    let mut store = Store::open(vault, identity).context("open vault store")?;
+    let key_bytes: [u8; 32] = B64
+        .decode(key_b64)
+        .context("decode key")?
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("key must be 32 bytes"))?;
+    store
+        .set_role(peer, key_bytes, parse_role(role)?)
+        .context("set role")?;
+    println!("granted peer {peer} role {role}");
     Ok(())
 }
 
