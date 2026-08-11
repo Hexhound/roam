@@ -128,7 +128,13 @@ pub fn merge_roster(entries: &mut [RosterEntry], founder: Option<u64>) -> Vec<Pe
     let mut revoked: HashSet<u64> = HashSet::new();
     let mut intents: BTreeMap<u64, HashMap<u64, (u64, Role)>> = BTreeMap::new();
     for e in valid.iter().filter(|e| ever_admin.contains(&e.added_by)) {
-        keys.insert(e.subject_peer, e.subject_key);
+        keys.entry(e.subject_peer)
+            .and_modify(|k| {
+                if e.subject_key < *k {
+                    *k = e.subject_key;
+                }
+            })
+            .or_insert(e.subject_key);
         match e.op {
             RosterOp::Revoke => {
                 revoked.insert(e.subject_peer);
@@ -136,8 +142,10 @@ pub fn merge_roster(entries: &mut [RosterEntry], founder: Option<u64>) -> Vec<Pe
             RosterOp::Add { role } | RosterOp::SetRole { role } => {
                 let per = intents.entry(e.subject_peer).or_default();
                 let slot = per.entry(e.added_by).or_insert((0, Role::Reader));
-                if e.seq >= slot.0 {
-                    *slot = (e.seq, role);
+                match e.seq.cmp(&slot.0) {
+                    std::cmp::Ordering::Greater => *slot = (e.seq, role),
+                    std::cmp::Ordering::Equal => slot.1 = slot.1.min(role),
+                    std::cmp::Ordering::Less => {}
                 }
             }
         }
@@ -339,6 +347,46 @@ mod tests {
     fn pid(k: u8) -> (u64, [u8; 32]) {
         let key = [k; 32];
         (u64::from_le_bytes(key[0..8].try_into().unwrap()), key)
+    }
+
+    #[test]
+    fn duplicate_seq_role_conflict_is_order_independent() {
+        let (f, fk) = pid(1);
+        let (b, bk) = pid(2);
+        // Two same-author (founder) entries for b at the SAME seq, different roles.
+        let e_admin = RosterEntry {
+            seq: 2,
+            op: RosterOp::SetRole { role: Role::Admin },
+            subject_peer: b,
+            subject_key: bk,
+            added_by: f,
+        };
+        let e_reader = RosterEntry {
+            seq: 2,
+            op: RosterOp::SetRole { role: Role::Reader },
+            subject_peer: b,
+            subject_key: bk,
+            added_by: f,
+        };
+        let seed = RosterEntry {
+            seq: 1,
+            op: RosterOp::Add { role: Role::Admin },
+            subject_peer: f,
+            subject_key: fk,
+            added_by: f,
+        };
+        let mut order1 = vec![seed.clone(), e_admin.clone(), e_reader.clone()];
+        let mut order2 = vec![seed, e_reader, e_admin];
+        let r1 = merge_roster(&mut order1, Some(f));
+        let r2 = merge_roster(&mut order2, Some(f));
+        let role1 = r1.iter().find(|p| p.peer_id == b).unwrap().role;
+        let role2 = r2.iter().find(|p| p.peer_id == b).unwrap().role;
+        assert_eq!(role1, role2, "same set, different order → same result");
+        assert_eq!(
+            role1,
+            Role::Reader,
+            "equal-seq tie resolves to least privilege"
+        );
     }
 
     #[test]
