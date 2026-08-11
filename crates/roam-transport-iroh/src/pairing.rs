@@ -65,7 +65,7 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use ed25519_dalek::Signature;
 use iroh::endpoint::{RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr};
-use roam_storage::{vault_subkeys, Identity, Store, VaultId, VerifyingKey};
+use roam_storage::{vault_subkeys, Identity, Role, Store, VaultId, VerifyingKey};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -148,6 +148,12 @@ pub struct JoinAccept {
     /// the epoch DAG and any wraps addressed to it. Empty for an un-rotated vault.
     pub keylog_author: u64,
     pub keylog_jsonl: Vec<u8>,
+    /// The pinned vault founder's `peer_id`. The joiner writes this to its own
+    /// `<vault>/founder` pin so its roster fold seeds `ever_admin` and it can
+    /// materialize the role the host just granted (without it a Reader/Writer
+    /// joiner folds NO role and is inert). Delivered ONLY here, over the proven
+    /// stream — never in the out-of-band token.
+    pub founder: u64,
 }
 
 /// The armed host side of a pairing exchange.
@@ -163,6 +169,9 @@ pub struct PairingHost<'a> {
     vault: VaultId,
     /// The shared vault key, handed to every proven joiner via [`JoinAccept`].
     vault_key: [u8; 32],
+    /// The role this host grants the joiner it approves (applied in the host's
+    /// `add_peer`). Admin-gated: the host must itself be an admin.
+    role: Role,
     store: &'a mut Store,
 }
 
@@ -175,6 +184,7 @@ pub async fn host_pairing<'a>(
     identity: &'a Identity,
     vault: VaultId,
     vault_key: [u8; 32],
+    role: Role,
     store: &'a mut Store,
 ) -> Result<(String, PairingHost<'a>)> {
     let endpoint = build_endpoint(identity)
@@ -205,6 +215,7 @@ pub async fn host_pairing<'a>(
             identity,
             vault,
             vault_key,
+            role,
             store,
         },
     ))
@@ -267,10 +278,19 @@ impl PairingHost<'_> {
             bail!("pairing proof did not verify — rejecting join (peer not added)");
         }
 
-        // Proof holds: add the joiner to our roster, then vouch back with our
-        // vault + signed roster so it can reach our siblings transitively.
+        // The founder pin the joiner needs to seed its roster fold. The host is
+        // founded (it authored the vault), so this is `Some`; a `None` here is a
+        // host misconfiguration — fail closed rather than shipping a bogus 0.
+        let founder = self
+            .store
+            .founder_pin()
+            .context("host is not founded — cannot deliver a founder pin to the joiner")?;
+
+        // Proof holds: add the joiner to our roster with the invitee role, then
+        // vouch back with our vault + signed roster so it can reach our siblings
+        // transitively.
         self.store
-            .add_peer(req.peer_id, req.verifying_key)
+            .add_peer(req.peer_id, req.verifying_key, self.role)
             .context("add paired peer to roster")?;
         // Wrap every epoch the host can open to the freshly-added joiner, so the
         // newcomer starts Synced instead of WaitingKey. (No-op for an un-rotated
@@ -286,6 +306,7 @@ impl PairingHost<'_> {
             roster_jsonl: self.store.export_own_roster().context("export own roster")?,
             keylog_author: self.identity.peer_id(),
             keylog_jsonl: self.store.export_own_keylog().context("export own keylog")?,
+            founder,
         };
         write_msg(&mut send, &accept)
             .await
@@ -310,7 +331,7 @@ pub async fn join_pairing(
     identity: Identity,
     vault_root: PathBuf,
     token_str: String,
-) -> Result<(Store, [u8; 32])> {
+) -> Result<(Store, [u8; 32], u64)> {
     let token = PairingToken::decode(&token_str).context("decode pairing token")?;
 
     let mut store =
@@ -322,8 +343,8 @@ pub async fn join_pairing(
 
     let result = run_join(&endpoint, &identity, &token, &mut store).await;
     endpoint.close().await;
-    let vault_key = result?;
-    Ok((store, vault_key))
+    let (vault_key, founder) = result?;
+    Ok((store, vault_key, founder))
 }
 
 /// The joiner half of the handshake, dialing out over `endpoint`. Split out so
@@ -333,7 +354,7 @@ async fn run_join(
     identity: &Identity,
     token: &PairingToken,
     store: &mut Store,
-) -> Result<[u8; 32]> {
+) -> Result<([u8; 32], u64)> {
     let conn = endpoint
         .connect(token.addr.clone(), PAIRING_ALPN)
         .await
@@ -362,12 +383,19 @@ async fn run_join(
         bail!("pairing vault mismatch — refusing to join a different vault");
     }
 
-    // Add the host to OUR roster (so we accept its ops), then import its signed
-    // roster so we learn its siblings (transitive mesh). The host's key from the
-    // token authenticates its roster.
+    // Pin the founder the host delivered over the proven stream FIRST, so the
+    // roster fold seeds `ever_admin` with it. Without this pin a Reader/Writer
+    // joiner (which cannot author roster ops, and is not admin) would materialize
+    // NO role at all and be inert. We do NOT author our own `add_peer` for the
+    // host — that is admin-gated and we may be a mere Reader; trust in the host
+    // (and our own granted role) both fall out of the founder-seeded fold over
+    // the host's imported roster.
     store
-        .add_peer(token.peer_id, token.verifying_key)
-        .context("add host to roster")?;
+        .pin_founder(accept.founder)
+        .context("pin founder delivered by host")?;
+    // Import the host's signed roster so we learn its self-`Add` (proves its
+    // admin role) and the `Add{role}` it authored for us, plus its siblings
+    // (transitive mesh). The host's key from the token authenticates its roster.
     let host_key = VerifyingKey::from_bytes(&token.verifying_key)
         .context("token carried a malformed host key")?;
     store
@@ -383,7 +411,7 @@ async fn run_join(
     }
 
     conn.close(0u32.into(), b"paired");
-    Ok(accept.vault_key)
+    Ok((accept.vault_key, accept.founder))
 }
 
 /// Snapshot a dialable [`EndpointAddr`], waiting (bounded) for a direct address
@@ -466,20 +494,29 @@ mod tests {
         let vault = VaultId::generate();
 
         let mut sa = Store::open(da.path(), ia.clone()).unwrap();
+        // Host must be founded (admin) to vouch joiners and to deliver a founder pin.
+        sa.declare_founder(Role::Admin).unwrap();
 
         // Host A: create a token, then accept one join (auto-approve).
         let vault_key = [42u8; 32];
-        let (token, host) = host_pairing(&ia, vault, vault_key, &mut sa).await.unwrap();
+        let (token, host) = host_pairing(&ia, vault, vault_key, Role::Admin, &mut sa)
+            .await
+            .unwrap();
         let db_root = db.path().to_path_buf();
         let join = tokio::spawn(join_pairing(ib.clone(), db_root, token));
 
         let approved = host.accept_auto().await.unwrap();
         assert_eq!(approved, ib.peer_id(), "host approves B's peer id");
 
-        let (sb, joiner_vault_key) = join.await.unwrap().unwrap();
+        let (sb, joiner_vault_key, joiner_founder) = join.await.unwrap().unwrap();
         assert_eq!(
             joiner_vault_key, vault_key,
             "the joiner must receive the host's shared vault key"
+        );
+        assert_eq!(
+            joiner_founder,
+            ia.peer_id(),
+            "the joiner must learn the host's founder pin"
         );
 
         assert!(
@@ -496,6 +533,43 @@ mod tests {
         );
     }
 
+    /// An admin host founds the vault and pairs in a joiner with `Role::Reader`.
+    /// Both the invitee role AND the founder pin must ride the proven stream, so
+    /// the joiner's persisted vault materializes exactly that role.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pairing_delivers_the_invitee_role_and_founder_pin() {
+        let da = tempdir().unwrap();
+        let db = tempdir().unwrap();
+        let ia = Identity::generate();
+        let ib = Identity::generate();
+        let vault = VaultId::generate();
+
+        let mut sa = Store::open(da.path(), ia.clone()).unwrap();
+        sa.declare_founder(Role::Admin).unwrap();
+        let host_founder_peer_id = ia.peer_id();
+
+        let (token, host) = host_pairing(&ia, vault, [42u8; 32], Role::Reader, &mut sa)
+            .await
+            .unwrap();
+        let joiner_vault_path = db.path().to_path_buf();
+        let join = tokio::spawn(join_pairing(
+            ib.clone(),
+            joiner_vault_path.clone(),
+            token,
+        ));
+
+        host.accept_auto().await.unwrap();
+        let (sb, _vk, founder) = join.await.unwrap().unwrap();
+        assert_eq!(founder, host_founder_peer_id);
+        assert_eq!(sb.self_role(), Some(Role::Reader));
+        assert_eq!(sb.founder_pin(), Some(host_founder_peer_id));
+
+        // Reopening the persisted vault yields the same folded role + pin.
+        let joiner = Store::open(&joiner_vault_path, ib.clone()).unwrap();
+        assert_eq!(joiner.self_role(), Some(Role::Reader));
+        assert_eq!(joiner.founder_pin(), Some(host_founder_peer_id));
+    }
+
     /// The host rotates BEFORE pairing; the joiner must come away able to open the
     /// rotated epoch (the host wrapped it to the joiner during accept).
     #[tokio::test(flavor = "multi_thread")]
@@ -509,16 +583,19 @@ mod tests {
         let (id_key, epoch0) = vault_subkeys(&vault_key);
 
         let mut sa = Store::open(da.path(), ia.clone()).unwrap();
+        sa.declare_founder(Role::Admin).unwrap();
         // Host rotates while alone -> mints epoch 1, wrapped to itself.
         let rotated = sa.rotate_epoch(&id_key, &epoch0, None).unwrap();
         assert!(sa.keychain(&id_key, &epoch0).unwrap().epoch_key(&rotated).is_some());
 
-        let (token, host) = host_pairing(&ia, vault, vault_key, &mut sa).await.unwrap();
+        let (token, host) = host_pairing(&ia, vault, vault_key, Role::Admin, &mut sa)
+            .await
+            .unwrap();
         let db_root = db.path().to_path_buf();
         let join = tokio::spawn(join_pairing(ib.clone(), db_root, token));
 
         host.accept_auto().await.unwrap();
-        let (sb, _vk) = join.await.unwrap().unwrap();
+        let (sb, _vk, _founder) = join.await.unwrap().unwrap();
 
         // The joiner can open the epoch the host minted before B existed.
         let kc_b = sb.keychain(&id_key, &epoch0).unwrap();
@@ -543,7 +620,9 @@ mod tests {
         let vault = VaultId::generate();
 
         let mut sa = Store::open(da.path(), ia.clone()).unwrap();
-        let (token, host) = host_pairing(&ia, vault, [0u8; 32], &mut sa).await.unwrap();
+        let (token, host) = host_pairing(&ia, vault, [0u8; 32], Role::Admin, &mut sa)
+            .await
+            .unwrap();
         let token_decoded = PairingToken::decode(&token).unwrap();
         let b_peer = ib.peer_id();
 
@@ -593,7 +672,9 @@ mod tests {
         let vault = VaultId::generate();
 
         let mut sa = Store::open(da.path(), ia.clone()).unwrap();
-        let (token, host) = host_pairing(&ia, vault, [0u8; 32], &mut sa).await.unwrap();
+        let (token, host) = host_pairing(&ia, vault, [0u8; 32], Role::Admin, &mut sa)
+            .await
+            .unwrap();
         let token_decoded = PairingToken::decode(&token).unwrap();
         // A peer_id that does NOT match ib's key.
         let bad_peer_id = ib.peer_id().wrapping_add(1);

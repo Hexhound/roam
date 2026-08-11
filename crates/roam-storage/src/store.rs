@@ -498,6 +498,13 @@ impl Store {
         }
     }
 
+    /// The pinned vault founder's `peer_id` (`<root>/founder`), if any. The
+    /// founder seeds the roster fold's `ever_admin` closure; a joiner needs it
+    /// to materialize any role at all.
+    pub fn founder_pin(&self) -> Option<u64> {
+        self.founder
+    }
+
     /// This device's own materialized role (None if not yet in the roster).
     pub fn self_role(&self) -> Option<Role> {
         let me = self.identity.peer_id();
