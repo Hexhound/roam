@@ -39,6 +39,7 @@ pub trait Backend: Send + Sync {
 pub struct MemoryBackend {
     entries: Mutex<BTreeMap<String, BTreeMap<String, Vec<u8>>>>,
     blobs: Mutex<BTreeMap<String, BTreeMap<String, Vec<u8>>>>,
+    snapshots: Mutex<BTreeMap<String, BTreeMap<String, Vec<u8>>>>,
 }
 
 impl MemoryBackend {
@@ -46,6 +47,7 @@ impl MemoryBackend {
         let map = match kind {
             SetKind::Entries => &self.entries,
             SetKind::Blobs => &self.blobs,
+            SetKind::Snapshots => &self.snapshots,
         };
         let guard = map.lock().unwrap();
         let Some(b) = guard.get(bucket) else {
