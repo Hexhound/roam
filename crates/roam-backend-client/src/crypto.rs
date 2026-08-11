@@ -36,7 +36,10 @@ impl VaultKey {
 
     /// Backend namespace id. Opaque to the server.
     pub fn bucket_id(&self) -> String {
-        self.keyed(b"roam-bucket")
+        // v2: content-addressed entry ids + snapshots kind. A scheme bump moves the
+        // whole vault to a new backend namespace, so mixed-scheme reconciliation
+        // (positional vs content ids) can never happen.
+        self.keyed(b"roam-bucket-v2")
     }
 
     /// Deterministic per-entry id = keyed(vault_key, "entry" || peer_le || index_le).
@@ -159,6 +162,13 @@ mod tests {
             .bucket_id()
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+    }
+
+    #[test]
+    fn bucket_id_carries_scheme_version() {
+        let k = VaultKey([1u8; 32]);
+        assert_eq!(k.bucket_id(), k.bucket_id());
+        assert_eq!(k.bucket_id().len(), 43);
     }
 
     #[test]
