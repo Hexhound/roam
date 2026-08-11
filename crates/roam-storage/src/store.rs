@@ -1265,12 +1265,21 @@ mod tests {
 
         let mut a = Store::open(dir_a.path(), a_id).unwrap();
         let mut b = Store::open(dir_b.path(), b_id.clone()).unwrap();
+        // Seed an admin founder so the roster fold counts a's grant certificates;
+        // without it add_peer/revoke_peer are ignored and the peer stays UNKNOWN,
+        // which would exercise the wrong import_peer rejection path.
+        a.declare_founder(Role::Admin).unwrap();
         a.add_peer(b_id.peer_id(), b_id.verifying_key().to_bytes()).unwrap();
         a.revoke_peer(b_id.peer_id(), b_id.verifying_key().to_bytes()).unwrap();
 
         b.edit_text("note", 0, "sneaky").unwrap();
         let err = a.import_peer(b_id.peer_id(), &b_id.verifying_key(), b.export_own_log().unwrap());
-        assert!(matches!(err, Err(StorageError::Peer(_))), "revoked peer ops must be refused");
+        // Must be the REVOKED path, not the UNKNOWN path: the peer was genuinely
+        // vouched-for then revoked through a real founder-rooted roster.
+        assert!(
+            matches!(&err, Err(StorageError::Peer(msg)) if msg.contains("revoked")),
+            "revoked peer ops must be refused via the revoke path, got: {err:?}"
+        );
     }
 
     #[test]
