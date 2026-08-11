@@ -739,7 +739,12 @@ impl Store {
         // The roster is the trust boundary: only accept ops from a peer we
         // currently vouch for. Unknown or revoked peers are refused outright.
         match self.peers.iter().find(|p| p.peer_id == peer_id) {
-            Some(p) if p.status == PeerStatus::Active => {}
+            Some(p) if p.status == PeerStatus::Active && p.role != Role::Reader => {}
+            Some(p) if p.status == PeerStatus::Active => {
+                return Err(StorageError::Peer(format!(
+                    "refusing content ops from reader peer {peer_id}"
+                )));
+            }
             Some(_) => {
                 return Err(StorageError::Peer(format!(
                     "refusing ops from revoked peer {peer_id}"
@@ -1906,5 +1911,38 @@ mod tests {
         let victim = Identity::generate();
         assert!(w.add_peer(victim.peer_id(), victim.verifying_key().to_bytes(), Role::Reader).is_err());
         assert!(w.set_role(writer.peer_id(), writer.verifying_key().to_bytes(), Role::Admin).is_err());
+    }
+
+    #[test]
+    fn import_peer_rejects_reader_authored_content_ops() {
+        // admin founder adds P as Writer
+        let dir = tempfile::tempdir().unwrap();
+        let admin = Identity::generate();
+        let p = Identity::generate();
+        let mut a = Store::open(dir.path(), admin.clone()).unwrap();
+        a.declare_founder(Role::Admin).unwrap();
+        a.add_peer(p.peer_id(), p.verifying_key().to_bytes(), Role::Writer).unwrap();
+
+        // P materializes as Writer and authors an op
+        let pdir = tempfile::tempdir().unwrap();
+        let mut ps = Store::open(pdir.path(), p.clone()).unwrap();
+        ps.pin_founder(admin.peer_id()).unwrap();
+        ps.import_roster(admin.peer_id(), &admin.verifying_key(), a.export_own_roster().unwrap())
+            .unwrap();
+        assert!(ps.may_write());
+        ps.edit_text("note", 0, "hello").unwrap();
+        // capture P's own signed op-log bytes:
+        let p_ops = ps.export_own_log().unwrap();
+
+        // sanity: while P is a Writer, import is accepted
+        a.import_peer(p.peer_id(), &p.verifying_key(), p_ops.clone()).unwrap();
+
+        // demote P to Reader, then a FRESH admin store must refuse P's ops
+        let dir2 = tempfile::tempdir().unwrap();
+        let mut a2 = Store::open(dir2.path(), admin.clone()).unwrap();
+        a2.declare_founder(Role::Admin).unwrap();
+        a2.add_peer(p.peer_id(), p.verifying_key().to_bytes(), Role::Reader).unwrap();
+        let err = a2.import_peer(p.peer_id(), &p.verifying_key(), p_ops);
+        assert!(err.is_err(), "reader-authored content ops must be refused");
     }
 }
