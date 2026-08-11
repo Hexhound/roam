@@ -1213,6 +1213,70 @@ impl Store {
         Ok(freed)
     }
 
+    /// Build a shallow snapshot suitable for upload to the backend, at the newest
+    /// history marker with `ts_ms <= before_ts`. Read-only — emits no ops, mutates
+    /// nothing on disk. Returns `None` when no marker qualifies (nothing to
+    /// snapshot yet). The caller seals `bytes`, derives entry-ids from
+    /// `subsumed_lines`, and derives blob-ids from `blob_refs`.
+    ///
+    /// `before_ts` is an ABSOLUTE timestamp (like [`Store::checkpoint`]); a caller
+    /// wanting a "keep the last N days as a replayable tail" policy passes
+    /// `now_ms - retention_lag_ms`, and one wanting a head snapshot passes
+    /// `i64::MAX`.
+    pub fn build_backend_snapshot(
+        &self,
+        before_ts: i64,
+    ) -> Result<Option<BackendSnapshot>, StorageError> {
+        use roam_crdt::Frontier;
+        let idx = HistoryIndex::new(&self.root.join("history"));
+        let target = match idx.marker_before(before_ts)? {
+            Some(m) => m,
+            None => return Ok(None),
+        };
+
+        // Shallow snapshot at the target frontier.
+        let fbytes = B64
+            .decode(target.frontier.as_bytes())
+            .map_err(|e| StorageError::Base64(e.to_string()))?;
+        let frontier = Frontier::from_bytes(&fbytes)?;
+        let bytes = self.doc.shallow_snapshot(&frontier)?;
+        let frontier_digest: [u8; 32] = blake3::hash(&fbytes).into();
+
+        // Subsumed op-log lines: the first `count` lines of each peer's log are
+        // the ones this snapshot replaces (mirrors the checkpoint drop plan).
+        let plan = crate::checkpoint::plan_from_marker(&target);
+        let mut subsumed_lines = Vec::new();
+        for (peer, count) in &plan.drop_lines {
+            let log = if *peer == self.peer_id() {
+                self.export_own_log()?
+            } else {
+                self.export_peer_log(*peer)?
+            };
+            for line in split_log_lines_bytes(&log)
+                .into_iter()
+                .take(*count as usize)
+            {
+                subsumed_lines.push((*peer, line));
+            }
+        }
+
+        // Blobs referenced by the snapshot state — the keep-alive set for blob GC.
+        // (`referenced_hashes` also unions the latest state, which can only
+        // over-retain a blob, never orphan one still in use — safe.)
+        let mut blob_refs: Vec<String> = self
+            .referenced_hashes(&[target.frontier.clone()])?
+            .into_iter()
+            .collect();
+        blob_refs.sort();
+
+        Ok(Some(BackendSnapshot {
+            bytes,
+            frontier_digest,
+            subsumed_lines,
+            blob_refs,
+        }))
+    }
+
     /// The serialized entry value for `key` in `map_id` as of the newest retained
     /// marker at/before `before_ts`, or `None` if no such marker exists or that
     /// point can't be checked out (already compacted below the shallow base).
@@ -1243,6 +1307,25 @@ impl Store {
         self.doc.checkout_latest();
         Ok(value)
     }
+}
+
+/// A shallow snapshot ready for backend upload, plus the metadata the backend's
+/// zero-knowledge retention sweep needs (all opaque once ids are derived).
+/// Produced by [`Store::build_backend_snapshot`]; the caller seals `bytes` and
+/// maps `subsumed_lines`/`blob_refs` into backend ids.
+#[derive(Debug, Clone)]
+pub struct BackendSnapshot {
+    /// Loro shallow-snapshot bytes at the covered frontier (PLAINTEXT — the
+    /// caller seals before upload).
+    pub bytes: Vec<u8>,
+    /// blake3 of the covered frontier bytes; the snapshot's stable identity.
+    pub frontier_digest: [u8; 32],
+    /// `(peer, line)` for every op-log line this snapshot subsumes. The caller
+    /// derives each backend entry-id via `VaultKey::entry_id_content(peer, line)`.
+    pub subsumed_lines: Vec<(u64, Vec<u8>)>,
+    /// Content hashes of blobs the snapshot state references (sorted, deduped).
+    /// The caller maps each to a backend blob-id via `VaultKey::blob_id`.
+    pub blob_refs: Vec<String>,
 }
 
 /// Mirrors `roam_files::fileset::FILESET_MAP_ID`. Kept as a literal to avoid a
@@ -2584,6 +2667,34 @@ mod tests {
         );
         // And the doc converged to the final value despite the reordering.
         assert_eq!(s.get_entry("files", "k"), Some("v2".to_string()));
+    }
+
+    #[test]
+    fn build_backend_snapshot_produces_a_loadable_shallow_snapshot() {
+        let dir = tempdir().unwrap();
+        let mut s = Store::open(dir.path(), Identity::generate()).unwrap();
+        s.declare_founder(Role::Admin).unwrap();
+        for i in 0..5 {
+            s.set_entry("files", "k", &format!("v{i}")).unwrap();
+        }
+        // No history marker yet -> nothing to snapshot.
+        assert!(s.build_backend_snapshot(i64::MAX).unwrap().is_none());
+
+        // Record a marker at head, then snapshot at it.
+        s.write_snapshot().unwrap();
+        let snap = s
+            .build_backend_snapshot(i64::MAX)
+            .unwrap()
+            .expect("a marker now exists");
+
+        // Reloading the shallow snapshot into a fresh doc yields head state.
+        let restored = roam_crdt::Document::from_snapshot(99, &snap.bytes).unwrap();
+        assert_eq!(restored.get_entry("files", "k"), Some("v4".to_string()));
+
+        // Subsumed lines cover this peer's own op-log.
+        assert!(!snap.subsumed_lines.is_empty());
+        assert!(snap.subsumed_lines.iter().all(|(p, _)| *p == s.peer_id()));
+        assert_ne!(snap.frontier_digest, [0u8; 32]);
     }
 
     #[test]
