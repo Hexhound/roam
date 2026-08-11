@@ -14,7 +14,7 @@
 use std::path::{Path, PathBuf};
 
 use roam_files::{container_id, FolderBridge};
-use roam_storage::{Identity, Store};
+use roam_storage::{Identity, Role, Store};
 use tempfile::tempdir;
 
 /// A vault + store pair rooted under one tempdir, mirroring the unit-test
@@ -32,11 +32,19 @@ impl Fixture {
         let vault = dir.path().join("vault");
         let store = dir.path().join("store");
         std::fs::create_dir_all(&vault).unwrap();
+        let identity = Identity::generate();
+        // Under the roles model a roleless store has `may_write() == false`.
+        // These fixtures drive the writable import/rename paths, so self-found
+        // as Admin once (persisted, replayed on later `open`) to stay writable.
+        {
+            let mut store = Store::open(&store, identity.clone()).unwrap();
+            store.declare_founder(Role::Admin).unwrap();
+        }
         Fixture {
             _dir: dir,
             vault,
             store,
-            identity: Identity::generate(),
+            identity,
         }
     }
 
@@ -209,9 +217,13 @@ fn two_bridges_converge_via_store_merge() {
     let mut m2 = Store::open(dir_m2.path(), Identity::generate()).unwrap();
 
     for m in [&mut m1, &mut m2] {
-        m.add_peer(id_a.peer_id(), id_a.verifying_key().to_bytes())
+        // Under the roles model `add_peer` is admin-gated and `import_peer`
+        // drops ops authored by a non-Writer, so the neutral merge store
+        // self-founds as Admin and vouches A/B as Writers to accept their ops.
+        m.declare_founder(Role::Admin).unwrap();
+        m.add_peer(id_a.peer_id(), id_a.verifying_key().to_bytes(), Role::Writer)
             .unwrap();
-        m.add_peer(id_b.peer_id(), id_b.verifying_key().to_bytes())
+        m.add_peer(id_b.peer_id(), id_b.verifying_key().to_bytes(), Role::Writer)
             .unwrap();
     }
 

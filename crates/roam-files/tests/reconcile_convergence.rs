@@ -41,7 +41,7 @@ use std::path::{Path, PathBuf};
 use roam_files::{
     container_id, sidecar_path, EntryStatus, FileEntry, FolderBridge, GcContext, FILESET_MAP_ID,
 };
-use roam_storage::{Identity, Store};
+use roam_storage::{Identity, Role, Store};
 use tempfile::tempdir;
 
 /// One device: an isolated vault + store_root + stable identity.
@@ -58,11 +58,20 @@ impl Device {
         let vault = dir.path().join("vault");
         let store = dir.path().join("store");
         std::fs::create_dir_all(&vault).unwrap();
+        let identity = Identity::generate();
+        // Under the roles model `add_peer` is admin-gated, so each device
+        // self-founds as an Admin (persisted, replayed on later `open`). This
+        // keeps every device WRITABLE (`may_write() == true`), preserving the
+        // original test behavior; peers are added as `Writer` in `sync`.
+        {
+            let mut store = Store::open(&store, identity.clone()).unwrap();
+            store.declare_founder(Role::Admin).unwrap();
+        }
         Device {
             _dir: dir,
             vault,
             store,
-            identity: Identity::generate(),
+            identity,
         }
     }
 
@@ -128,7 +137,7 @@ fn sync(from: &Device, to: &Device) {
         .any(|p| p.peer_id == from.identity.peer_id())
     {
         store
-            .add_peer(from.identity.peer_id(), from_key.to_bytes())
+            .add_peer(from.identity.peer_id(), from_key.to_bytes(), Role::Writer)
             .unwrap();
     }
     store
@@ -881,7 +890,7 @@ fn relay(via: &Device, author: &Device, to: &Device) {
         .any(|p| p.peer_id == author.identity.peer_id())
     {
         store
-            .add_peer(author.identity.peer_id(), author_key.to_bytes())
+            .add_peer(author.identity.peer_id(), author_key.to_bytes(), Role::Writer)
             .unwrap();
     }
     store
