@@ -431,6 +431,12 @@ impl Store {
 
     /// This device's ed25519 verifying-key bytes (for cross-vouching and for peers
     /// to trust our authored ops).
+    /// This device's identity — used by the backend client to sign artifacts it
+    /// authors (e.g. a snapshot manifest) with the device's own key.
+    pub fn identity(&self) -> &Identity {
+        &self.identity
+    }
+
     pub fn identity_verifying_bytes(&self) -> [u8; 32] {
         self.identity.verifying_key_bytes()
     }

@@ -3,9 +3,10 @@ use crate::entries::{local_blobs, local_entries};
 use crate::transport::Backend;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64URL, Engine};
 use roam_rbsr::{initiate, reconcile, ItemSet, SetKind};
-use roam_storage::{Keychain, PeerStatus, Store, VerifyingKey, EPOCH0_ID};
+use roam_storage::{Keychain, PeerStatus, Role, Store, VerifyingKey, EPOCH0_ID};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
 /// Client-side round cap: bounds a pathological/hostile server that never
@@ -234,6 +235,103 @@ pub async fn reconcile_once<B: Backend>(
         );
     }
 
+    // If the backend asked for a snapshot and we're an Admin, produce + upload one.
+    maybe_produce_snapshot(store, backend, key, &bucket, &kc, debug).await?;
+
+    Ok(())
+}
+
+/// Seal `plaintext` under the head epoch — the same rule the entry/blob upload
+/// paths use (tagged epoch seal above epoch 0, legacy `VaultKey::seal` at 0).
+fn seal_under_head(kc: &Keychain, key: &VaultKey, plaintext: &[u8]) -> Vec<u8> {
+    match kc.head_write_key() {
+        Some((epoch_id, epoch_key)) if epoch_id != EPOCH0_ID => {
+            crate::crypto::seal_epoch(&epoch_key, &epoch_id, plaintext)
+        }
+        _ => key.seal(plaintext),
+    }
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Op-log tail (in ms) left replayable beyond the snapshot frontier. Peers only
+/// recently behind catch up by normal op-replay and never adopt a snapshot.
+/// Default 14 days; override with `ROAM_SNAPSHOT_LAG_DAYS` (tests set 0).
+fn retention_lag_ms() -> i64 {
+    let days: i64 = std::env::var("ROAM_SNAPSHOT_LAG_DAYS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(14);
+    days.saturating_mul(86_400_000)
+}
+
+/// When the backend signals `snapshot_wanted` and this device is an Admin, pin a
+/// head history marker, build a shallow snapshot at `head − retention_lag`, seal
+/// it, and upload it framed with a signed manifest. Only Admins may author (the
+/// act authorizes a future prune); non-Admins ignore the request.
+async fn maybe_produce_snapshot<B: Backend>(
+    store: &Arc<Mutex<Store>>,
+    backend: &Arc<B>,
+    key: &VaultKey,
+    bucket: &str,
+    kc: &Keychain,
+    debug: bool,
+) -> anyhow::Result<()> {
+    if !backend.manifest(bucket).await?.snapshot_wanted {
+        return Ok(());
+    }
+    if store.lock().await.self_role() != Some(Role::Admin) {
+        return Ok(());
+    }
+
+    let before_ts = now_ms().saturating_sub(retention_lag_ms());
+    // Pin a head marker so there is always a frontier to snapshot, then build.
+    let snap = {
+        let mut guard = store.lock().await;
+        guard.write_snapshot()?;
+        guard.build_backend_snapshot(before_ts)?
+    };
+    let Some(snap) = snap else {
+        if debug {
+            eprintln!("[be-sync]   snapshot_wanted but no qualifying marker yet");
+        }
+        return Ok(());
+    };
+
+    let sealed = seal_under_head(kc, key, &snap.bytes);
+    let snapshot_id = key.snapshot_id(&snap.frontier_digest);
+    let subsumed_entry_ids: Vec<String> = snap
+        .subsumed_lines
+        .iter()
+        .map(|(peer, line)| key.entry_id_content(*peer, line))
+        .collect();
+    let blob_ref_ids: Vec<String> = snap.blob_refs.iter().map(|h| key.blob_id(h)).collect();
+
+    let manifest = crate::snapshot_msg::SnapshotManifest {
+        frontier_digest: snap.frontier_digest,
+        snapshot_ct_hash: blake3::hash(&sealed).into(),
+        subsumed_entry_ids,
+        blob_ref_ids,
+        author: 0,
+        sig: String::new(),
+    }
+    .signed(store.lock().await.identity());
+
+    let manifest_json = serde_json::to_vec(&manifest)?;
+    let framed = crate::snapshot_msg::frame(&manifest_json, &sealed);
+    backend.put_snapshot(bucket, &snapshot_id, framed).await?;
+    if debug {
+        eprintln!(
+            "[be-sync]   uploaded snapshot {snapshot_id} subsuming {} entries, {} blob refs",
+            manifest.subsumed_entry_ids.len(),
+            manifest.blob_ref_ids.len(),
+        );
+    }
     Ok(())
 }
 
@@ -368,6 +466,51 @@ mod tests {
         let v1 = s.lock().await.doc_version_bytes();
         reconcile_once(&s, &backend, &key).await.unwrap();
         assert_eq!(s.lock().await.doc_version_bytes(), v1);
+    }
+
+    #[tokio::test]
+    async fn admin_produces_and_uploads_snapshot_when_backend_asks() {
+        // lag 0 => snapshot at the head marker, so the test needs no time travel.
+        std::env::set_var("ROAM_SNAPSHOT_LAG_DAYS", "0");
+        let key = VaultKey([9u8; 32]);
+        let backend = Arc::new(MemoryBackend::default());
+        let dir = tempfile::tempdir().unwrap();
+        let s = store_at(dir.path()).await; // Admin founder
+        s.lock().await.set_entry("files", "k", "v").unwrap();
+
+        // No request pending: a normal pass uploads no snapshot.
+        reconcile_once(&s, &backend, &key).await.unwrap();
+        assert!(backend
+            .list_snapshots(&key.bucket_id())
+            .await
+            .unwrap()
+            .is_empty());
+
+        // Backend asks -> an Admin produces and uploads exactly one.
+        backend.set_snapshot_wanted(&key.bucket_id(), true);
+        reconcile_once(&s, &backend, &key).await.unwrap();
+        let ids = backend.list_snapshots(&key.bucket_id()).await.unwrap();
+        assert_eq!(ids.len(), 1, "one snapshot uploaded on request");
+
+        // The uploaded object unframes into a verifiable manifest + sealed body.
+        let framed = backend
+            .get_snapshot(&key.bucket_id(), &ids[0])
+            .await
+            .unwrap()
+            .unwrap();
+        let (manifest_json, sealed) = crate::snapshot_msg::unframe(&framed).unwrap();
+        let manifest: crate::snapshot_msg::SnapshotManifest =
+            serde_json::from_slice(manifest_json).unwrap();
+        let author_vk = {
+            let g = s.lock().await;
+            roam_storage::VerifyingKey::from_bytes(&g.identity_verifying_bytes()).unwrap()
+        };
+        assert!(manifest.verify(&author_vk), "manifest signature verifies");
+        assert_eq!(
+            <[u8; 32]>::from(blake3::hash(sealed)),
+            manifest.snapshot_ct_hash,
+            "manifest binds the sealed ciphertext"
+        );
     }
 
     /// A multi-line log, then a partial catch-up: B first pulls A's whole log,

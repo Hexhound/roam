@@ -92,6 +92,35 @@ fn decode_sig(s: &str) -> Option<[u8; 64]> {
     B64URL.decode(s).ok()?.try_into().ok()
 }
 
+/// Frame a snapshot object stored under one backend id: the PLAINTEXT manifest
+/// JSON followed by the SEALED snapshot ciphertext, length-prefixed. One object
+/// (backend ids are a restricted charset — no room for a `.manifest` sibling),
+/// yet the zero-knowledge backend can read the manifest prefix (opaque id lists)
+/// for its retention sweep without ever touching the key.
+///
+/// Layout: `u32-LE manifest_len ‖ manifest_json ‖ sealed_ct`.
+pub fn frame(manifest_json: &[u8], sealed_ct: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + manifest_json.len() + sealed_ct.len());
+    out.extend_from_slice(&(manifest_json.len() as u32).to_le_bytes());
+    out.extend_from_slice(manifest_json);
+    out.extend_from_slice(sealed_ct);
+    out
+}
+
+/// Split a framed snapshot object back into `(manifest_json, sealed_ct)`.
+/// Returns `None` on a truncated/malformed frame.
+pub fn unframe(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
+    if bytes.len() < 4 {
+        return None;
+    }
+    let len = u32::from_le_bytes(bytes[..4].try_into().ok()?) as usize;
+    let rest = &bytes[4..];
+    if rest.len() < len {
+        return None;
+    }
+    Some((&rest[..len], &rest[len..]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,6 +171,19 @@ mod tests {
         b_with_a_sig.author = signed_a.author;
         b_with_a_sig.sig = signed_a.sig.clone();
         assert!(b_with_a_sig.verify(&author.verifying_key()));
+    }
+
+    #[test]
+    fn frame_roundtrips_and_rejects_truncation() {
+        let m = b"{\"manifest\":true}";
+        let ct = b"sealed-ciphertext-bytes";
+        let framed = frame(m, ct);
+        let (got_m, got_ct) = unframe(&framed).unwrap();
+        assert_eq!(got_m, m);
+        assert_eq!(got_ct, ct);
+        // A frame claiming more manifest bytes than present is rejected.
+        assert!(unframe(&framed[..6]).is_none());
+        assert!(unframe(&[1, 0]).is_none());
     }
 
     #[test]
