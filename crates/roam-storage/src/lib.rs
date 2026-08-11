@@ -27,6 +27,6 @@ pub use keylog::{KeyBody, KeyLog, KeyLogEntry, Recipient};
 pub use keywrap::{unwrap, wrap};
 pub use oplog::{Entry, OpLog};
 pub use paper::PaperKey;
-pub use roster::{merge_roster, PeerRecord, PeerStatus, RosterEntry, RosterLog, RosterOp};
+pub use roster::{merge_roster, PeerRecord, PeerStatus, Role, RosterEntry, RosterLog, RosterOp};
 pub use store::{version_dominates, Store};
 pub use vault_key::{vault_subkeys, VAULT_AEAD_LABEL, VAULT_ID_LABEL};

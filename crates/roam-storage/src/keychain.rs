@@ -239,7 +239,7 @@ mod tests {
     fn peer(id: u64, status: PeerStatus) -> PeerRecord {
         let mut key = [0u8; 32];
         key[0..8].copy_from_slice(&id.to_le_bytes());
-        PeerRecord { peer_id: id, verifying_key: key, status }
+        PeerRecord { peer_id: id, verifying_key: key, status, role: crate::roster::Role::Admin }
     }
 
     #[test]

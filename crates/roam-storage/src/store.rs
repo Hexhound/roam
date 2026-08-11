@@ -7,7 +7,7 @@ use crate::keychain::{compute_epoch_id, Keychain, VaultIssue};
 use crate::keylog::{KeyBody, KeyLog, KeyLogEntry, Recipient};
 use crate::keywrap;
 use crate::oplog::OpLog;
-use crate::roster::{merge_roster, PeerRecord, PeerStatus, RosterEntry, RosterLog, RosterOp};
+use crate::roster::{merge_roster, PeerRecord, PeerStatus, Role, RosterEntry, RosterLog, RosterOp};
 use crate::snapshot;
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use roam_crdt::{Document, Version};
@@ -190,7 +190,8 @@ impl Store {
             all_entries.extend(entries);
         }
 
-        Ok(merge_roster(&mut all_entries))
+        // TODO(Task 3): thread the real founder id through rebuild_peers.
+        Ok(merge_roster(&mut all_entries, None))
     }
 
     pub fn text(&self, id: &str) -> String {
@@ -403,8 +404,9 @@ impl Store {
     /// map to the wrong key).
     pub fn add_peer(&mut self, peer_id: u64, key_bytes: [u8; 32]) -> Result<(), StorageError> {
         Self::check_peer_id_binding(peer_id, &key_bytes)?;
+        // TODO(Task 3): pass the intended role instead of hard-coding Admin.
         self.own_roster
-            .append(&self.identity, RosterOp::Add, peer_id, key_bytes)?;
+            .append(&self.identity, RosterOp::Add { role: Role::Admin }, peer_id, key_bytes)?;
         self.refresh_peers()
     }
 
