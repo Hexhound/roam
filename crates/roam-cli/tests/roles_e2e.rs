@@ -276,7 +276,12 @@ async fn three_device_admin_writer_reader_role_enforcement() {
     converge_note(&mesh, &reader, "hello world", "reader to receive writer's edit").await;
 
     // ================================================================
-    // Phase 3 — READER edit is DROPPED by receivers and REVERTED locally.
+    // Phase 3 — READER edit is REVERTED locally (author-side enforcement).
+    // Phase 3 proves author-side enforcement: the Reader's local edit is reverted
+    // to authoritative state and never authored as an op. Receiver-side drop of a
+    // Reader-authored op is covered by the storage unit test
+    // `import_peer_rejects_reader_authored_content_ops` and demoted-author drop by
+    // Phase 4.
     // The reader dirties its own note.md; its next scan (read-only vault) never
     // authors an op and force-reverts to the authoritative projection.
     // ================================================================

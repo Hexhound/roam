@@ -1101,6 +1101,9 @@ impl FolderBridge {
     /// ops that propagate and heal the mesh. For a blob, the referenced bytes
     /// must still be present.
     pub fn resurrect(&self, store: &mut Store, file: &Path) -> Result<SyncOutcome, FilesError> {
+        if !store.may_write() {
+            return Err(FilesError::ReadOnly);
+        }
         let key = container_id(&self.vault_root, file)?;
         let value = store
             .get_entry(FILESET_MAP_ID, &key)

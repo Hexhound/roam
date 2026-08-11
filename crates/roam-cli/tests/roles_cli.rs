@@ -23,14 +23,17 @@ fn init_declares_founder_admin() {
     assert_eq!(store.self_role(), Some(Role::Admin));
 }
 
-/// A founder may declare a lesser role (the CLI default is admin, but `--role`
-/// lets the creator self-vouch as reader/writer too).
+/// A founder must be Admin — it is the vault's root authority. Declaring a
+/// non-admin founder (e.g. Reader) would brick the vault (it could never author
+/// grants), so `declare_founder` rejects it.
 #[test]
-fn init_declares_founder_reader() {
+fn init_rejects_a_non_admin_founder() {
     let dir = tempfile::tempdir().unwrap();
     let vault = dir.path().join("vault");
     let identity = Identity::generate();
     let mut store = Store::open(&vault, identity).unwrap();
-    store.declare_founder(Role::Reader).unwrap();
-    assert_eq!(store.self_role(), Some(Role::Reader));
+    assert!(store.declare_founder(Role::Reader).is_err());
+    assert!(store.declare_founder(Role::Writer).is_err());
+    store.declare_founder(Role::Admin).unwrap();
+    assert_eq!(store.self_role(), Some(Role::Admin));
 }

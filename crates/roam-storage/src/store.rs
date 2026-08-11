@@ -473,6 +473,11 @@ impl Store {
     /// Genesis: pin THIS device as founder and self-vouch it with `role`. Refuses if
     /// a founder is already pinned (re-declaring would fork trust).
     pub fn declare_founder(&mut self, role: Role) -> Result<(), StorageError> {
+        if role != Role::Admin {
+            return Err(StorageError::Peer(
+                "founder must be Admin (it is the vault's root authority)".into(),
+            ));
+        }
         if crate::founder::read_founder(&self.root)?.is_some() {
             return Err(StorageError::Peer("vault founder already pinned".into()));
         }
@@ -1099,6 +1104,17 @@ mod tests {
         assert!(!store.may_write(), "no-role device must not write");
         store.declare_founder(Role::Admin).unwrap();
         assert!(store.may_write(), "admin may write");
+    }
+
+    #[test]
+    fn declare_founder_rejects_a_non_admin_role() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = Identity::generate();
+        let mut store = Store::open(dir.path(), id).unwrap();
+        assert!(store.declare_founder(Role::Reader).is_err());
+        assert!(store.declare_founder(Role::Writer).is_err());
+        // founder file must NOT have been written by the rejected attempts:
+        store.declare_founder(Role::Admin).unwrap(); // still succeeds afterwards
     }
 
     #[test]
