@@ -5,5 +5,6 @@
 pub mod crypto;
 pub mod entries;
 pub mod http;
+pub mod snapshot_msg;
 pub mod sync;
 pub mod transport;

@@ -53,6 +53,12 @@ impl Identity {
         self.signing_key.sign(msg)
     }
 
+    /// Sign `msg`, returning the raw 64-byte signature. Byte-level seam for
+    /// crates that never depend on `ed25519` (e.g. the backend client).
+    pub fn sign_bytes(&self, msg: &[u8]) -> [u8; 64] {
+        self.signing_key.sign(msg).to_bytes()
+    }
+
     /// The raw 32-byte ed25519 secret, for constructing a transport key
     /// (e.g. `iroh::SecretKey`).
     ///
@@ -145,6 +151,14 @@ impl VerifyingKey {
         // verify_strict rejects non-canonical / malleable signatures — the
         // recommended default for tamper detection.
         self.0.verify_strict(msg, sig).is_ok()
+    }
+
+    /// Verify a raw 64-byte signature over `msg`. A byte-level seam so crates
+    /// that never touch `ed25519` (e.g. the backend client) can verify signed
+    /// artifacts using only storage types.
+    pub fn verify_bytes(&self, msg: &[u8], sig_bytes: &[u8; 64]) -> bool {
+        let sig = Signature::from_bytes(sig_bytes);
+        self.0.verify_strict(msg, &sig).is_ok()
     }
 }
 
