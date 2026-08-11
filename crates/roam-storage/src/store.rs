@@ -1283,6 +1283,27 @@ impl Store {
         }))
     }
 
+    /// Adopt a snapshot received from a peer or the backend. **Additive**: it
+    /// merges the snapshot's state into the live doc and NEVER truncates this
+    /// device's op-logs. A device can therefore only ever "lose" history it never
+    /// had — importing a snapshot cannot reach across and drop history a
+    /// well-stocked device holds locally (design invariant). Local space reclaim
+    /// remains the separate, explicit job of [`Store::checkpoint`].
+    pub fn adopt_snapshot(&mut self, bytes: &[u8]) -> Result<(), StorageError> {
+        self.doc.import(bytes)?;
+        self.doc.commit();
+        // Persist the merged state as the fast-load base so a reopen keeps it —
+        // the op-logs are untouched, so without this the adopted state would be
+        // lost on reload. No history marker: adopting a peer's snapshot is not a
+        // local checkpoint moment.
+        let path = self.root.join("snapshots").join("snapshot.loro");
+        snapshot::save(&path, &self.doc.snapshot()?)?;
+        // Advance `persisted` so these foreign ops are never re-exported into our
+        // own (own-key-signed) log — mirrors `import_peer`.
+        self.persisted = self.doc.version();
+        Ok(())
+    }
+
     /// The serialized entry value for `key` in `map_id` as of the newest retained
     /// marker at/before `before_ts`, or `None` if no such marker exists or that
     /// point can't be checked out (already compacted below the shallow base).
@@ -2673,6 +2694,36 @@ mod tests {
         );
         // And the doc converged to the final value despite the reordering.
         assert_eq!(s.get_entry("files", "k"), Some("v2".to_string()));
+    }
+
+    #[test]
+    fn adopt_snapshot_is_additive_and_never_truncates_existing_history() {
+        // Producer builds a snapshot at head.
+        let pd = tempdir().unwrap();
+        let mut prod = Store::open(pd.path(), Identity::generate()).unwrap();
+        prod.declare_founder(Role::Admin).unwrap();
+        prod.set_entry("files", "k", "v1").unwrap();
+        prod.write_snapshot().unwrap();
+        let snap = prod.build_backend_snapshot(i64::MAX).unwrap().unwrap();
+
+        // A fresh consumer adopting it gains the producer's state.
+        let cd = tempdir().unwrap();
+        let mut cons = Store::open(cd.path(), Identity::generate()).unwrap();
+        cons.declare_founder(Role::Admin).unwrap();
+        cons.adopt_snapshot(&snap.bytes).unwrap();
+        assert_eq!(cons.get_entry("files", "k"), Some("v1".to_string()));
+
+        // A consumer that already holds richer local history keeps it after
+        // adopting the (older) snapshot — adoption is additive, never truncating.
+        cons.set_entry("files", "k2", "local").unwrap();
+        let own_before = cons.export_own_log().unwrap();
+        cons.adopt_snapshot(&snap.bytes).unwrap();
+        assert_eq!(cons.get_entry("files", "k2"), Some("local".to_string()));
+        assert_eq!(
+            cons.export_own_log().unwrap(),
+            own_before,
+            "adopting a snapshot must not touch our own op-log"
+        );
     }
 
     #[test]
