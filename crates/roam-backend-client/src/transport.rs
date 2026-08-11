@@ -10,6 +10,10 @@ pub use roam_rbsr::SetKind;
 pub struct Manifest {
     pub entry_ids: Vec<String>,
     pub blob_ids: Vec<String>,
+    /// Snapshot ids the backend holds. `serde(default)` so a manifest from a
+    /// pre-snapshot backend (no such field) still decodes.
+    #[serde(default)]
+    pub snapshot_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,6 +31,11 @@ pub trait Backend: Send + Sync {
     async fn put_entry(&self, bucket: &str, id: &str, ct: Vec<u8>) -> anyhow::Result<PutOutcome>;
     async fn get_blob(&self, bucket: &str, id: &str) -> anyhow::Result<Option<Vec<u8>>>;
     async fn put_blob(&self, bucket: &str, id: &str, ct: Vec<u8>) -> anyhow::Result<PutOutcome>;
+    async fn get_snapshot(&self, bucket: &str, id: &str) -> anyhow::Result<Option<Vec<u8>>>;
+    async fn put_snapshot(&self, bucket: &str, id: &str, ct: Vec<u8>)
+        -> anyhow::Result<PutOutcome>;
+    /// All snapshot ids the backend currently holds for `bucket`.
+    async fn list_snapshots(&self, bucket: &str) -> anyhow::Result<Vec<String>>;
 
     /// One RBSR round: hand the backend a negentropy message for `kind`'s id set,
     /// get its reply. Bytes are opaque negentropy protocol frames.
@@ -108,9 +117,17 @@ impl Backend for MemoryBackend {
             .get(bucket)
             .map(|b| b.keys().cloned().collect())
             .unwrap_or_default();
+        let snapshot_ids = self
+            .snapshots
+            .lock()
+            .unwrap()
+            .get(bucket)
+            .map(|b| b.keys().cloned().collect())
+            .unwrap_or_default();
         Ok(Manifest {
             entry_ids,
             blob_ids,
+            snapshot_ids,
         })
     }
     async fn get_entry(&self, bucket: &str, id: &str) -> anyhow::Result<Option<Vec<u8>>> {
@@ -124,6 +141,26 @@ impl Backend for MemoryBackend {
     }
     async fn put_blob(&self, bucket: &str, id: &str, ct: Vec<u8>) -> anyhow::Result<PutOutcome> {
         Ok(put(&self.blobs, bucket, id, ct))
+    }
+    async fn get_snapshot(&self, bucket: &str, id: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        Ok(get(&self.snapshots, bucket, id))
+    }
+    async fn put_snapshot(
+        &self,
+        bucket: &str,
+        id: &str,
+        ct: Vec<u8>,
+    ) -> anyhow::Result<PutOutcome> {
+        Ok(put(&self.snapshots, bucket, id, ct))
+    }
+    async fn list_snapshots(&self, bucket: &str) -> anyhow::Result<Vec<String>> {
+        Ok(self
+            .snapshots
+            .lock()
+            .unwrap()
+            .get(bucket)
+            .map(|b| b.keys().cloned().collect())
+            .unwrap_or_default())
     }
     async fn reconcile(
         &self,
@@ -151,6 +188,26 @@ mod tests {
             b.put_entry("bkt", "e1", b"ct".to_vec()).await.unwrap(),
             PutOutcome::Exists
         );
+    }
+
+    #[tokio::test]
+    async fn memory_backend_stores_and_lists_snapshots() {
+        let b = MemoryBackend::default();
+        assert_eq!(
+            b.put_snapshot("bkt", "sid", vec![1, 2, 3]).await.unwrap(),
+            PutOutcome::Created
+        );
+        assert_eq!(
+            b.get_snapshot("bkt", "sid").await.unwrap(),
+            Some(vec![1, 2, 3])
+        );
+        assert_eq!(
+            b.list_snapshots("bkt").await.unwrap(),
+            vec!["sid".to_string()]
+        );
+        // Snapshot ids also surface through the manifest, isolated per bucket.
+        assert_eq!(b.manifest("bkt").await.unwrap().snapshot_ids, vec!["sid"]);
+        assert!(b.list_snapshots("other").await.unwrap().is_empty());
     }
 
     #[tokio::test]
