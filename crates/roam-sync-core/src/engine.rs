@@ -7,22 +7,25 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-/// Upper bound on the blob-bytes payload this slice transfers in ONE
-/// [`Frame::BlobData`]. The iroh transport caps a whole encoded frame at 64 MiB
-/// (`MAX_FRAME_LEN`); we stay a comfortable margin below it so the hash string +
-/// postcard framing overhead still fit. A blob larger than this is NOT served
-/// (the server skips it with a log line) — chunked transfer is deferred.
-///
-/// TODO(blob-chunking): lift this cap by splitting an oversized blob into
-/// offset-tagged `BlobData` chunks reassembled + full-hash-verified by the
-/// receiver. Until then a >`MAX_BLOB_BYTES` blob simply does not transfer.
-pub const MAX_BLOB_BYTES: usize = 60 * 1024 * 1024;
+/// Bytes of blob payload per `Frame::BlobChunk`. Well under the transport's
+/// 64 MiB whole-frame ceiling; large enough that per-chunk framing overhead is
+/// negligible. The sender reads one chunk at a time so blob size is unbounded
+/// by memory.
+const BLOB_CHUNK_SIZE: usize = 1024 * 1024;
 
-/// Whether a blob of `byte_len` bytes fits in a single [`Frame::BlobData`] under
-/// [`MAX_BLOB_BYTES`]. Pulled out as a pure predicate so the size boundary is
-/// unit-testable without allocating tens of MiB.
-fn blob_fits_frame(byte_len: usize) -> bool {
-    byte_len <= MAX_BLOB_BYTES
+/// Hard ceiling on a single blob's advertised `total_len` accepted over the
+/// wire. Guards against a peer advertising an absurd size that would pre-size a
+/// huge sparse `.part` and never complete. Generous — real media stays well
+/// under it.
+const MAX_INCOMING_BLOB_BYTES: u64 = 16 * 1024 * 1024 * 1024; // 16 GiB
+
+/// In-flight reassembly bookkeeping for one chunked blob. Tracks DISTINCT
+/// received offsets (not a running sum) so duplicate/interleaved chunk streams
+/// from multiple serving peers cannot inflate the count past a still-holey file.
+struct IncomingBlob {
+    total_len: u64,
+    received: u64,
+    seen: std::collections::HashSet<u64>,
 }
 
 /// Drives sync for one device over a [`Transport`]. Owns the [`Store`]; local
@@ -63,6 +66,10 @@ pub struct Engine<T: Transport> {
     // subkeys + build a Keychain that decrypts a received snapshot's sealed body;
     // held here so `Engine::new` carries the key material from construction.
     vault_key: [u8; 32],
+    /// Per-hash received-byte count for in-flight chunked blob transfers. The
+    /// bytes live in `BlobStore`'s `incoming/<hash>.part`; this only tracks
+    /// progress so we know when a transfer is complete. Cleared on finalize.
+    incoming_blobs: tokio::sync::Mutex<std::collections::HashMap<String, IncomingBlob>>,
 }
 
 /// Everything we offer a peer on connect or in a `Hello` reply, gathered under a
@@ -98,6 +105,7 @@ impl<T: Transport + 'static> Engine<T> {
             changed: Arc::new(tokio::sync::Notify::new()),
             local_flush: Arc::new(tokio::sync::Notify::new()),
             vault_key,
+            incoming_blobs: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -626,26 +634,46 @@ impl<T: Transport + 'static> Engine<T> {
                 }
             }
             Frame::BlobWant { hash } => {
-                // Read-side revoke gate: only ever serve a blob to a peer we
-                // currently vouch for as Active — identical to the Have/RosterHave
-                // serving paths (spec §9.6). A revoked/untrusted peer gets nothing.
+                // Read-side revoke gate: only serve a blob to a peer we vouch
+                // for as Active (spec §9.6). A revoked peer gets nothing.
                 if !self.is_active(peer).await {
                     return Ok(());
                 }
-                // Look the bytes up under the store lock, DROP the guard, then
-                // send. Absent blob → send nothing, no error.
-                let bytes = {
+                // Total length under the lock; absent blob -> serve nothing.
+                let total_len = {
                     let store = self.store.lock().await;
-                    // `get` verifies on-disk integrity; a corrupt/missing blob
-                    // yields None here and we simply do not serve it.
-                    store.blobs().get(&hash).ok().flatten()
-                };
-                if let Some(bytes) = bytes {
-                    if blob_fits_frame(bytes.len()) {
-                        self.send(peer, Frame::BlobData { hash, bytes }).await;
+                    match store.blobs().size(&hash) {
+                        Ok(Some(n)) => n,
+                        _ => return Ok(()),
                     }
-                    // else: oversized for a single frame this slice — skip
-                    // serving it (chunking deferred; see `MAX_BLOB_BYTES`).
+                };
+                if total_len == 0 {
+                    // Zero-byte blob: the while loop below would send nothing, so
+                    // the receiver would never complete. Send one empty chunk.
+                    self.send(
+                        peer,
+                        Frame::BlobChunk { hash: hash.clone(), offset: 0, total_len: 0, bytes: vec![] },
+                    )
+                    .await;
+                    return Ok(());
+                }
+                let mut offset: u64 = 0;
+                while offset < total_len {
+                    let want = std::cmp::min(BLOB_CHUNK_SIZE as u64, total_len - offset) as usize;
+                    let chunk = {
+                        let store = self.store.lock().await;
+                        match store.blobs().read_range(&hash, offset, want) {
+                            Ok(b) if !b.is_empty() => b,
+                            _ => return Ok(()), // vanished/corrupt mid-serve; stop
+                        }
+                    };
+                    let read = chunk.len() as u64;
+                    self.send(
+                        peer,
+                        Frame::BlobChunk { hash: hash.clone(), offset, total_len, bytes: chunk },
+                    )
+                    .await;
+                    offset += read;
                 }
             }
             Frame::BlobData { hash, bytes } => {
@@ -670,6 +698,68 @@ impl<T: Transport + 'static> Engine<T> {
                 // Signal the reconcile/projection (D5) that new blob bytes
                 // landed, so it can project them to disk. Only fire on a real
                 // store (not on a dropped duplicate/unsolicited/failed put).
+                if stored {
+                    self.changed.notify_waiters();
+                }
+            }
+            Frame::BlobChunk { hash, offset, total_len, bytes } => {
+                // DoS guard: reject an absurd advertised size before any disk I/O.
+                if total_len > MAX_INCOMING_BLOB_BYTES {
+                    return Ok(());
+                }
+                // Anti-spam + idempotency: only accept chunks for a hash a Live
+                // `Blob` file-set entry references, and never one we already hold.
+                let accept = {
+                    let store = self.store.lock().await;
+                    !store.blobs().has(&hash) && Self::fileset_wants(&store, &hash)
+                };
+                if !accept {
+                    return Ok(());
+                }
+                // Stream the chunk into the .part file at its offset.
+                {
+                    let store = self.store.lock().await;
+                    if store
+                        .blobs()
+                        .write_incoming_chunk(&hash, offset, total_len, &bytes)
+                        .is_err()
+                    {
+                        return Ok(());
+                    }
+                }
+                // Count DISTINCT offsets. A duplicate offset (another peer serving
+                // the same blob) re-writes identical bytes but must not advance the
+                // completion counter. A peer disagreeing on total_len for the same
+                // hash is malformed and ignored.
+                let complete = {
+                    let mut map = self.incoming_blobs.lock().await;
+                    let entry = map.entry(hash.clone()).or_insert_with(|| IncomingBlob {
+                        total_len,
+                        received: 0,
+                        seen: std::collections::HashSet::new(),
+                    });
+                    if entry.total_len == total_len && entry.seen.insert(offset) {
+                        entry.received += bytes.len() as u64;
+                    }
+                    entry.received >= entry.total_len
+                };
+                if !complete {
+                    return Ok(());
+                }
+                self.incoming_blobs.lock().await.remove(&hash);
+                // Finalize verifies the full blake3 == hash and atomically moves the
+                // .part into the store (poison guard). Re-check we still don't hold
+                // it: a concurrent `BlobData` transfer of the same hash may have
+                // landed between our accept gate and here.
+                let stored = {
+                    let store = self.store.lock().await;
+                    if store.blobs().has(&hash) {
+                        let _ = store.blobs().discard_incoming(&hash);
+                        false
+                    } else {
+                        store.blobs().finalize_incoming(&hash).unwrap_or(false)
+                    }
+                };
                 if stored {
                     self.changed.notify_waiters();
                 }
@@ -1001,7 +1091,7 @@ impl<T: Transport + 'static> Engine<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::{blob_fits_frame, Engine, MAX_BLOB_BYTES};
+    use super::Engine;
     use crate::memory::MemorySwitchboard;
     use roam_storage::{Identity, Store, VaultId};
     use std::sync::Arc;
@@ -1025,15 +1115,5 @@ mod tests {
             [0u8; 32],
         );
         assert!(engine.connected_peers().await.is_empty());
-    }
-
-    #[test]
-    fn blob_fits_frame_decides_at_the_cap_boundary() {
-        // Boundary is exercised via the pure predicate, WITHOUT allocating a
-        // 60 MiB blob: exactly at the cap fits; one byte over does not.
-        assert!(blob_fits_frame(0));
-        assert!(blob_fits_frame(MAX_BLOB_BYTES - 1));
-        assert!(blob_fits_frame(MAX_BLOB_BYTES));
-        assert!(!blob_fits_frame(MAX_BLOB_BYTES + 1));
     }
 }

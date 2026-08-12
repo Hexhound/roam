@@ -8,6 +8,7 @@
 //! hash before transferring bytes over the wire.
 
 use crate::error::StorageError;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 /// A blake3 hex digest is exactly 32 bytes rendered as 64 lowercase hex chars.
@@ -150,6 +151,134 @@ impl BlobStore {
             )));
         }
         Ok(self.root.join(hash))
+    }
+
+    /// Path of the scratch dir holding partially-received blobs (`<hash>.part`).
+    /// This lives directly under `root` alongside the finished blobs, but its
+    /// name (`incoming`) is not a valid blake3 hex digest, so [`list`] and
+    /// [`blob_path`] never mistake it for one.
+    fn incoming_dir(&self) -> PathBuf {
+        self.root.join("incoming")
+    }
+
+    /// Read up to `len` bytes of the blob for `hash` starting at byte `offset`.
+    ///
+    /// Clamps at EOF: a range that runs past the end of the blob yields fewer
+    /// bytes than requested (or, if `offset` is already at or past EOF, an
+    /// empty vec) rather than erroring. Errors only on I/O failure or an
+    /// invalid hash. This is what the chunked sender uses so a multi-GB blob
+    /// is never fully loaded into memory for a single transfer.
+    pub fn read_range(&self, hash: &str, offset: u64, len: usize) -> Result<Vec<u8>, StorageError> {
+        let path = self.blob_path(hash)?;
+        let mut file = std::fs::File::open(&path)?;
+        file.seek(SeekFrom::Start(offset))?;
+
+        let mut buf = vec![0u8; len];
+        let mut filled = 0;
+        while filled < len {
+            let read = file.read(&mut buf[filled..])?;
+            if read == 0 {
+                // Hit EOF before filling the requested length — clamp.
+                break;
+            }
+            filled += read;
+        }
+        buf.truncate(filled);
+        Ok(buf)
+    }
+
+    /// Write one chunk of an in-flight blob into `incoming/<hash>.part`.
+    ///
+    /// On the first write for a given `hash` the part file is created and
+    /// pre-sized to `total_len` (via `set_len`), so chunks can arrive in any
+    /// order and each just seeks to its own `offset` before writing. Calling
+    /// this again with the same `(offset, bytes)` is a no-op in effect
+    /// (idempotent), which matters if the sync layer retries a chunk after a
+    /// dropped connection.
+    pub fn write_incoming_chunk(
+        &self,
+        hash: &str,
+        offset: u64,
+        total_len: u64,
+        bytes: &[u8],
+    ) -> Result<(), StorageError> {
+        if !is_valid_hash(hash) {
+            return Err(StorageError::Blob(format!("invalid blob hash {hash}")));
+        }
+
+        let dir = self.incoming_dir();
+        std::fs::create_dir_all(&dir)?;
+        let part = dir.join(format!("{hash}.part"));
+
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&part)?;
+        file.set_len(total_len)?;
+        file.seek(SeekFrom::Start(offset))?;
+        file.write_all(bytes)?;
+        Ok(())
+    }
+
+    /// Verify the fully-received `incoming/<hash>.part` against `hash` and, on
+    /// a match, atomically move it into the store as a finished blob.
+    ///
+    /// Returns `Ok(true)` once the blob is in place under `root`. Returns
+    /// `Ok(false)` if the part file is missing (nothing to finalize) or its
+    /// content does not hash to `hash` — a poisoned or still-incomplete part
+    /// is discarded rather than ever exposed as a valid blob, matching the
+    /// verify-on-read contract [`get`] already enforces for finished blobs.
+    pub fn finalize_incoming(&self, hash: &str) -> Result<bool, StorageError> {
+        if !is_valid_hash(hash) {
+            return Err(StorageError::Blob(format!("invalid blob hash {hash}")));
+        }
+
+        let part = self.incoming_dir().join(format!("{hash}.part"));
+        let bytes = match std::fs::read(&part) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(err) => return Err(err.into()),
+        };
+
+        if Self::hash(&bytes) != hash {
+            // Poisoned or incomplete: never let this become a readable blob.
+            let _ = std::fs::remove_file(&part);
+            return Ok(false);
+        }
+
+        let final_path = self.root.join(hash);
+        match std::fs::rename(&part, &final_path) {
+            Ok(()) => Ok(true),
+            Err(_) => {
+                // Cross-filesystem rename can fail even though the content is
+                // verified good — fall back to a copy-then-remove so the
+                // finished blob still lands. Always clean up the `.part`,
+                // even if the write itself fails, so a failed fallback never
+                // leaves scratch debris behind.
+                let written = std::fs::write(&final_path, &bytes);
+                let _ = std::fs::remove_file(&part);
+                written?;
+                Ok(true)
+            }
+        }
+    }
+
+    /// Drop a partial transfer (connection lost, sender abandoned, etc.).
+    /// Tolerates an already-absent part file, so it is safe to call from
+    /// cleanup paths without first checking whether a transfer was ever
+    /// in progress.
+    pub fn discard_incoming(&self, hash: &str) -> Result<(), StorageError> {
+        if !is_valid_hash(hash) {
+            return Err(StorageError::Blob(format!("invalid blob hash {hash}")));
+        }
+
+        let part = self.incoming_dir().join(format!("{hash}.part"));
+        match std::fs::remove_file(&part) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err.into()),
+        }
     }
 }
 
@@ -307,5 +436,85 @@ mod tests {
         let hash = store.put(b"12345").unwrap();
         assert_eq!(store.size(&hash).unwrap(), Some(5));
         assert_eq!(store.size(&BlobStore::hash(b"absent")).unwrap(), None);
+    }
+
+    #[test]
+    fn read_range_returns_the_requested_slice() {
+        let dir = tempdir().unwrap();
+        let bs = open(&dir);
+        let hash = bs.put(b"0123456789").unwrap();
+        assert_eq!(bs.read_range(&hash, 0, 10).unwrap(), b"0123456789".to_vec());
+        assert_eq!(bs.read_range(&hash, 3, 4).unwrap(), b"3456".to_vec());
+        assert_eq!(bs.read_range(&hash, 8, 100).unwrap(), b"89".to_vec()); // clamp at EOF
+        assert_eq!(bs.read_range(&hash, 10, 5).unwrap(), Vec::<u8>::new()); // offset at EOF
+    }
+
+    #[test]
+    fn incoming_chunk_roundtrip_finalizes_a_valid_blob() {
+        let dir = tempdir().unwrap();
+        let bs = open(&dir);
+        let full = b"the quick brown fox".to_vec();
+        let hash = BlobStore::hash(&full);
+        bs.write_incoming_chunk(&hash, 10, full.len() as u64, &full[10..])
+            .unwrap();
+        bs.write_incoming_chunk(&hash, 0, full.len() as u64, &full[..10])
+            .unwrap();
+        assert_eq!(bs.finalize_incoming(&hash).unwrap(), true);
+        assert_eq!(bs.get(&hash).unwrap(), Some(full));
+    }
+
+    #[test]
+    fn finalize_incoming_rejects_content_that_does_not_match_the_hash() {
+        let dir = tempdir().unwrap();
+        let bs = open(&dir);
+        let claimed = BlobStore::hash(b"honest bytes");
+        bs.write_incoming_chunk(&claimed, 0, 4, b"evil").unwrap();
+        assert_eq!(bs.finalize_incoming(&claimed).unwrap(), false);
+        assert!(!bs.has(&claimed));
+    }
+
+    #[test]
+    fn write_incoming_chunk_rejects_a_malicious_hash() {
+        let dir = tempdir().unwrap();
+        let bs = open(&dir);
+
+        for bad in ["../escape", "a/b"] {
+            assert!(matches!(
+                bs.write_incoming_chunk(bad, 0, 4, b"evil"),
+                Err(StorageError::Blob(_))
+            ));
+            assert!(matches!(
+                bs.finalize_incoming(bad),
+                Err(StorageError::Blob(_))
+            ));
+            assert!(matches!(
+                bs.discard_incoming(bad),
+                Err(StorageError::Blob(_))
+            ));
+        }
+
+        // Nothing escaped the temp dir.
+        assert!(!dir.path().join("escape.part").exists());
+        assert!(!dir.path().parent().unwrap().join("escape.part").exists());
+    }
+
+    #[test]
+    fn finalize_incoming_cleans_up_the_part_even_when_the_fallback_write_fails() {
+        let dir = tempdir().unwrap();
+        let bs = open(&dir);
+        let full = b"the quick brown fox".to_vec();
+        let hash = BlobStore::hash(&full);
+        bs.write_incoming_chunk(&hash, 0, full.len() as u64, &full)
+            .unwrap();
+
+        // Make the destination path unwritable by occupying it with a
+        // directory, forcing the fallback copy-write to fail. This does not
+        // exercise the cross-filesystem rename path directly, but confirms
+        // that a failed fallback write still leaves no `.part` behind.
+        let assets = dir.path().join("assets");
+        std::fs::create_dir(assets.join(&hash)).unwrap();
+
+        assert!(bs.finalize_incoming(&hash).is_err());
+        assert!(!assets.join("incoming").join(format!("{hash}.part")).exists());
     }
 }

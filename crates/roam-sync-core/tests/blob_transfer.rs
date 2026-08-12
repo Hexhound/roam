@@ -223,12 +223,22 @@ async fn a_serves_an_active_peers_blob_want() {
 
     let got = tokio::time::timeout(Duration::from_millis(200), b_in.next()).await;
     match got {
-        Ok(Some((from, Frame::BlobData { hash: h, bytes }))) => {
+        Ok(Some((
+            from,
+            Frame::BlobChunk {
+                hash: h,
+                offset,
+                total_len,
+                bytes,
+            },
+        ))) => {
             assert_eq!(from, ia.peer_id());
             assert_eq!(h, hash);
+            assert_eq!(offset, 0);
+            assert_eq!(total_len, payload.len() as u64);
             assert_eq!(bytes, payload);
         }
-        other => panic!("expected BlobData for an active peer, got {other:?}"),
+        other => panic!("expected BlobChunk for an active peer, got {other:?}"),
     }
 }
 

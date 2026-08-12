@@ -39,6 +39,13 @@ pub enum Frame {
     /// The framed `[len][manifest][sealed_ct]` object for a `SnapshotWant`.
     /// Self-authenticating; the receiver verifies Admin sig + ct-hash before adopt.
     SnapshotData { framed: Vec<u8> },
+    /// One chunk of the blob identified by `hash`. `offset` is the byte offset
+    /// of `bytes` within the whole blob; `total_len` is the full blob length,
+    /// repeated in every chunk so the receiver can size the file and detect
+    /// completion without a separate announce frame. The receiver verifies the
+    /// full blob hash only once every byte has landed (poison-safe like the old
+    /// single-frame `BlobData`). Supersedes `BlobData` on the send path.
+    BlobChunk { hash: String, offset: u64, total_len: u64, bytes: Vec<u8> },
 }
 
 impl Frame {
@@ -66,6 +73,7 @@ impl Frame {
             Frame::SnapshotHave { .. } => "SnapshotHave",
             Frame::SnapshotWant { .. } => "SnapshotWant",
             Frame::SnapshotData { .. } => "SnapshotData",
+            Frame::BlobChunk { .. } => "BlobChunk",
         }
     }
 }
@@ -99,6 +107,12 @@ mod tests {
             Frame::BlobData {
                 hash: "cd".repeat(32),
                 bytes: vec![0, 1, 2, 255],
+            },
+            Frame::BlobChunk {
+                hash: "ef".repeat(32),
+                offset: 1_048_576,
+                total_len: 83_886_080,
+                bytes: vec![7, 7, 7, 0, 255],
             },
         ];
         for f in frames {
@@ -137,5 +151,16 @@ mod tests {
         assert_eq!(have.kind(), "SnapshotHave");
         assert_eq!(want.kind(), "SnapshotWant");
         assert_eq!(data.kind(), "SnapshotData");
+    }
+
+    #[test]
+    fn blob_chunk_kind_label() {
+        let f = Frame::BlobChunk {
+            hash: "a".into(),
+            offset: 0,
+            total_len: 0,
+            bytes: vec![],
+        };
+        assert_eq!(f.kind(), "BlobChunk");
     }
 }
