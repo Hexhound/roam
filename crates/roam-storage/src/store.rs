@@ -7,7 +7,9 @@ use crate::keychain::{compute_epoch_id, Keychain, VaultIssue};
 use crate::keylog::{KeyBody, KeyLog, KeyLogEntry, Recipient};
 use crate::keywrap;
 use crate::oplog::OpLog;
-use crate::roster::{merge_roster, PeerRecord, PeerStatus, Role, RosterEntry, RosterLog, RosterOp};
+use crate::roster::{
+    merge_roster, PeerRecord, PeerStatus, Role, RosterEntry, RosterLog, RosterOp, MAX_NAME_LEN,
+};
 use crate::snapshot;
 use crate::text_history::{TextVersion, VersionKind};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
@@ -620,6 +622,28 @@ impl Store {
         let key = self.identity.verifying_key().to_bytes();
         self.own_roster
             .append(&self.identity, RosterOp::Add { role }, me, key)?;
+        self.refresh_peers()
+    }
+
+    /// Set this device's own display name. Self-asserted (no admin needed):
+    /// appends a signed `SetName` to this device's roster log and re-folds. The
+    /// name is orthogonal to privilege — it never affects any peer's role.
+    pub fn set_device_name(&mut self, name: &str) -> Result<(), StorageError> {
+        if name.chars().count() > MAX_NAME_LEN {
+            return Err(StorageError::Peer(format!(
+                "device name exceeds {MAX_NAME_LEN} chars"
+            )));
+        }
+        let me = self.identity.peer_id();
+        let my_key = self.self_key();
+        self.own_roster.append(
+            &self.identity,
+            RosterOp::SetName {
+                name: name.to_string(),
+            },
+            me,
+            my_key,
+        )?;
         self.refresh_peers()
     }
 
