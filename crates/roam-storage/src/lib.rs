@@ -16,6 +16,7 @@ mod oplog;
 mod paper;
 mod roster;
 mod snapshot;
+pub mod snapshot_bootstrap;
 pub mod snapshot_msg;
 mod store;
 mod vault_key;

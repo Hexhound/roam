@@ -286,76 +286,45 @@ async fn import_needed_snapshots<B: Backend>(
         return Ok(());
     }
 
-    // Verifying keys we trust to author a snapshot: ADMIN roster peers only (plus
-    // self iff this device is an Admin). Authoring a snapshot authorizes a future
-    // prune and injects state via an additive `doc.import` that bypasses the
-    // per-op Reader-content-drop rule — so a non-Admin author must never be
-    // adopted, even with a valid self-signature. Producer-side gating is
-    // voluntary; this receiver-side gate is what actually enforces Admin-only.
-    let author_keys: std::collections::HashMap<u64, VerifyingKey> = {
+    // Verifying keys we trust to author a snapshot: ADMIN + Active roster peers
+    // (plus self iff this device is an Admin). The whole verify+adopt gate — the
+    // receiver-side Admin enforcement that stops a non-Admin author from injecting
+    // state via the additive `doc.import` — lives in the shared bootstrap module,
+    // so the backend HTTP loop and the P2P Engine run one identical copy.
+    let author_keys = {
         let guard = store.lock().await;
-        let mut m = std::collections::HashMap::new();
-        for r in guard.roster() {
-            if r.role == Role::Admin {
-                if let Ok(k) = VerifyingKey::from_bytes(&r.verifying_key) {
-                    m.insert(r.peer_id, k);
-                }
-            }
-        }
-        if guard.self_role() == Some(Role::Admin) {
-            if let Ok(k) = VerifyingKey::from_bytes(&guard.identity_verifying_bytes()) {
-                m.insert(guard.peer_id(), k);
-            }
-        }
-        m
+        roam_storage::snapshot_bootstrap::admin_author_keys(&guard)
     };
 
     for id in &need {
         let Some(framed) = backend.get_snapshot(bucket, id).await? else {
             continue;
         };
-        let Some((manifest_json, sealed)) = crate::snapshot_msg::unframe(&framed) else {
-            eprintln!("backend sync: snapshot {id} has a malformed frame; skipping");
-            continue;
-        };
-        let manifest: crate::snapshot_msg::SnapshotManifest =
-            match serde_json::from_slice(manifest_json) {
-                Ok(m) => m,
-                Err(e) => {
-                    eprintln!("backend sync: snapshot {id} manifest parse failed: {e}");
-                    continue;
-                }
-            };
-        // Authority + integrity: signed by a trusted roster author, and the sig
-        // binds exactly these sealed bytes.
-        let Some(vk) = author_keys.get(&manifest.author) else {
-            eprintln!("backend sync: snapshot {id} author not in roster; skipping");
-            continue;
-        };
-        if !manifest.verify(vk) {
-            eprintln!("backend sync: snapshot {id} signature invalid; skipping");
-            continue;
-        }
-        if <[u8; 32]>::from(blake3::hash(sealed)) != manifest.snapshot_ct_hash {
-            eprintln!("backend sync: snapshot {id} ciphertext hash mismatch; skipping");
-            continue;
-        }
-        // Decrypt through the keychain's read rule (may be pending if the epoch
-        // key hasn't arrived; that self-heals next pass).
-        let Some(plaintext) = open_classified(kc, sealed)? else {
-            report.undecryptable += 1;
-            continue;
-        };
-        {
+        let outcome = {
             let mut guard = store.lock().await;
-            guard.adopt_snapshot(&plaintext)?;
-            guard.record_held_snapshot(id, &manifest.subsumed_entry_ids)?;
-        }
-        if debug {
-            eprintln!(
-                "[be-sync]   adopted snapshot {id} subsuming {} entries",
-                manifest.subsumed_entry_ids.len()
-            );
+            roam_storage::snapshot_bootstrap::verify_and_adopt_snapshot(
+                &mut guard,
+                kc,
+                &author_keys,
+                id,
+                &framed,
+            )?
+        };
+        match outcome {
+            roam_storage::snapshot_bootstrap::AdoptOutcome::Adopted { subsumed, .. } => {
+                if debug {
+                    eprintln!(
+                        "[be-sync]   adopted snapshot {id} subsuming {} entries",
+                        subsumed.len()
+                    );
+                }
+            }
+            roam_storage::snapshot_bootstrap::AdoptOutcome::Undecryptable => {
+                report.undecryptable += 1;
+            }
+            roam_storage::snapshot_bootstrap::AdoptOutcome::Rejected(why) => {
+                eprintln!("backend sync: snapshot {id} rejected: {why}");
+            }
         }
     }
     Ok(())
