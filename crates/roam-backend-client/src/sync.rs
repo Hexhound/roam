@@ -637,6 +637,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_produced_bootstrap_snapshot_lets_a_fresh_peer_converge() {
+        std::env::set_var("ROAM_SNAPSHOT_LAG_DAYS", "0");
+        let key = VaultKey([9u8; 32]);
+        let backend = Arc::new(MemoryBackend::default());
+        let a_dir = tempfile::tempdir().unwrap();
+        let b_dir = tempfile::tempdir().unwrap();
+        let a = store_at(a_dir.path()).await;
+        let b = store_at(b_dir.path()).await;
+
+        let (a_peer, a_key) = {
+            let g = a.lock().await;
+            (g.peer_id(), g.identity_verifying_bytes())
+        };
+        let (b_peer, b_key) = {
+            let g = b.lock().await;
+            (g.peer_id(), g.identity_verifying_bytes())
+        };
+        // Mutual roster so B can verify A's snapshot-author signature.
+        a.lock().await.add_peer(b_peer, b_key, Role::Admin).unwrap();
+        b.lock().await.add_peer(a_peer, a_key, Role::Admin).unwrap();
+
+        // A writes, records a marker, then produces a bootstrap snapshot the way the
+        // checkpoint path does — directly, no backend snapshot_wanted, no manual seed.
+        {
+            let mut g = a.lock().await;
+            g.set_entry("files", "note", "hello").unwrap();
+            g.write_snapshot().unwrap();
+        }
+        let (id, framed) = {
+            let g = a.lock().await;
+            produce_held_snapshot(&g, &key, i64::MAX).unwrap().unwrap()
+        };
+
+        // Deliver the produced object to B via the backend object store, then B's
+        // normal reconcile fetches, verifies (Admin sig + ct-hash), and adopts it.
+        // No `set_snapshot_wanted` here: unlike `consumer_fetches_verifies_and_adopts_a_snapshot`,
+        // this snapshot's discovery does not depend on the backend requesting one —
+        // `put_snapshot` alone makes it visible to B's SetKind::Snapshots RBSR reconcile.
+        let bucket = key.bucket_id();
+        backend.put_snapshot(&bucket, &id, framed).await.unwrap();
+        reconcile_once(&b, &backend, &key).await.unwrap();
+
+        assert_eq!(
+            b.lock().await.get_entry("files", "note"),
+            Some("hello".to_string())
+        );
+    }
+
+    #[tokio::test]
     async fn a_non_admin_authored_snapshot_is_never_adopted() {
         // Admin-only authorship is enforced RECEIVER-side: producer gating is
         // voluntary, so a peer must reject a validly-signed snapshot whose author
