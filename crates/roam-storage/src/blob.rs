@@ -202,6 +202,10 @@ impl BlobStore {
         total_len: u64,
         bytes: &[u8],
     ) -> Result<(), StorageError> {
+        if !is_valid_hash(hash) {
+            return Err(StorageError::Blob(format!("invalid blob hash {hash}")));
+        }
+
         let dir = self.incoming_dir();
         std::fs::create_dir_all(&dir)?;
         let part = dir.join(format!("{hash}.part"));
@@ -226,6 +230,10 @@ impl BlobStore {
     /// is discarded rather than ever exposed as a valid blob, matching the
     /// verify-on-read contract [`get`] already enforces for finished blobs.
     pub fn finalize_incoming(&self, hash: &str) -> Result<bool, StorageError> {
+        if !is_valid_hash(hash) {
+            return Err(StorageError::Blob(format!("invalid blob hash {hash}")));
+        }
+
         let part = self.incoming_dir().join(format!("{hash}.part"));
         let bytes = match std::fs::read(&part) {
             Ok(bytes) => bytes,
@@ -245,9 +253,12 @@ impl BlobStore {
             Err(_) => {
                 // Cross-filesystem rename can fail even though the content is
                 // verified good — fall back to a copy-then-remove so the
-                // finished blob still lands.
-                std::fs::write(&final_path, &bytes)?;
+                // finished blob still lands. Always clean up the `.part`,
+                // even if the write itself fails, so a failed fallback never
+                // leaves scratch debris behind.
+                let written = std::fs::write(&final_path, &bytes);
                 let _ = std::fs::remove_file(&part);
+                written?;
                 Ok(true)
             }
         }
@@ -258,6 +269,10 @@ impl BlobStore {
     /// cleanup paths without first checking whether a transfer was ever
     /// in progress.
     pub fn discard_incoming(&self, hash: &str) -> Result<(), StorageError> {
+        if !is_valid_hash(hash) {
+            return Err(StorageError::Blob(format!("invalid blob hash {hash}")));
+        }
+
         let part = self.incoming_dir().join(format!("{hash}.part"));
         match std::fs::remove_file(&part) {
             Ok(()) => Ok(()),
@@ -456,5 +471,50 @@ mod tests {
         bs.write_incoming_chunk(&claimed, 0, 4, b"evil").unwrap();
         assert_eq!(bs.finalize_incoming(&claimed).unwrap(), false);
         assert!(!bs.has(&claimed));
+    }
+
+    #[test]
+    fn write_incoming_chunk_rejects_a_malicious_hash() {
+        let dir = tempdir().unwrap();
+        let bs = open(&dir);
+
+        for bad in ["../escape", "a/b"] {
+            assert!(matches!(
+                bs.write_incoming_chunk(bad, 0, 4, b"evil"),
+                Err(StorageError::Blob(_))
+            ));
+            assert!(matches!(
+                bs.finalize_incoming(bad),
+                Err(StorageError::Blob(_))
+            ));
+            assert!(matches!(
+                bs.discard_incoming(bad),
+                Err(StorageError::Blob(_))
+            ));
+        }
+
+        // Nothing escaped the temp dir.
+        assert!(!dir.path().join("escape.part").exists());
+        assert!(!dir.path().parent().unwrap().join("escape.part").exists());
+    }
+
+    #[test]
+    fn finalize_incoming_cleans_up_the_part_even_when_the_fallback_write_fails() {
+        let dir = tempdir().unwrap();
+        let bs = open(&dir);
+        let full = b"the quick brown fox".to_vec();
+        let hash = BlobStore::hash(&full);
+        bs.write_incoming_chunk(&hash, 0, full.len() as u64, &full)
+            .unwrap();
+
+        // Make the destination path unwritable by occupying it with a
+        // directory, forcing the fallback copy-write to fail. This does not
+        // exercise the cross-filesystem rename path directly, but confirms
+        // that a failed fallback write still leaves no `.part` behind.
+        let assets = dir.path().join("assets");
+        std::fs::create_dir(assets.join(&hash)).unwrap();
+
+        assert!(bs.finalize_incoming(&hash).is_err());
+        assert!(!assets.join("incoming").join(format!("{hash}.part")).exists());
     }
 }
