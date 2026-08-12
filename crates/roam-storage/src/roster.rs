@@ -16,13 +16,20 @@ pub enum Role {
     Admin,
 }
 
+/// Maximum device-name length in unicode chars (authoring boundary rejects longer).
+pub const MAX_NAME_LEN: usize = 64;
+
 /// A membership change under the grant-certificate model. `Add`/`SetRole` carry
 /// the role the author intends for the subject; `Revoke` is terminal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RosterOp {
     Add { role: Role },
     SetRole { role: Role },
     Revoke,
+    /// Self-asserted device name. Valid only when `added_by == subject_peer`.
+    /// Completely orthogonal to privilege: never changes any peer's role,
+    /// `ever_admin` membership, or revocation status.
+    SetName { name: String },
 }
 
 /// One signed roster entry. Signed by `added_by` (an already-trusted device).
@@ -55,16 +62,23 @@ impl RosterEntry {
         let mut buf = Vec::with_capacity(1 + 8 + 2 + 8 + 32 + 8);
         buf.extend_from_slice(b"roam.roster.v2");
         buf.extend_from_slice(&self.seq.to_le_bytes());
-        let (op_tag, role_tag) = match self.op {
-            RosterOp::Add { role } => (0u8, role_byte(role)),
-            RosterOp::SetRole { role } => (2u8, role_byte(role)),
+        let (op_tag, role_tag) = match &self.op {
+            RosterOp::Add { role } => (0u8, role_byte(*role)),
+            RosterOp::SetRole { role } => (2u8, role_byte(*role)),
             RosterOp::Revoke => (1u8, 0xFF),
+            RosterOp::SetName { .. } => (3u8, 0xFF),
         };
         buf.push(op_tag);
         buf.push(role_tag);
         buf.extend_from_slice(&self.subject_peer.to_le_bytes());
         buf.extend_from_slice(&self.subject_key);
         buf.extend_from_slice(&self.added_by.to_le_bytes());
+        // Length-prefixed name AFTER the fixed fields so the name is inside the
+        // signed bytes without disturbing the layout of the privilege-carrying ops.
+        if let RosterOp::SetName { name } = &self.op {
+            buf.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            buf.extend_from_slice(name.as_bytes());
+        }
         buf
     }
 }
@@ -113,7 +127,7 @@ pub fn merge_roster(entries: &mut [RosterEntry], founder: Option<u64>) -> Vec<Pe
         let before = ever_admin.len();
         for e in &valid {
             let grants_admin = matches!(
-                e.op,
+                &e.op,
                 RosterOp::Add { role: Role::Admin } | RosterOp::SetRole { role: Role::Admin }
             );
             if grants_admin && ever_admin.contains(&e.added_by) {
@@ -135,11 +149,12 @@ pub fn merge_roster(entries: &mut [RosterEntry], founder: Option<u64>) -> Vec<Pe
                 }
             })
             .or_insert(e.subject_key);
-        match e.op {
+        match &e.op {
             RosterOp::Revoke => {
                 revoked.insert(e.subject_peer);
             }
             RosterOp::Add { role } | RosterOp::SetRole { role } => {
+                let role = *role;
                 let per = intents.entry(e.subject_peer).or_default();
                 let slot = per.entry(e.added_by).or_insert((0, Role::Reader));
                 match e.seq.cmp(&slot.0) {
@@ -148,6 +163,8 @@ pub fn merge_roster(entries: &mut [RosterEntry], founder: Option<u64>) -> Vec<Pe
                     std::cmp::Ordering::Less => {}
                 }
             }
+            // Names are folded separately (see below); a SetName is never a grant.
+            RosterOp::SetName { .. } => {}
         }
     }
     let mut out: Vec<PeerRecord> = intents
@@ -230,7 +247,7 @@ impl RosterLog {
         let sig = id.sign(&entry.canonical_bytes());
         let line = RosterLine {
             seq: entry.seq,
-            op: entry.op,
+            op: entry.op.clone(),
             subject_peer: entry.subject_peer,
             subject_key: B64.encode(entry.subject_key),
             added_by: entry.added_by,
@@ -744,6 +761,33 @@ mod tests {
         // `other` is not this log's author -> append must refuse.
         let err = log.append(&other, RosterOp::Add { role: Role::Reader }, 7, [0u8; 32]);
         assert!(matches!(err, Err(StorageError::Peer(_))));
+    }
+
+    #[test]
+    fn set_name_is_covered_by_canonical_bytes() {
+        let base = RosterEntry {
+            seq: 1,
+            op: RosterOp::SetName {
+                name: "Sam's laptop".to_string(),
+            },
+            subject_peer: 42,
+            subject_key: [7u8; 32],
+            added_by: 42,
+        };
+        let mut other = base.clone();
+        other.op = RosterOp::SetName {
+            name: "Other name".to_string(),
+        };
+        assert_ne!(
+            base.canonical_bytes(),
+            other.canonical_bytes(),
+            "name must be inside signed bytes"
+        );
+        let add = RosterEntry {
+            op: RosterOp::Add { role: Role::Admin },
+            ..base.clone()
+        };
+        assert_ne!(base.canonical_bytes(), add.canonical_bytes());
     }
 
     #[test]
