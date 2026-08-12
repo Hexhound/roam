@@ -31,6 +31,14 @@ pub enum Frame {
     KeylogHave { authors: Vec<(u64, u64)> },
     /// Signed key-log lines authored by `author` (mirrors RosterOps).
     KeylogOps { author: u64, jsonl: Vec<u8> },
+    /// Snapshot ids the sender holds on disk. Sent in response to a `Have` from
+    /// a peer behind the sender's doc version (P2P snapshot-serving).
+    SnapshotHave { ids: Vec<String> },
+    /// Pull request for one snapshot id the receiver does not already hold.
+    SnapshotWant { id: String },
+    /// The framed `[len][manifest][sealed_ct]` object for a `SnapshotWant`.
+    /// Self-authenticating; the receiver verifies Admin sig + ct-hash before adopt.
+    SnapshotData { framed: Vec<u8> },
 }
 
 impl Frame {
@@ -55,6 +63,9 @@ impl Frame {
             Frame::BlobData { .. } => "BlobData",
             Frame::KeylogHave { .. } => "KeylogHave",
             Frame::KeylogOps { .. } => "KeylogOps",
+            Frame::SnapshotHave { .. } => "SnapshotHave",
+            Frame::SnapshotWant { .. } => "SnapshotWant",
+            Frame::SnapshotData { .. } => "SnapshotData",
         }
     }
 }
@@ -109,5 +120,22 @@ mod tests {
         assert_eq!(Frame::decode(&ops.encode()).unwrap(), ops);
         assert_eq!(have.kind(), "KeylogHave");
         assert_eq!(ops.kind(), "KeylogOps");
+    }
+
+    #[test]
+    fn snapshot_frames_roundtrip_through_postcard() {
+        let have = Frame::SnapshotHave {
+            ids: vec!["a".into(), "b".into()],
+        };
+        assert_eq!(Frame::decode(&have.encode()).unwrap(), have);
+        let want = Frame::SnapshotWant { id: "a".into() };
+        assert_eq!(Frame::decode(&want.encode()).unwrap(), want);
+        let data = Frame::SnapshotData {
+            framed: vec![1, 2, 3, 4],
+        };
+        assert_eq!(Frame::decode(&data.encode()).unwrap(), data);
+        assert_eq!(have.kind(), "SnapshotHave");
+        assert_eq!(want.kind(), "SnapshotWant");
+        assert_eq!(data.kind(), "SnapshotData");
     }
 }

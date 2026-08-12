@@ -656,6 +656,12 @@ impl<T: Transport + 'static> Engine<T> {
                     self.changed.notify_waiters();
                 }
             }
+            // P2P snapshot-serving frames (Task 4 wire types). Serve/adopt logic
+            // lands in Tasks 5/6; these no-op arms exist only to keep the
+            // exhaustive match compiling now that the variants exist.
+            Frame::SnapshotHave { .. } => {}
+            Frame::SnapshotWant { .. } => {}
+            Frame::SnapshotData { .. } => {}
             Frame::Ping => {}
         }
         Ok(())
