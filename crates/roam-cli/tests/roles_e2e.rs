@@ -154,7 +154,13 @@ fn make_device(
 ) -> Device {
     let vault = vault_dir.path().to_path_buf();
     let meta = store_dir.path().join("filemeta");
-    let engine = Arc::new(Engine::new(identity, vault_id, store, Arc::new(transport)));
+    let engine = Arc::new(Engine::new(
+        identity,
+        vault_id,
+        store,
+        Arc::new(transport),
+        [0u8; 32],
+    ));
     Device {
         vault: vault.clone(),
         bridge: FolderBridge::new(&vault, &meta),

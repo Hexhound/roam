@@ -96,13 +96,7 @@ impl Node {
     fn new(board: &MemorySwitchboard, id: &Identity, vault: VaultId, store: Store) -> Self {
         let transport = Arc::new(board.endpoint(id.peer_id()));
         let inbox = transport.incoming();
-        let engine = Arc::new(Engine::new(
-            id.clone(),
-            vault,
-            store,
-            transport,
-            VAULT_KEY,
-        ));
+        let engine = Arc::new(Engine::new(id.clone(), vault, store, transport, VAULT_KEY));
         Node { engine, inbox }
     }
 
@@ -217,7 +211,12 @@ async fn p2p_snapshot_lets_a_lagging_peer_converge_past_a_compaction_frontier() 
     // A answers B's (behind) Have: it pushes its own op-log (truncated!) and
     // advertises its held snapshot. A's responses land in B's inbox.
     a.engine
-        .handle(ib.peer_id(), Frame::Have { doc_version: behind_version.clone() })
+        .handle(
+            ib.peer_id(),
+            Frame::Have {
+                doc_version: behind_version.clone(),
+            },
+        )
         .await
         .unwrap();
     let from_a = drain(&mut b.inbox).await;
@@ -316,7 +315,12 @@ async fn a_writer_relays_an_admin_signed_snapshot_to_a_third_peer_with_no_admin_
     // ---- Phase 1: A serves B; B adopts A's Admin-signed object.
     // A's responses land in B's inbox; B's Want lands in A's inbox.
     a.engine
-        .handle(ib.peer_id(), Frame::Have { doc_version: b_behind })
+        .handle(
+            ib.peer_id(),
+            Frame::Have {
+                doc_version: b_behind,
+            },
+        )
         .await
         .unwrap();
     for (_f, fr) in drain(&mut b.inbox).await {
@@ -338,7 +342,11 @@ async fn a_writer_relays_an_admin_signed_snapshot_to_a_third_peer_with_no_admin_
         !b.held().await.is_empty(),
         "B (Writer) must hold the adopted Admin-signed object for re-serving"
     );
-    assert_eq!(b.entry("a").await.as_deref(), Some("1"), "B must converge to A's state");
+    assert_eq!(
+        b.entry("a").await.as_deref(),
+        Some("1"),
+        "B must converge to A's state"
+    );
 
     // ---- A goes OFFLINE: drop its engine + endpoint. From here only B and C
     // route/exchange frames; A never participates again.
@@ -348,7 +356,12 @@ async fn a_writer_relays_an_admin_signed_snapshot_to_a_third_peer_with_no_admin_
     // Admin-signed object. C verifies A's (original) signature and adopts.
     // B's responses land in C's inbox; C's Want lands in B's inbox.
     b.engine
-        .handle(ic.peer_id(), Frame::Have { doc_version: c_behind })
+        .handle(
+            ic.peer_id(),
+            Frame::Have {
+                doc_version: c_behind,
+            },
+        )
         .await
         .unwrap();
     for (_f, fr) in drain(&mut c.inbox).await {
@@ -421,7 +434,9 @@ async fn a_writer_fabricated_snapshot_is_rejected_by_the_receiver_author_gate() 
         .unwrap();
     let served = drain(&mut c.inbox).await;
     assert!(
-        served.iter().any(|(_f, fr)| matches!(fr, Frame::SnapshotData { .. })),
+        served
+            .iter()
+            .any(|(_f, fr)| matches!(fr, Frame::SnapshotData { .. })),
         "B must actually serve the fabricated object across the wire (else the reject is vacuous)"
     );
     for (_f, fr) in served {

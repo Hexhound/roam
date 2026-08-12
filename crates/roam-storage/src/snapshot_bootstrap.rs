@@ -7,7 +7,7 @@
 //! receiver-side gate is what actually enforces Admin-only authorship.
 use crate::roster::{PeerStatus, Role};
 use crate::snapshot_msg::{unframe, SnapshotManifest};
-use crate::{Keychain, Store, StorageError, VerifyingKey};
+use crate::{Keychain, StorageError, Store, VerifyingKey};
 use std::collections::HashMap;
 
 #[derive(Debug, PartialEq, Eq)]

@@ -149,8 +149,7 @@ async fn have_from_behind_peer_gets_snapshot_advert_then_data() {
     // Among the frames A sent B (push_logs may also send Ops/Log frames), a
     // SnapshotHave advertising the held id must be present.
     let mut saw_advert = false;
-    while let Ok(Some(frame)) =
-        tokio::time::timeout(Duration::from_millis(200), b_in.next()).await
+    while let Ok(Some(frame)) = tokio::time::timeout(Duration::from_millis(200), b_in.next()).await
     {
         if let (_, Frame::SnapshotHave { ids }) = frame {
             assert_eq!(ids, vec!["snap".to_string()]);
@@ -169,8 +168,7 @@ async fn have_from_behind_peer_gets_snapshot_advert_then_data() {
         .unwrap();
 
     let mut saw_data = false;
-    while let Ok(Some(frame)) =
-        tokio::time::timeout(Duration::from_millis(200), b_in.next()).await
+    while let Ok(Some(frame)) = tokio::time::timeout(Duration::from_millis(200), b_in.next()).await
     {
         if let (_, Frame::SnapshotData { framed }) = frame {
             assert_eq!(framed, b"snap-object-bytes".to_vec());

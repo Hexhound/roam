@@ -736,8 +736,7 @@ impl<T: Transport + 'static> Engine<T> {
                 // the change signal (mirrors the `Ops`/`BlobData` arms).
                 let changed = {
                     let mut store = self.store.lock().await;
-                    let (id_key, epoch0_key) =
-                        roam_storage::vault_subkeys(&self.vault_key);
+                    let (id_key, epoch0_key) = roam_storage::vault_subkeys(&self.vault_key);
                     // `keychain` returns an OWNED Keychain (no borrow of `store`),
                     // so we can still take `&mut store` for the adopt below.
                     let kc = match store.keychain(&id_key, &epoch0_key) {
@@ -746,8 +745,7 @@ impl<T: Transport + 'static> Engine<T> {
                         // later delivery once the key material lands.
                         Err(_) => return Ok(()),
                     };
-                    let author_keys =
-                        roam_storage::snapshot_bootstrap::admin_author_keys(&store);
+                    let author_keys = roam_storage::snapshot_bootstrap::admin_author_keys(&store);
                     let before = store.doc_version_bytes();
                     match roam_storage::snapshot_bootstrap::verify_and_adopt_snapshot(
                         &mut store,
@@ -756,9 +754,9 @@ impl<T: Transport + 'static> Engine<T> {
                         &id,
                         &framed,
                     ) {
-                        Ok(roam_storage::snapshot_bootstrap::AdoptOutcome::Adopted {
-                            ..
-                        }) => store.doc_version_bytes() != before,
+                        Ok(roam_storage::snapshot_bootstrap::AdoptOutcome::Adopted { .. }) => {
+                            store.doc_version_bytes() != before
+                        }
                         // Undecryptable / Rejected / error: nothing adopted, nothing
                         // held, no signal. Never crash the engine loop.
                         _ => false,

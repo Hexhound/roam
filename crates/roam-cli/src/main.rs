@@ -478,7 +478,17 @@ async fn setup_engine(vault: &Path, identity_path: &Path) -> Result<Arc<Engine<I
     let transport = IrohTransport::spawn(&identity, routes)
         .await
         .context("spawn iroh transport")?;
-    let engine = Arc::new(Engine::new(identity, vault_id, store, Arc::new(transport)));
+    // The shared vault key (raw 32 bytes) lets the engine decrypt/verify snapshot
+    // objects served over P2P. Same key every device holds (minted at `init`,
+    // received in `pair`); a missing one is a hard error — the vault can't sync.
+    let vault_key = load_vault_key(vault)?;
+    let engine = Arc::new(Engine::new(
+        identity,
+        vault_id,
+        store,
+        Arc::new(transport),
+        vault_key,
+    ));
     tokio::spawn(engine.clone().run());
 
     // Connect in the BACKGROUND: an unreachable peer's dial blocks ~15s (iroh's

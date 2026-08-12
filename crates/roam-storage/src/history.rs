@@ -74,7 +74,7 @@ impl HistoryIndex {
 
     /// The newest marker with `ts_ms <= ts`, or `None` if none qualify.
     pub fn marker_before(&self, ts: i64) -> Result<Option<Marker>, StorageError> {
-        Ok(self.markers()?.into_iter().filter(|m| m.ts_ms <= ts).last())
+        Ok(self.markers()?.into_iter().rfind(|m| m.ts_ms <= ts))
     }
 
     /// The most recent marker, or `None`.

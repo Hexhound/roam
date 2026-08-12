@@ -11,8 +11,8 @@
 //! before trusting a prune — that an authorized author produced exactly this
 //! artifact.
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64URL, Engine};
 use crate::{Identity, VerifyingKey};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64URL, Engine};
 use serde::{Deserialize, Serialize};
 
 /// Domain separator so a snapshot-manifest signature can never be replayed as a

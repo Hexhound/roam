@@ -235,11 +235,11 @@ impl Store {
         // founder's log proves its key: its self-`Add` carries the founder key, and
         // the peer-id binding (`fid == first-8-LE-bytes(key)`) prevents a swap.
         if let Some(fid) = founder {
-            if !trusted.contains_key(&fid) {
+            if let std::collections::hash_map::Entry::Vacant(entry) = trusted.entry(fid) {
                 let flog = RosterLog::new(&roster_dir, fid);
                 if let Some(fkey) = flog.peek_self_key()? {
                     if derived_peer_id(&fkey) == fid {
-                        trusted.insert(fid, fkey);
+                        entry.insert(fkey);
                     }
                 }
             }
@@ -1270,7 +1270,7 @@ impl Store {
         // (`referenced_hashes` also unions the latest state, which can only
         // over-retain a blob, never orphan one still in use — safe.)
         let mut blob_refs: Vec<String> = self
-            .referenced_hashes(&[target.frontier.clone()])?
+            .referenced_hashes(std::slice::from_ref(&target.frontier))?
             .into_iter()
             .collect();
         blob_refs.sort();
@@ -2941,8 +2941,14 @@ mod tests {
         assert!(store.held_snapshot_ids().unwrap().is_empty());
         store.persist_snapshot_object("snap-1", &framed).unwrap();
 
-        assert_eq!(store.held_snapshot_ids().unwrap(), vec!["snap-1".to_string()]);
-        assert_eq!(store.load_snapshot_object("snap-1").unwrap(), Some(framed.clone()));
+        assert_eq!(
+            store.held_snapshot_ids().unwrap(),
+            vec!["snap-1".to_string()]
+        );
+        assert_eq!(
+            store.load_snapshot_object("snap-1").unwrap(),
+            Some(framed.clone())
+        );
         assert_eq!(store.load_snapshot_object("missing").unwrap(), None);
 
         store.drop_snapshot("snap-1").unwrap();
@@ -2954,7 +2960,9 @@ mod tests {
     fn held_snapshot_ids_ignores_sidecars_and_tmp() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path(), Identity::generate()).unwrap();
-        store.persist_snapshot_object("real", b"\x00\x00\x00\x00").unwrap();
+        store
+            .persist_snapshot_object("real", b"\x00\x00\x00\x00")
+            .unwrap();
         // Sidecars that share the snapshots/ dir must never be listed as objects.
         let snapdir = dir.path().join("snapshots");
         std::fs::write(snapdir.join("snapshot.loro"), b"x").unwrap();

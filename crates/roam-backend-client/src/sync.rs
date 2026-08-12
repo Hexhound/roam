@@ -385,7 +385,7 @@ async fn maybe_produce_snapshot<B: Backend>(
     // default lag the head marker is intentionally excluded, leaving a replayable
     // tail; lag 0 (tests) snapshots at head.
     let snap = {
-        let mut guard = store.lock().await;
+        let guard = store.lock().await;
         guard.write_snapshot()?;
         let before_ts = now_ms().saturating_sub(retention_lag_ms());
         guard.build_backend_snapshot(before_ts)?
@@ -442,6 +442,7 @@ async fn maybe_produce_snapshot<B: Backend>(
 /// [`Store::dedup_append_peer_line`] — which re-imports the whole log each
 /// time, so Loro buffers any op whose dependency hasn't landed yet and
 /// converges once it does, regardless of fetch order.
+#[allow(clippy::too_many_arguments)]
 async fn import_needed_entries<B: Backend>(
     store: &Arc<Mutex<Store>>,
     backend: &Arc<B>,
