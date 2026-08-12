@@ -280,6 +280,7 @@ mod tests {
             verifying_key: key,
             status,
             role: crate::roster::Role::Admin,
+            name: None,
         }
     }
 

@@ -23,13 +23,19 @@ pub const MAX_NAME_LEN: usize = 64;
 /// the role the author intends for the subject; `Revoke` is terminal.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RosterOp {
-    Add { role: Role },
-    SetRole { role: Role },
+    Add {
+        role: Role,
+    },
+    SetRole {
+        role: Role,
+    },
     Revoke,
     /// Self-asserted device name. Valid only when `added_by == subject_peer`.
     /// Completely orthogonal to privilege: never changes any peer's role,
     /// `ever_admin` membership, or revocation status.
-    SetName { name: String },
+    SetName {
+        name: String,
+    },
 }
 
 /// One signed roster entry. Signed by `added_by` (an already-trusted device).
@@ -106,6 +112,9 @@ pub struct PeerRecord {
     pub verifying_key: [u8; 32],
     pub status: PeerStatus,
     pub role: Role,
+    /// Self-asserted display name (highest-seq `SetName` authored by the peer
+    /// itself), or `None`. Folded independently of privilege.
+    pub name: Option<String>,
 }
 
 /// Fold a set of signed roster entries into the current peer set using the
@@ -167,6 +176,24 @@ pub fn merge_roster(entries: &mut [RosterEntry], founder: Option<u64>) -> Vec<Pe
             RosterOp::SetName { .. } => {}
         }
     }
+    // Self-asserted device names. Folded ENTIRELY separately from the privilege
+    // logic above: this pass never touches `ever_admin`, `revoked`, or `intents`,
+    // so a SetName can NEVER change any peer's role, status, or revocation. It runs
+    // over the same key-derivation-validated entries, but is gated ONLY on
+    // `added_by == subject_peer` (a name is authoritative solely for oneself);
+    // highest-seq wins.
+    let mut names: BTreeMap<u64, (u64, String)> = BTreeMap::new();
+    for e in &valid {
+        if let RosterOp::SetName { name } = &e.op {
+            if e.added_by != e.subject_peer {
+                continue; // foreign name — a device may only name itself
+            }
+            let slot = names.entry(e.subject_peer).or_insert((0, String::new()));
+            if e.seq >= slot.0 {
+                *slot = (e.seq, name.clone());
+            }
+        }
+    }
     let mut out: Vec<PeerRecord> = intents
         .iter()
         .map(|(subject, per_author)| {
@@ -185,6 +212,7 @@ pub fn merge_roster(entries: &mut [RosterEntry], founder: Option<u64>) -> Vec<Pe
                 verifying_key: keys[subject],
                 status,
                 role,
+                name: names.get(subject).map(|(_, n)| n.clone()),
             }
         })
         .collect();
@@ -761,6 +789,87 @@ mod tests {
         // `other` is not this log's author -> append must refuse.
         let err = log.append(&other, RosterOp::Add { role: Role::Reader }, 7, [0u8; 32]);
         assert!(matches!(err, Err(StorageError::Peer(_))));
+    }
+
+    /// A key whose first 8 little-endian bytes equal `peer`, so the
+    /// key-derivation validity filter in `merge_roster` accepts entries for it.
+    fn key_for(peer: u64) -> [u8; 32] {
+        let mut key = [0u8; 32];
+        key[0..8].copy_from_slice(&peer.to_le_bytes());
+        key
+    }
+
+    fn entry(
+        seq: u64,
+        op: RosterOp,
+        subject_peer: u64,
+        subject_key: [u8; 32],
+        added_by: u64,
+    ) -> RosterEntry {
+        RosterEntry {
+            seq,
+            op,
+            subject_peer,
+            subject_key,
+            added_by,
+        }
+    }
+
+    #[test]
+    fn set_name_folds_onto_peer_and_latest_wins() {
+        let key1 = key_for(1);
+        let mut entries = vec![
+            entry(1, RosterOp::Add { role: Role::Admin }, 1, key1, 1),
+            entry(2, RosterOp::SetName { name: "old".into() }, 1, key1, 1),
+            entry(3, RosterOp::SetName { name: "new".into() }, 1, key1, 1),
+        ];
+        let peers = merge_roster(&mut entries, Some(1));
+        let me = peers.iter().find(|p| p.peer_id == 1).unwrap();
+        assert_eq!(me.name.as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn foreign_set_name_is_ignored_and_privilege_unchanged() {
+        let key1 = key_for(1);
+        let key2 = key_for(2);
+        // entry #3: subject_peer=2 (matches key2, so it PASSES the validity filter),
+        // but added_by=1 (foreign author). ONLY the fold's `added_by == subject_peer`
+        // gate can drop it — the validity filter does not, which is what makes this a
+        // genuine test of the self-only rule (not the key-derivation filter).
+        let mut with_foreign = vec![
+            entry(1, RosterOp::Add { role: Role::Admin }, 1, key1, 1),
+            entry(2, RosterOp::Add { role: Role::Writer }, 2, key2, 1),
+            entry(
+                3,
+                RosterOp::SetName {
+                    name: "hacked".into(),
+                },
+                2,
+                key2,
+                1,
+            ),
+        ];
+        let mut without = vec![
+            entry(1, RosterOp::Add { role: Role::Admin }, 1, key1, 1),
+            entry(2, RosterOp::Add { role: Role::Writer }, 2, key2, 1),
+        ];
+        let a = merge_roster(&mut with_foreign, Some(1));
+        let b = merge_roster(&mut without, Some(1));
+        assert_eq!(
+            a.iter().find(|p| p.peer_id == 2).unwrap().name,
+            None,
+            "a name whose author != subject must never land"
+        );
+        let roles = |v: &[PeerRecord]| {
+            v.iter()
+                .map(|p| (p.peer_id, p.role, p.status))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            roles(&a),
+            roles(&b),
+            "SetName must not change any role/status"
+        );
     }
 
     #[test]
