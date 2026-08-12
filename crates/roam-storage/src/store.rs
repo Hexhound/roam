@@ -1323,6 +1323,84 @@ impl Store {
         Ok(out)
     }
 
+    /// Persist the signed framed snapshot object (`[len][manifest][sealed_ct]`)
+    /// so this device can re-serve it to peers (snapshots gossip like blobs).
+    /// Atomic: write to `<id>.tmp` then rename. Idempotent overwrite.
+    pub fn persist_snapshot_object(&self, id: &str, framed: &[u8]) -> Result<(), StorageError> {
+        let dir = self.root.join("snapshots");
+        std::fs::create_dir_all(&dir)?;
+        let tmp = dir.join(format!("{id}.tmp"));
+        std::fs::write(&tmp, framed)?;
+        std::fs::rename(&tmp, dir.join(id))?;
+        Ok(())
+    }
+
+    /// Ids of the framed snapshot objects this device holds on disk. Excludes the
+    /// plaintext fast-load base (`snapshot.loro`), the held-metadata sidecar
+    /// (`held.jsonl`), and any in-flight `.tmp`.
+    pub fn held_snapshot_ids(&self) -> Result<Vec<String>, StorageError> {
+        let dir = self.root.join("snapshots");
+        let names = match std::fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut out = Vec::new();
+        for ent in names {
+            let ent = ent?;
+            let name = ent.file_name().to_string_lossy().into_owned();
+            if name == "snapshot.loro" || name == "held.jsonl" || name.ends_with(".tmp") {
+                continue;
+            }
+            out.push(name);
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    /// Read the framed snapshot object for `id`, or `None` if not held.
+    pub fn load_snapshot_object(&self, id: &str) -> Result<Option<Vec<u8>>, StorageError> {
+        let path = self.root.join("snapshots").join(id);
+        match std::fs::read(&path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Remove a held snapshot object + its `held.jsonl` metadata line. Mechanism
+    /// for client-side GC; the library never calls this as policy. Missing = Ok.
+    pub fn drop_snapshot(&self, id: &str) -> Result<(), StorageError> {
+        let path = self.root.join("snapshots").join(id);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        // Rewrite held.jsonl without the dropped id.
+        let kept: Vec<HeldSnapshot> = self
+            .held_snapshots()?
+            .into_iter()
+            .filter(|h| h.id != id)
+            .collect();
+        let held_path = self.root.join("snapshots").join("held.jsonl");
+        if kept.is_empty() {
+            match std::fs::remove_file(&held_path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        } else {
+            let mut buf = Vec::new();
+            for h in &kept {
+                buf.extend_from_slice(&serde_json::to_vec(h)?);
+                buf.push(b'\n');
+            }
+            std::fs::write(&held_path, buf)?;
+        }
+        Ok(())
+    }
+
     /// Adopt a snapshot received from a peer or the backend. **Additive**: it
     /// merges the snapshot's state into the live doc and NEVER truncates this
     /// device's op-logs. A device can therefore only ever "lose" history it never
@@ -2852,5 +2930,36 @@ mod tests {
 
         // The good state still reads back — no collateral damage.
         assert_eq!(s.get_entry("files", "k"), Some("good".to_string()));
+    }
+
+    #[test]
+    fn snapshot_object_persist_list_load_drop_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), Identity::generate()).unwrap();
+        let framed = b"\x03\x00\x00\x00{}xyz".to_vec(); // len=3 manifest "{}" + body — shape only
+
+        assert!(store.held_snapshot_ids().unwrap().is_empty());
+        store.persist_snapshot_object("snap-1", &framed).unwrap();
+
+        assert_eq!(store.held_snapshot_ids().unwrap(), vec!["snap-1".to_string()]);
+        assert_eq!(store.load_snapshot_object("snap-1").unwrap(), Some(framed.clone()));
+        assert_eq!(store.load_snapshot_object("missing").unwrap(), None);
+
+        store.drop_snapshot("snap-1").unwrap();
+        assert!(store.held_snapshot_ids().unwrap().is_empty());
+        assert_eq!(store.load_snapshot_object("snap-1").unwrap(), None);
+    }
+
+    #[test]
+    fn held_snapshot_ids_ignores_sidecars_and_tmp() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), Identity::generate()).unwrap();
+        store.persist_snapshot_object("real", b"\x00\x00\x00\x00").unwrap();
+        // Sidecars that share the snapshots/ dir must never be listed as objects.
+        let snapdir = dir.path().join("snapshots");
+        std::fs::write(snapdir.join("snapshot.loro"), b"x").unwrap();
+        std::fs::write(snapdir.join("held.jsonl"), b"x").unwrap();
+        std::fs::write(snapdir.join("real.tmp"), b"x").unwrap();
+        assert_eq!(store.held_snapshot_ids().unwrap(), vec!["real".to_string()]);
     }
 }
