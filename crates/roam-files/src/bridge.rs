@@ -59,6 +59,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use roam_crdt::Frontier;
 use roam_storage::{version_dominates, Store};
 
 use crate::error::FilesError;
@@ -1273,6 +1274,24 @@ impl FolderBridge {
         // Always a blob here (non-blob early-returned NoBlobHistory above), so
         // project the stored bytes rather than the (empty) text container.
         self.project_blob(store, file, &live.content_hash)
+    }
+
+    /// Non-destructively revert a TEXT file to an earlier version (by frontier,
+    /// obtained from `Store::text_history`). Authors new ops that re-shape the
+    /// content, then re-projects the file to disk. Refuses if this device may
+    /// not write. Blobs are out of scope — use `restore_blob_version`.
+    pub fn revert_file(
+        &self,
+        store: &mut Store,
+        file: &Path,
+        target: &Frontier,
+    ) -> Result<SyncOutcome, FilesError> {
+        if !store.may_write() {
+            return Err(FilesError::ReadOnly);
+        }
+        let container = container_id(&self.vault_root, file)?;
+        store.revert_text(&container, target)?;
+        self.project_file(store, file)
     }
 }
 
@@ -3651,7 +3670,9 @@ mod tests {
         bridge.delete_file(&mut store, &file).unwrap();
         assert!(!file.exists());
 
-        let outcomes = bridge.restore_paths(&mut store, &[file.clone()]).unwrap();
+        let outcomes = bridge
+            .restore_paths(&mut store, std::slice::from_ref(&file))
+            .unwrap();
         assert_eq!(outcomes.len(), 1);
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "precious");
     }

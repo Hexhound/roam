@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 roam-storage = { path = "../roam-storage" }
+roam-crdt = { path = "../roam-crdt" }
 thiserror.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
@@ -21,3 +22,6 @@ tempfile.workspace = true
 # convergence test merges exported oplogs through the public `Store` API that
 # `FolderBridge::store()` hands back.
 roam-storage = { path = "../roam-storage" }
+# `revert_file` takes a `Frontier` (obtained from `Store::text_history`); the
+# text-revert integration test names that type and `Frontier::empty()` directly.
+roam-crdt = { path = "../roam-crdt" }
