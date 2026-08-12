@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 roam-storage = { path = "../roam-storage" }
+roam-crdt = { path = "../roam-crdt" }
 roam-sync-core = { path = "../roam-sync-core" }
 roam-transport-iroh = { path = "../roam-transport-iroh" }
 roam-files = { path = "../roam-files" }

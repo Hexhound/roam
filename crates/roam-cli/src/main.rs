@@ -165,6 +165,28 @@ enum Command {
         #[arg(long)]
         key: String,
     },
+    /// List a text file's version history (newest first), with an index per row.
+    TextHistory {
+        #[arg(long)]
+        vault: PathBuf,
+        #[arg(long)]
+        identity: PathBuf,
+        #[arg(long)]
+        folder: PathBuf,
+        path: PathBuf,
+    },
+    /// Revert a text file to a listed version by its `text-history` index.
+    Revert {
+        #[arg(long)]
+        vault: PathBuf,
+        #[arg(long)]
+        identity: PathBuf,
+        #[arg(long)]
+        folder: PathBuf,
+        path: PathBuf,
+        #[arg(long)]
+        to: usize,
+    },
 }
 
 #[tokio::main]
@@ -217,6 +239,19 @@ async fn main() -> Result<()> {
             role,
             key,
         } => grant(&vault, &identity, peer, &role, &key).await,
+        Command::TextHistory {
+            vault,
+            identity,
+            folder,
+            path,
+        } => text_history(&vault, &identity, &folder, &path).await,
+        Command::Revert {
+            vault,
+            identity,
+            folder,
+            path,
+            to,
+        } => revert(&vault, &identity, &folder, &path, to).await,
     }
 }
 
@@ -1180,6 +1215,87 @@ async fn grant(
         .context("set role")?;
     println!("granted peer {peer} role {role}");
     Ok(())
+}
+
+/// List a text file's version history, newest-first, one row per version:
+/// `INDEX \t TS_MS \t KIND \t AUTHOR \t DIFF-SUMMARY`. The INDEX is stable within
+/// this listing; `revert --to <INDEX>` recomputes the same list and maps the index
+/// back to its frontier (frontiers never leave the process).
+async fn text_history(
+    vault: &Path,
+    identity_path: &Path,
+    folder: &Path,
+    path: &Path,
+) -> anyhow::Result<()> {
+    let identity = Identity::load(identity_path).context("load identity")?;
+    let store = Store::open(vault, identity).context("open vault store")?;
+    let container = roam_files::container_id(folder, path).context("resolve container id")?;
+    let versions = store
+        .text_history(&container)
+        .context("read text history")?;
+    for (i, v) in versions.iter().enumerate() {
+        let who = v
+            .author_key
+            .map(|k| short_id(&k))
+            .unwrap_or_else(|| format!("peer:{}", v.author_peer));
+        println!(
+            "{i}\t{ts}\t{kind:?}\t{who}\t{summary}",
+            ts = v.ts_ms,
+            kind = v.kind,
+            summary = diff_summary(&v.diff),
+        );
+    }
+    Ok(())
+}
+
+/// Revert a text file to the version at `to` in its `text-history` listing. The
+/// index→frontier mapping is recomputed here (identical ordering to
+/// `text-history`), so only the small integer index crosses the CLI boundary. The
+/// revert is write-gated by the bridge and persisted before returning.
+async fn revert(
+    vault: &Path,
+    identity_path: &Path,
+    folder: &Path,
+    path: &Path,
+    to: usize,
+) -> anyhow::Result<()> {
+    let identity = Identity::load(identity_path).context("load identity")?;
+    let mut store = Store::open(vault, identity).context("open vault store")?;
+    let bridge = FolderBridge::new(folder, &vault.join("filemeta"));
+    let container = roam_files::container_id(folder, path).context("resolve container id")?;
+    let versions = store
+        .text_history(&container)
+        .context("read text history")?;
+    let target = versions
+        .get(to)
+        .ok_or_else(|| anyhow::anyhow!("no version at index {to}"))?
+        .frontier
+        .clone();
+    bridge
+        .revert_file(&mut store, path, &target)
+        .context("revert file")?;
+    store.write_snapshot().context("persist after revert")?;
+    println!("reverted {} to version {}", path.display(), to);
+    Ok(())
+}
+
+/// Short, human display id for a device key: first 4 bytes hex.
+fn short_id(key: &[u8; 32]) -> String {
+    format!("{:02x}{:02x}{:02x}{:02x}", key[0], key[1], key[2], key[3])
+}
+
+/// One-line diff summary: total inserted/deleted char counts (`+INS -DEL`).
+fn diff_summary(diff: &roam_crdt::TextDiff) -> String {
+    let mut ins = 0usize;
+    let mut del = 0usize;
+    for s in &diff.spans {
+        match s {
+            roam_crdt::TextSpan::Insert(t) => ins += t.chars().count(),
+            roam_crdt::TextSpan::Delete(n) => del += *n,
+            roam_crdt::TextSpan::Retain(_) => {}
+        }
+    }
+    format!("+{ins} -{del}")
 }
 
 #[cfg(test)]
