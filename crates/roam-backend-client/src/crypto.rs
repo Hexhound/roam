@@ -2,18 +2,12 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64URL, Engine};
 use chacha20poly1305::aead::{Aead, KeyInit, OsRng};
 use chacha20poly1305::{AeadCore, XChaCha20Poly1305, XNonce};
 
+pub use roam_storage::epoch_crypto::{open_epoch, seal_epoch, CryptoError};
+
 /// 256-bit symmetric vault key. Shared across a vault's devices; never sent to
 /// the backend. Derives all opaque ids and seals/opens all payloads.
 #[derive(Clone)]
 pub struct VaultKey(pub [u8; 32]);
-
-#[derive(Debug, thiserror::Error)]
-pub enum CryptoError {
-    #[error("ciphertext too short")]
-    Short,
-    #[error("aead open failed")]
-    Open,
-}
 
 impl VaultKey {
     /// Independent subkey for opaque id derivation (keyed BLAKE3). Derived via
@@ -116,33 +110,6 @@ impl VaultKey {
         let nonce = XNonce::from_slice(nonce_bytes);
         cipher.decrypt(nonce, ct).map_err(|_| CryptoError::Open)
     }
-}
-
-/// Seal `plaintext` under an explicit epoch key, tagging the output with
-/// `epoch_id`: returns `epoch_id(32) || nonce(24) || ct`. Callers writing under
-/// epoch 0 use [`VaultKey::seal`] instead (untagged, legacy-compatible).
-pub fn seal_epoch(epoch_key: &[u8; 32], epoch_id: &[u8; 32], plaintext: &[u8]) -> Vec<u8> {
-    let cipher = XChaCha20Poly1305::new(epoch_key.into());
-    let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
-    let mut out = Vec::with_capacity(32 + 24 + plaintext.len() + 16);
-    out.extend_from_slice(epoch_id);
-    out.extend_from_slice(&nonce);
-    let ct = cipher.encrypt(&nonce, plaintext).expect("aead encrypt");
-    out.extend_from_slice(&ct);
-    out
-}
-
-/// Open a `nonce(24) || ct` body (the epoch tag, if any, already stripped by the
-/// caller via the keychain's `ReadPlan.body_offset`) under `epoch_key`.
-pub fn open_epoch(epoch_key: &[u8; 32], body: &[u8]) -> Result<Vec<u8>, CryptoError> {
-    if body.len() < 24 {
-        return Err(CryptoError::Short);
-    }
-    let (nonce_bytes, ct) = body.split_at(24);
-    let cipher = XChaCha20Poly1305::new(epoch_key.into());
-    cipher
-        .decrypt(XNonce::from_slice(nonce_bytes), ct)
-        .map_err(|_| CryptoError::Open)
 }
 
 #[cfg(test)]

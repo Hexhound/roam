@@ -12,7 +12,7 @@
 //! artifact.
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64URL, Engine};
-use roam_storage::{Identity, VerifyingKey};
+use crate::{Identity, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
 /// Domain separator so a snapshot-manifest signature can never be replayed as a

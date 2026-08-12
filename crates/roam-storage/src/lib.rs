@@ -2,6 +2,7 @@
 
 mod blob;
 pub mod checkpoint;
+pub mod epoch_crypto;
 mod error;
 mod founder;
 mod history;
@@ -15,6 +16,7 @@ mod oplog;
 mod paper;
 mod roster;
 mod snapshot;
+pub mod snapshot_msg;
 mod store;
 mod vault_key;
 
