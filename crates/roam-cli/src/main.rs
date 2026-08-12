@@ -175,6 +175,14 @@ enum Command {
         folder: PathBuf,
         path: PathBuf,
     },
+    /// Set this device's display name (self-asserted, gossips with the roster).
+    SetName {
+        #[arg(long)]
+        vault: PathBuf,
+        #[arg(long)]
+        identity: PathBuf,
+        name: String,
+    },
     /// Revert a text file to a listed version by its `text-history` index.
     Revert {
         #[arg(long)]
@@ -245,6 +253,11 @@ async fn main() -> Result<()> {
             folder,
             path,
         } => text_history(&vault, &identity, &folder, &path).await,
+        Command::SetName {
+            vault,
+            identity,
+            name,
+        } => set_name(&vault, &identity, &name).await,
         Command::Revert {
             vault,
             identity,
@@ -1012,7 +1025,11 @@ async fn status(vault: &Path, identity_path: Option<PathBuf>) -> Result<()> {
             PeerStatus::Revoked => "revoked",
         };
         let role = format!("{:?}", peer.role).to_lowercase();
-        println!("  peer {} [{}] role={}", peer.peer_id, status, role);
+        let name = peer.name.as_deref().unwrap_or("—");
+        println!(
+            "  peer {} [{}] role={} name={}",
+            peer.peer_id, status, role, name
+        );
     }
     println!("note: {} bytes", store.text("note").len());
     println!("doc version: {} bytes", store.doc_version_bytes().len());
@@ -1217,6 +1234,18 @@ async fn grant(
     Ok(())
 }
 
+/// Set this device's display name (self-asserted). The name is folded into this
+/// device's own `PeerRecord` and gossips with the roster; it is advisory (a
+/// device only ever names itself). Persisted with `write_snapshot`.
+async fn set_name(vault: &Path, identity_path: &Path, name: &str) -> anyhow::Result<()> {
+    let identity = Identity::load(identity_path).context("load identity")?;
+    let mut store = Store::open(vault, identity).context("open vault store")?;
+    store.set_device_name(name).context("set device name")?;
+    store.write_snapshot().context("persist device name")?;
+    println!("device name set to {name:?}");
+    Ok(())
+}
+
 /// List a text file's version history, newest-first, one row per version:
 /// `INDEX \t TS_MS \t KIND \t AUTHOR \t DIFF-SUMMARY`. The INDEX is stable within
 /// this listing; `revert --to <INDEX>` recomputes the same list and maps the index
@@ -1233,11 +1262,19 @@ async fn text_history(
     let versions = store
         .text_history(&container)
         .context("read text history")?;
+    // Prefer the self-asserted device name for the author column: build a
+    // peer_id→name map from the roster once, before the row loop.
+    let names: std::collections::HashMap<u64, String> = store
+        .roster()
+        .into_iter()
+        .filter_map(|p| p.name.map(|n| (p.peer_id, n)))
+        .collect();
     for (i, v) in versions.iter().enumerate() {
-        let who = v
-            .author_key
-            .map(|k| short_id(&k))
-            .unwrap_or_else(|| format!("peer:{}", v.author_peer));
+        let who = match (names.get(&v.author_peer), v.author_key) {
+            (Some(n), Some(k)) => format!("{n} · {}", short_id(&k)),
+            (None, Some(k)) => short_id(&k),
+            _ => format!("peer:{}", v.author_peer),
+        };
         println!(
             "{i}\t{ts}\t{kind:?}\t{who}\t{summary}",
             ts = v.ts_ms,
