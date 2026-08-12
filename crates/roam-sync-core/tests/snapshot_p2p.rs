@@ -3,15 +3,15 @@
 //!
 //!  1. `p2p_snapshot_lets_a_lagging_peer_converge_past_a_compaction_frontier`
 //!     — a real compaction-frontier stall: A checkpoints so its own op-log is
-//!       truncated; a fresh peer replaying only those Ops does NOT converge
-//!       (PART 1 inequality), then the snapshot negotiation makes it converge
-//!       (PART 2).
+//!     truncated; a fresh peer replaying only those Ops does NOT converge
+//!     (PART 1 inequality), then the snapshot negotiation makes it converge
+//!     (PART 2).
 //!  2. `a_writer_relays_an_admin_signed_snapshot_to_a_third_peer_with_no_admin_online`
 //!     — model A: a non-Admin holder (B) re-serves an Admin-signed object to C
-//!       while the original Admin (A) is offline; C still verifies A's signature.
+//!     while the original Admin (A) is offline; C still verifies A's signature.
 //!  3. `a_writer_fabricated_snapshot_is_rejected_by_the_receiver_author_gate`
 //!     — a Writer's well-formed, self-signed, decryptable object is rejected by
-//!       the receiver-side Admin-author gate, across the wire.
+//!     the receiver-side Admin-author gate, across the wire.
 //!
 //! Drive style mirrors `read_gate.rs`: each engine keeps its endpoint so we can
 //! both observe frames it sends (`incoming()`) and hand-deliver frames to it
