@@ -59,9 +59,9 @@ pub struct Engine<T: Transport> {
     /// Raw 32-byte vault key, held so the adopt path can derive subkeys and
     /// build a Keychain to decrypt a received snapshot's sealed body. P2P never
     /// PRODUCES snapshots, so no producer-side key material is needed.
-    // Read by the adopt path in Task 6; held here now so `Engine::new` carries
-    // the key material from the moment the engine is constructed.
-    #[allow(dead_code)]
+    // Read by the adopt path (`Frame::SnapshotData`) to derive the vault
+    // subkeys + build a Keychain that decrypts a received snapshot's sealed body;
+    // held here so `Engine::new` carries the key material from construction.
     vault_key: [u8; 32],
 }
 
@@ -714,7 +714,63 @@ impl<T: Transport + 'static> Engine<T> {
                     self.send(peer, Frame::SnapshotData { framed }).await;
                 }
             }
-            Frame::SnapshotData { .. } => {} // Task 6 replaces this with the adopt arm.
+            Frame::SnapshotData { framed } => {
+                // Read-side revoke gate: only accept a snapshot object from a peer
+                // we currently vouch for as Active. (The Admin-AUTHOR gate is
+                // enforced separately, receiver-side, inside
+                // `verify_and_adopt_snapshot`.)
+                if !self.is_active(peer).await {
+                    return Ok(());
+                }
+                // Content-addressed id: name the object by OUR OWN hash of the
+                // framed bytes, so what we persist is exactly what we later
+                // advertise (`SnapshotHave`) and re-serve (`SnapshotWant`). Dedup
+                // is "do I already hold THIS id". `BlobStore::hash` is the same
+                // blake3-hex convention used everywhere else in roam, and — unlike
+                // the backend path's frontier-digest id — needs no vault key, so it
+                // works purely from production deps. Both are opaque ids.
+                let id = BlobStore::hash(&framed);
+                // Adopt under the store lock; note whether the document actually
+                // advanced (a Rejected/Undecryptable outcome mutates nothing).
+                // Compare doc versions under the lock, DROP the guard before firing
+                // the change signal (mirrors the `Ops`/`BlobData` arms).
+                let changed = {
+                    let mut store = self.store.lock().await;
+                    let (id_key, epoch0_key) =
+                        roam_storage::vault_subkeys(&self.vault_key);
+                    // `keychain` returns an OWNED Keychain (no borrow of `store`),
+                    // so we can still take `&mut store` for the adopt below.
+                    let kc = match store.keychain(&id_key, &epoch0_key) {
+                        Ok(kc) => kc,
+                        // Keylog can't yet build a keychain: drop, self-heals on a
+                        // later delivery once the key material lands.
+                        Err(_) => return Ok(()),
+                    };
+                    let author_keys =
+                        roam_storage::snapshot_bootstrap::admin_author_keys(&store);
+                    let before = store.doc_version_bytes();
+                    match roam_storage::snapshot_bootstrap::verify_and_adopt_snapshot(
+                        &mut store,
+                        &kc,
+                        &author_keys,
+                        &id,
+                        &framed,
+                    ) {
+                        Ok(roam_storage::snapshot_bootstrap::AdoptOutcome::Adopted {
+                            ..
+                        }) => store.doc_version_bytes() != before,
+                        // Undecryptable / Rejected / error: nothing adopted, nothing
+                        // held, no signal. Never crash the engine loop.
+                        _ => false,
+                    }
+                };
+                // Fire the remote-change Notify outside the lock, only when
+                // adoption advanced the document — so the CLI re-projects the newly
+                // imported state to disk (same contract as the `Ops` arm).
+                if changed {
+                    self.changed.notify_waiters();
+                }
+            }
             Frame::Ping => {}
         }
         Ok(())

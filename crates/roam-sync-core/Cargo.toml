@@ -22,3 +22,4 @@ proptest.workspace = true
 tempfile.workspace = true
 roam-backend-client = { path = "../roam-backend-client" }
 blake3 = { workspace = true }
+serde_json = { workspace = true }
