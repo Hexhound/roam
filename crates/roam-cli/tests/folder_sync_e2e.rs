@@ -187,12 +187,14 @@ async fn real_folder_create_delete_rename_syncs_over_iroh() {
         vault_id,
         store_a,
         Arc::new(transport_a),
+        [0u8; 32],
     ));
     let engine_b = Arc::new(Engine::new(
         identity_b.clone(),
         vault_id,
         store_b,
         Arc::new(transport_b),
+        [0u8; 32],
     ));
     tokio::spawn(engine_a.clone().run());
     tokio::spawn(engine_b.clone().run());

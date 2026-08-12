@@ -68,12 +68,14 @@ async fn pull_round_trip_transfers_blob_bytes_and_fires_changed() {
         vault,
         sa,
         Arc::new(board.endpoint(ia.peer_id())),
+        [0u8; 32],
     ));
     let eb = Arc::new(Engine::new(
         ib.clone(),
         vault,
         sb,
         Arc::new(board.endpoint(ib.peer_id())),
+        [0u8; 32],
     ));
     tokio::spawn(ea.clone().run());
     tokio::spawn(eb.clone().run());
@@ -133,6 +135,7 @@ async fn corrupt_blob_data_is_rejected_no_poison() {
         vault,
         sb,
         Arc::new(board.endpoint(ib.peer_id())),
+        [0u8; 32],
     ));
 
     // A (trusted) sends bytes that DO NOT hash to `claimed`.
@@ -175,6 +178,7 @@ async fn a_does_not_serve_a_revoked_peers_blob_want() {
         vault,
         sa,
         Arc::new(board.endpoint(ia.peer_id())),
+        [0u8; 32],
     ));
     let tb = board.endpoint(ib.peer_id());
     let mut b_in = tb.incoming();
@@ -208,6 +212,7 @@ async fn a_serves_an_active_peers_blob_want() {
         vault,
         sa,
         Arc::new(board.endpoint(ia.peer_id())),
+        [0u8; 32],
     ));
     let tb = board.endpoint(ib.peer_id());
     let mut b_in = tb.incoming();
@@ -246,6 +251,7 @@ async fn blob_want_for_absent_blob_serves_nothing() {
         vault,
         sa,
         Arc::new(board.endpoint(ia.peer_id())),
+        [0u8; 32],
     ));
     let tb = board.endpoint(ib.peer_id());
     let mut b_in = tb.incoming();
@@ -282,6 +288,7 @@ async fn blob_data_for_already_held_blob_is_a_noop() {
         vault,
         sb,
         Arc::new(board.endpoint(ib.peer_id())),
+        [0u8; 32],
     ));
 
     let changed = eb.changed();
@@ -328,6 +335,7 @@ async fn request_missing_blobs_sends_nothing_when_complete() {
         vault,
         sb,
         Arc::new(board.endpoint(ib.peer_id())),
+        [0u8; 32],
     ));
     // Raw observer endpoint for A: no engine, just read what B sends.
     let ta = board.endpoint(ia.peer_id());

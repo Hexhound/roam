@@ -132,7 +132,7 @@ impl BlobStore {
         match std::fs::metadata(&path) {
             Ok(m) => Ok(Some(m.len())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => return Err(e.into()),
+            Err(e) => Err(e.into()),
         }
     }
 

@@ -42,12 +42,14 @@ async fn engine_records_and_advances_peer_acked_version() {
         vault,
         sa,
         Arc::new(board.endpoint(ia.peer_id())),
+        [0u8; 32],
     ));
     let eb = Arc::new(Engine::new(
         ib.clone(),
         vault,
         sb,
         Arc::new(board.endpoint(ib.peer_id())),
+        [0u8; 32],
     ));
     tokio::spawn(ea.clone().run());
     tokio::spawn(eb.clone().run());
@@ -121,6 +123,7 @@ async fn engine_ignores_have_from_untrusted_peer() {
         vault,
         sa,
         Arc::new(board.endpoint(ia.peer_id())),
+        [0u8; 32],
     ));
 
     // A bare, well-formed Have from the untrusted stranger.

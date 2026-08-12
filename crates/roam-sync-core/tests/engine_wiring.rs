@@ -43,12 +43,14 @@ async fn flush_local_gossips_direct_store_edits() {
         vault,
         sa,
         Arc::new(board.endpoint(ia.peer_id())),
+        [0u8; 32],
     ));
     let eb = Arc::new(Engine::new(
         ib.clone(),
         vault,
         sb,
         Arc::new(board.endpoint(ib.peer_id())),
+        [0u8; 32],
     ));
     tokio::spawn(ea.clone().run());
     tokio::spawn(eb.clone().run());
@@ -90,6 +92,7 @@ async fn flush_local_is_a_safe_noop_when_nothing_new() {
         vault,
         sa,
         Arc::new(board.endpoint(ia.peer_id())),
+        [0u8; 32],
     ));
     // Raw observer endpoint for B: no engine, we just read frames A sends.
     let tb = board.endpoint(ib.peer_id());
@@ -142,12 +145,14 @@ async fn reconnect_active_catches_up_an_unconnected_peer() {
         vault,
         sa,
         Arc::new(board.endpoint(ia.peer_id())),
+        [0u8; 32],
     ));
     let eb = Arc::new(Engine::new(
         ib.clone(),
         vault,
         sb,
         Arc::new(board.endpoint(ib.peer_id())),
+        [0u8; 32],
     ));
     tokio::spawn(ea.clone().run());
     tokio::spawn(eb.clone().run());
@@ -192,12 +197,14 @@ async fn changed_fires_on_inbound_ops() {
         vault,
         sa,
         Arc::new(board.endpoint(ia.peer_id())),
+        [0u8; 32],
     ));
     let eb = Arc::new(Engine::new(
         ib.clone(),
         vault,
         sb,
         Arc::new(board.endpoint(ib.peer_id())),
+        [0u8; 32],
     ));
     tokio::spawn(ea.clone().run());
     tokio::spawn(eb.clone().run());
@@ -252,12 +259,14 @@ async fn repeated_edits_do_not_duplicate_on_peer() {
         vault,
         sa,
         Arc::new(board.endpoint(ia.peer_id())),
+        [0u8; 32],
     ));
     let eb = Arc::new(Engine::new(
         ib.clone(),
         vault,
         sb,
         Arc::new(board.endpoint(ib.peer_id())),
+        [0u8; 32],
     ));
     tokio::spawn(ea.clone().run());
     tokio::spawn(eb.clone().run());

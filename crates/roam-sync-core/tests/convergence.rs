@@ -36,12 +36,14 @@ async fn two_engines_converge_on_connect() {
         vault,
         sa,
         Arc::new(board.endpoint(ida.peer_id())),
+        [0u8; 32],
     ));
     let eb = Arc::new(Engine::new(
         idb.clone(),
         vault,
         sb,
         Arc::new(board.endpoint(idb.peer_id())),
+        [0u8; 32],
     ));
     tokio::spawn(ea.clone().run());
     tokio::spawn(eb.clone().run());
@@ -92,12 +94,14 @@ async fn keylog_gossips_a_rotated_epoch_to_a_trusted_peer() {
         vault,
         sa,
         Arc::new(board.endpoint(ida.peer_id())),
+        [0u8; 32],
     ));
     let eb = Arc::new(Engine::new(
         idb.clone(),
         vault,
         sb,
         Arc::new(board.endpoint(idb.peer_id())),
+        [0u8; 32],
     ));
     tokio::spawn(ea.clone().run());
     tokio::spawn(eb.clone().run());
@@ -172,6 +176,7 @@ proptest! {
                         vault,
                         store,
                         Arc::new(board.endpoint(ids[i].peer_id())),
+                        [0u8; 32],
                     ))
                 })
                 .collect();

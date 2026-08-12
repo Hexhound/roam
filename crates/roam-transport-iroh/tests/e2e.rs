@@ -36,8 +36,8 @@ async fn two_real_endpoints_catch_up_offline_edits() {
     ta.add_addr(ib.peer_id(), tb.endpoint_addr()).await;
     tb.add_addr(ia.peer_id(), ta.endpoint_addr()).await;
 
-    let ea = Arc::new(Engine::new(ia.clone(), vault, sa, Arc::new(ta)));
-    let eb = Arc::new(Engine::new(ib.clone(), vault, sb, Arc::new(tb)));
+    let ea = Arc::new(Engine::new(ia.clone(), vault, sa, Arc::new(ta), [0u8; 32]));
+    let eb = Arc::new(Engine::new(ib.clone(), vault, sb, Arc::new(tb), [0u8; 32]));
     tokio::spawn(ea.clone().run());
     tokio::spawn(eb.clone().run());
 
