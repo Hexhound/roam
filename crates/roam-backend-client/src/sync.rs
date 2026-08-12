@@ -259,7 +259,7 @@ pub async fn reconcile_once<B: Backend>(
     }
 
     // If the backend asked for a snapshot and we're an Admin, produce + upload one.
-    maybe_produce_snapshot(store, backend, key, &bucket, &kc, debug).await?;
+    maybe_produce_snapshot(store, backend, key, &bucket, debug).await?;
 
     Ok(())
 }
@@ -368,7 +368,6 @@ async fn maybe_produce_snapshot<B: Backend>(
     backend: &Arc<B>,
     key: &VaultKey,
     bucket: &str,
-    kc: &Keychain,
     debug: bool,
 ) -> anyhow::Result<()> {
     if !backend.manifest(bucket).await?.snapshot_wanted {
@@ -378,59 +377,27 @@ async fn maybe_produce_snapshot<B: Backend>(
         return Ok(());
     }
 
-    // Pin a head marker so there is always a frontier to snapshot, then build.
-    // Compute `before_ts` AFTER writing the marker: the marker's timestamp is
-    // taken inside write_snapshot, so a `before_ts` sampled earlier could sit just
-    // below it and miss the fresh marker (flaky on the ms boundary). With the
-    // default lag the head marker is intentionally excluded, leaving a replayable
-    // tail; lag 0 (tests) snapshots at head.
-    let snap = {
+    // Pin a head marker so there is always a frontier to snapshot, then produce.
+    // before_ts is computed AFTER write_snapshot so the fresh marker isn't missed
+    // on the ms boundary (default lag leaves a replayable tail; lag 0 => head).
+    // produce_held_snapshot persists the framed object locally + records it held;
+    // we additionally upload it to the backend here.
+    let produced = {
         let guard = store.lock().await;
         guard.write_snapshot()?;
         let before_ts = now_ms().saturating_sub(retention_lag_ms());
-        guard.build_backend_snapshot(before_ts)?
+        produce_held_snapshot(&guard, key, before_ts)?
     };
-    let Some(snap) = snap else {
+    let Some((snapshot_id, framed)) = produced else {
         if debug {
             eprintln!("[be-sync]   snapshot_wanted but no qualifying marker yet");
         }
         return Ok(());
     };
 
-    let sealed = seal_under_head(kc, key, &snap.bytes);
-    let snapshot_id = key.snapshot_id(&snap.frontier_digest);
-    let subsumed_entry_ids: Vec<String> = snap
-        .subsumed_lines
-        .iter()
-        .map(|(peer, line)| key.entry_id_content(*peer, line))
-        .collect();
-    let blob_ref_ids: Vec<String> = snap.blob_refs.iter().map(|h| key.blob_id(h)).collect();
-
-    let manifest = crate::snapshot_msg::SnapshotManifest {
-        frontier_digest: snap.frontier_digest,
-        snapshot_ct_hash: blake3::hash(&sealed).into(),
-        subsumed_entry_ids,
-        blob_ref_ids,
-        author: 0,
-        sig: String::new(),
-    }
-    .signed(store.lock().await.identity());
-
-    let manifest_json = serde_json::to_vec(&manifest)?;
-    let framed = crate::snapshot_msg::frame(&manifest_json, &sealed);
     backend.put_snapshot(bucket, &snapshot_id, framed).await?;
-    // Record it as held so future passes advertise it and stop advertising the
-    // entries it subsumes.
-    store
-        .lock()
-        .await
-        .record_held_snapshot(&snapshot_id, &manifest.subsumed_entry_ids)?;
     if debug {
-        eprintln!(
-            "[be-sync]   uploaded snapshot {snapshot_id} subsuming {} entries, {} blob refs",
-            manifest.subsumed_entry_ids.len(),
-            manifest.blob_ref_ids.len(),
-        );
+        eprintln!("[be-sync]   uploaded snapshot {snapshot_id}");
     }
     Ok(())
 }
