@@ -10,10 +10,9 @@
 //! LOOPBACK CAVEAT: this measures OUR stack's overhead on a single warm host,
 //! not internet/LAN throughput. Treat it as a floor (best case), not a promise.
 //!
-//! BLOB CAP: the sync engine transfers a blob in a SINGLE frame capped at
-//! `MAX_BLOB_BYTES` (60 MiB, `engine.rs`); chunking is deferred. The max-blob
-//! scenario is sized under that cap so it exercises a real transfer instead of
-//! silently never converging.
+//! BLOBS: the sync engine transfers a blob as a stream of offset-tagged
+//! `BlobChunk` frames (`BLOB_CHUNK_SIZE`, `engine.rs`) reassembled and
+//! full-hash-verified by the receiver, so blob size is unbounded by the wire.
 //!
 //! Run: `cargo run -j 1 --release -p roam-cli --bin roam-bench`
 //! (release matters — debug AEAD/CRDT is far slower and not representative.)
@@ -94,7 +93,7 @@ fn text_scenario_many() -> Scenario {
 fn blob_scenario_large() -> Scenario {
     Scenario {
         name: "1 x 50 MiB blob",
-        note: "binary throughput ceiling (single-frame blob path)",
+        note: "binary throughput ceiling (chunked blob path)",
         files: vec![FileSpec {
             name: "big.bin".to_string(),
             bytes: payload(50 * 1024 * 1024, 0xB10B, false),
@@ -278,7 +277,7 @@ async fn main() -> anyhow::Result<()> {
     println!("roam P2P file-transfer benchmark");
     println!("  path: P2P over iroh, loopback (single host) — measures OUR stack overhead, not internet/LAN");
     println!("  metric: end-to-end convergence — write on A -> byte-identical on B (CRDT + AEAD + QUIC + project)");
-    println!("  blob cap: single-frame transfer capped at 60 MiB (engine.rs); chunking deferred; max blob sized under cap");
+    println!("  blobs: chunked transfer (BlobChunk frames, engine.rs), reassembled + hash-verified; size unbounded by the wire");
     println!("  runs/scenario: {RUNS_PER_SCENARIO} (median reported)\n");
 
     let scenarios = [
