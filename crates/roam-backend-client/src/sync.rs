@@ -435,6 +435,58 @@ async fn maybe_produce_snapshot<B: Backend>(
     Ok(())
 }
 
+/// Build a shallow snapshot at `before_ts`, seal + sign it, PERSIST the framed
+/// object locally (so this device can P2P-serve it via `offer_snapshots`), and
+/// record it held. Does NOT upload to any backend — the caller uploads the
+/// returned `framed` bytes if a backend is present. Returns `(snapshot_id,
+/// framed)`, or `None` when self is not Admin (only Admins may author a
+/// snapshot) or no history marker qualifies at `before_ts`.
+///
+/// Callers that also truncate (checkpoint) MUST call this FIRST, with the SAME
+/// `before_ts`: `build_backend_snapshot` reads the pre-truncation op-logs to
+/// derive `subsumed_lines`, and the shared `before_ts` makes the produced
+/// snapshot cover exactly the frontier the checkpoint compacts to.
+pub fn produce_held_snapshot(
+    store: &Store,
+    key: &VaultKey,
+    before_ts: i64,
+) -> anyhow::Result<Option<(String, Vec<u8>)>> {
+    if store.self_role() != Some(Role::Admin) {
+        return Ok(None);
+    }
+    let kc = store.keychain(&key.id_key(), &key.epoch0_key())?;
+    let Some(snap) = store.build_backend_snapshot(before_ts)? else {
+        return Ok(None);
+    };
+
+    let sealed = seal_under_head(&kc, key, &snap.bytes);
+    let snapshot_id = key.snapshot_id(&snap.frontier_digest);
+    let subsumed_entry_ids: Vec<String> = snap
+        .subsumed_lines
+        .iter()
+        .map(|(peer, line)| key.entry_id_content(*peer, line))
+        .collect();
+    let blob_ref_ids: Vec<String> = snap.blob_refs.iter().map(|h| key.blob_id(h)).collect();
+
+    let manifest = crate::snapshot_msg::SnapshotManifest {
+        frontier_digest: snap.frontier_digest,
+        snapshot_ct_hash: blake3::hash(&sealed).into(),
+        subsumed_entry_ids,
+        blob_ref_ids,
+        author: 0,
+        sig: String::new(),
+    }
+    .signed(store.identity());
+
+    let manifest_json = serde_json::to_vec(&manifest)?;
+    let framed = crate::snapshot_msg::frame(&manifest_json, &sealed);
+
+    store.persist_snapshot_object(&snapshot_id, &framed)?;
+    store.record_held_snapshot(&snapshot_id, &manifest.subsumed_entry_ids)?;
+
+    Ok(Some((snapshot_id, framed)))
+}
+
 /// Fetch every content-addressed entry id in `need_entry_ids` directly from the
 /// backend (RBSR's discovery is set-based, not sequential, so there is no
 /// per-peer index to walk anymore), decrypt, attribute it to its author via the
@@ -859,6 +911,48 @@ mod tests {
             b.lock().await.blobs().get(&hash).unwrap(),
             Some(b"blobdata".to_vec())
         );
+    }
+
+    #[tokio::test]
+    async fn produce_held_snapshot_persists_and_records_when_admin() {
+        std::env::set_var("ROAM_SNAPSHOT_LAG_DAYS", "0");
+        let key = VaultKey([9u8; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let s = store_at(dir.path()).await; // founder Admin
+        {
+            let mut g = s.lock().await;
+            g.set_entry("files", "note", "hello").unwrap();
+            g.write_snapshot().unwrap(); // record a history marker to snapshot at
+        }
+        let out = {
+            let g = s.lock().await;
+            produce_held_snapshot(&g, &key, i64::MAX).unwrap()
+        };
+        let (id, framed) = out.expect("admin with history produces a snapshot");
+        assert!(!framed.is_empty());
+        let held = s.lock().await.held_snapshot_ids().unwrap();
+        assert!(
+            held.contains(&id),
+            "produced snapshot must be locally held/advertisable"
+        );
+    }
+
+    #[tokio::test]
+    async fn produce_held_snapshot_is_none_without_history() {
+        let key = VaultKey([9u8; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let s = store_at(dir.path()).await;
+        let g = s.lock().await;
+        assert!(produce_held_snapshot(&g, &key, i64::MAX).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn produce_held_snapshot_is_none_for_non_admin() {
+        let key = VaultKey([9u8; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        // No declare_founder => self has no Admin role.
+        let store = Store::open(dir.path(), Identity::generate()).unwrap();
+        assert!(produce_held_snapshot(&store, &key, i64::MAX).unwrap().is_none());
     }
 
     #[test]
