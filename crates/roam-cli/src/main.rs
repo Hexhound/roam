@@ -1174,8 +1174,45 @@ async fn checkpoint(vault: &Path, identity_path: &Path, before: &str, dry_run: b
             "checkpoint --before {before}: would free {bytes} bytes (blobs). No changes made."
         );
     } else {
+        // Produce a bootstrap snapshot BEFORE truncating: build_backend_snapshot
+        // reads the pre-truncation op-logs, and the SAME cutoff makes the snapshot
+        // cover exactly the frontier checkpoint compacts to. A lagging peer then
+        // catches up past the compaction frontier by adopting this snapshot.
+        let produced = match load_vault_key(vault) {
+            Ok(raw) => {
+                use roam_backend_client::crypto::VaultKey;
+                use roam_backend_client::sync::produce_held_snapshot;
+                let key = VaultKey(raw);
+                produce_held_snapshot(&store, &key, cutoff)
+                    .context("produce bootstrap snapshot")?
+            }
+            // No vault key on disk => vault was never wired for sync (purely
+            // local). Nothing to bootstrap; checkpoint is safe as-is.
+            Err(_) => None,
+        };
+
         let freed = store.checkpoint(cutoff).context("checkpoint")?;
-        println!("checkpoint done: freed {freed} bytes; op history compacted. Local only.");
+
+        match produced {
+            Some((id, _framed)) => println!(
+                "checkpoint done: freed {freed} bytes; op history compacted. \
+                 Bootstrap snapshot {id} published for lagging peers."
+            ),
+            None => {
+                println!(
+                    "checkpoint done: freed {freed} bytes; op history compacted. Local only."
+                );
+                // Distinguish the risky case: a non-Admin on a sync-wired vault
+                // truncated but cannot sign a bootstrap snapshot.
+                if load_vault_key(vault).is_ok() && store.self_role() != Some(Role::Admin) {
+                    eprintln!(
+                        "warning: compacted locally, but only an Admin can publish a bootstrap \
+                         snapshot; peers behind this point need an Admin or backend snapshot to \
+                         catch up."
+                    );
+                }
+            }
+        }
     }
     Ok(())
 }

@@ -259,7 +259,7 @@ pub async fn reconcile_once<B: Backend>(
     }
 
     // If the backend asked for a snapshot and we're an Admin, produce + upload one.
-    maybe_produce_snapshot(store, backend, key, &bucket, &kc, debug).await?;
+    maybe_produce_snapshot(store, backend, key, &bucket, debug).await?;
 
     Ok(())
 }
@@ -368,7 +368,6 @@ async fn maybe_produce_snapshot<B: Backend>(
     backend: &Arc<B>,
     key: &VaultKey,
     bucket: &str,
-    kc: &Keychain,
     debug: bool,
 ) -> anyhow::Result<()> {
     if !backend.manifest(bucket).await?.snapshot_wanted {
@@ -378,26 +377,56 @@ async fn maybe_produce_snapshot<B: Backend>(
         return Ok(());
     }
 
-    // Pin a head marker so there is always a frontier to snapshot, then build.
-    // Compute `before_ts` AFTER writing the marker: the marker's timestamp is
-    // taken inside write_snapshot, so a `before_ts` sampled earlier could sit just
-    // below it and miss the fresh marker (flaky on the ms boundary). With the
-    // default lag the head marker is intentionally excluded, leaving a replayable
-    // tail; lag 0 (tests) snapshots at head.
-    let snap = {
+    // Pin a head marker so there is always a frontier to snapshot, then produce.
+    // before_ts is computed AFTER write_snapshot so the fresh marker isn't missed
+    // on the ms boundary (default lag leaves a replayable tail; lag 0 => head).
+    // produce_held_snapshot persists the framed object locally + records it held;
+    // we additionally upload it to the backend here.
+    let produced = {
         let guard = store.lock().await;
         guard.write_snapshot()?;
         let before_ts = now_ms().saturating_sub(retention_lag_ms());
-        guard.build_backend_snapshot(before_ts)?
+        produce_held_snapshot(&guard, key, before_ts)?
     };
-    let Some(snap) = snap else {
+    let Some((snapshot_id, framed)) = produced else {
         if debug {
             eprintln!("[be-sync]   snapshot_wanted but no qualifying marker yet");
         }
         return Ok(());
     };
 
-    let sealed = seal_under_head(kc, key, &snap.bytes);
+    backend.put_snapshot(bucket, &snapshot_id, framed).await?;
+    if debug {
+        eprintln!("[be-sync]   uploaded snapshot {snapshot_id}");
+    }
+    Ok(())
+}
+
+/// Build a shallow snapshot at `before_ts`, seal + sign it, PERSIST the framed
+/// object locally (so this device can P2P-serve it via `offer_snapshots`), and
+/// record it held. Does NOT upload to any backend — the caller uploads the
+/// returned `framed` bytes if a backend is present. Returns `(snapshot_id,
+/// framed)`, or `None` when self is not Admin (only Admins may author a
+/// snapshot) or no history marker qualifies at `before_ts`.
+///
+/// Callers that also truncate (checkpoint) MUST call this FIRST, with the SAME
+/// `before_ts`: `build_backend_snapshot` reads the pre-truncation op-logs to
+/// derive `subsumed_lines`, and the shared `before_ts` makes the produced
+/// snapshot cover exactly the frontier the checkpoint compacts to.
+pub fn produce_held_snapshot(
+    store: &Store,
+    key: &VaultKey,
+    before_ts: i64,
+) -> anyhow::Result<Option<(String, Vec<u8>)>> {
+    if store.self_role() != Some(Role::Admin) {
+        return Ok(None);
+    }
+    let kc = store.keychain(&key.id_key(), &key.epoch0_key())?;
+    let Some(snap) = store.build_backend_snapshot(before_ts)? else {
+        return Ok(None);
+    };
+
+    let sealed = seal_under_head(&kc, key, &snap.bytes);
     let snapshot_id = key.snapshot_id(&snap.frontier_digest);
     let subsumed_entry_ids: Vec<String> = snap
         .subsumed_lines
@@ -414,25 +443,15 @@ async fn maybe_produce_snapshot<B: Backend>(
         author: 0,
         sig: String::new(),
     }
-    .signed(store.lock().await.identity());
+    .signed(store.identity());
 
     let manifest_json = serde_json::to_vec(&manifest)?;
     let framed = crate::snapshot_msg::frame(&manifest_json, &sealed);
-    backend.put_snapshot(bucket, &snapshot_id, framed).await?;
-    // Record it as held so future passes advertise it and stop advertising the
-    // entries it subsumes.
-    store
-        .lock()
-        .await
-        .record_held_snapshot(&snapshot_id, &manifest.subsumed_entry_ids)?;
-    if debug {
-        eprintln!(
-            "[be-sync]   uploaded snapshot {snapshot_id} subsuming {} entries, {} blob refs",
-            manifest.subsumed_entry_ids.len(),
-            manifest.blob_ref_ids.len(),
-        );
-    }
-    Ok(())
+
+    store.persist_snapshot_object(&snapshot_id, &framed)?;
+    store.record_held_snapshot(&snapshot_id, &manifest.subsumed_entry_ids)?;
+
+    Ok(Some((snapshot_id, framed)))
 }
 
 /// Fetch every content-addressed entry id in `need_entry_ids` directly from the
@@ -615,6 +634,55 @@ mod tests {
         // B recorded the snapshot as held (so it will advertise it + stop
         // advertising the entries it subsumes next pass).
         assert_eq!(b.lock().await.held_snapshots().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_produced_bootstrap_snapshot_lets_a_fresh_peer_converge() {
+        std::env::set_var("ROAM_SNAPSHOT_LAG_DAYS", "0");
+        let key = VaultKey([9u8; 32]);
+        let backend = Arc::new(MemoryBackend::default());
+        let a_dir = tempfile::tempdir().unwrap();
+        let b_dir = tempfile::tempdir().unwrap();
+        let a = store_at(a_dir.path()).await;
+        let b = store_at(b_dir.path()).await;
+
+        let (a_peer, a_key) = {
+            let g = a.lock().await;
+            (g.peer_id(), g.identity_verifying_bytes())
+        };
+        let (b_peer, b_key) = {
+            let g = b.lock().await;
+            (g.peer_id(), g.identity_verifying_bytes())
+        };
+        // Mutual roster so B can verify A's snapshot-author signature.
+        a.lock().await.add_peer(b_peer, b_key, Role::Admin).unwrap();
+        b.lock().await.add_peer(a_peer, a_key, Role::Admin).unwrap();
+
+        // A writes, records a marker, then produces a bootstrap snapshot the way the
+        // checkpoint path does — directly, no backend snapshot_wanted, no manual seed.
+        {
+            let mut g = a.lock().await;
+            g.set_entry("files", "note", "hello").unwrap();
+            g.write_snapshot().unwrap();
+        }
+        let (id, framed) = {
+            let g = a.lock().await;
+            produce_held_snapshot(&g, &key, i64::MAX).unwrap().unwrap()
+        };
+
+        // Deliver the produced object to B via the backend object store, then B's
+        // normal reconcile fetches, verifies (Admin sig + ct-hash), and adopts it.
+        // No `set_snapshot_wanted` here: unlike `consumer_fetches_verifies_and_adopts_a_snapshot`,
+        // this snapshot's discovery does not depend on the backend requesting one —
+        // `put_snapshot` alone makes it visible to B's SetKind::Snapshots RBSR reconcile.
+        let bucket = key.bucket_id();
+        backend.put_snapshot(&bucket, &id, framed).await.unwrap();
+        reconcile_once(&b, &backend, &key).await.unwrap();
+
+        assert_eq!(
+            b.lock().await.get_entry("files", "note"),
+            Some("hello".to_string())
+        );
     }
 
     #[tokio::test]
@@ -859,6 +927,48 @@ mod tests {
             b.lock().await.blobs().get(&hash).unwrap(),
             Some(b"blobdata".to_vec())
         );
+    }
+
+    #[tokio::test]
+    async fn produce_held_snapshot_persists_and_records_when_admin() {
+        std::env::set_var("ROAM_SNAPSHOT_LAG_DAYS", "0");
+        let key = VaultKey([9u8; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let s = store_at(dir.path()).await; // founder Admin
+        {
+            let mut g = s.lock().await;
+            g.set_entry("files", "note", "hello").unwrap();
+            g.write_snapshot().unwrap(); // record a history marker to snapshot at
+        }
+        let out = {
+            let g = s.lock().await;
+            produce_held_snapshot(&g, &key, i64::MAX).unwrap()
+        };
+        let (id, framed) = out.expect("admin with history produces a snapshot");
+        assert!(!framed.is_empty());
+        let held = s.lock().await.held_snapshot_ids().unwrap();
+        assert!(
+            held.contains(&id),
+            "produced snapshot must be locally held/advertisable"
+        );
+    }
+
+    #[tokio::test]
+    async fn produce_held_snapshot_is_none_without_history() {
+        let key = VaultKey([9u8; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let s = store_at(dir.path()).await;
+        let g = s.lock().await;
+        assert!(produce_held_snapshot(&g, &key, i64::MAX).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn produce_held_snapshot_is_none_for_non_admin() {
+        let key = VaultKey([9u8; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        // No declare_founder => self has no Admin role.
+        let store = Store::open(dir.path(), Identity::generate()).unwrap();
+        assert!(produce_held_snapshot(&store, &key, i64::MAX).unwrap().is_none());
     }
 
     #[test]
