@@ -13,6 +13,21 @@ use tokio::sync::Mutex;
 /// by memory.
 const BLOB_CHUNK_SIZE: usize = 1024 * 1024;
 
+/// Hard ceiling on a single blob's advertised `total_len` accepted over the
+/// wire. Guards against a peer advertising an absurd size that would pre-size a
+/// huge sparse `.part` and never complete. Generous — real media stays well
+/// under it.
+const MAX_INCOMING_BLOB_BYTES: u64 = 16 * 1024 * 1024 * 1024; // 16 GiB
+
+/// In-flight reassembly bookkeeping for one chunked blob. Tracks DISTINCT
+/// received offsets (not a running sum) so duplicate/interleaved chunk streams
+/// from multiple serving peers cannot inflate the count past a still-holey file.
+struct IncomingBlob {
+    total_len: u64,
+    received: u64,
+    seen: std::collections::HashSet<u64>,
+}
+
 /// Drives sync for one device over a [`Transport`]. Owns the [`Store`]; local
 /// edits go through the engine so it can live-push.
 pub struct Engine<T: Transport> {
@@ -54,7 +69,7 @@ pub struct Engine<T: Transport> {
     /// Per-hash received-byte count for in-flight chunked blob transfers. The
     /// bytes live in `BlobStore`'s `incoming/<hash>.part`; this only tracks
     /// progress so we know when a transfer is complete. Cleared on finalize.
-    incoming_blobs: tokio::sync::Mutex<std::collections::HashMap<String, u64>>,
+    incoming_blobs: tokio::sync::Mutex<std::collections::HashMap<String, IncomingBlob>>,
 }
 
 /// Everything we offer a peer on connect or in a `Hello` reply, gathered under a
@@ -632,6 +647,16 @@ impl<T: Transport + 'static> Engine<T> {
                         _ => return Ok(()),
                     }
                 };
+                if total_len == 0 {
+                    // Zero-byte blob: the while loop below would send nothing, so
+                    // the receiver would never complete. Send one empty chunk.
+                    self.send(
+                        peer,
+                        Frame::BlobChunk { hash: hash.clone(), offset: 0, total_len: 0, bytes: vec![] },
+                    )
+                    .await;
+                    return Ok(());
+                }
                 let mut offset: u64 = 0;
                 while offset < total_len {
                     let want = std::cmp::min(BLOB_CHUNK_SIZE as u64, total_len - offset) as usize;
@@ -678,9 +703,12 @@ impl<T: Transport + 'static> Engine<T> {
                 }
             }
             Frame::BlobChunk { hash, offset, total_len, bytes } => {
-                // Anti-spam + idempotency, checked BEFORE writing any bytes:
-                // only accept chunks for a hash a Live `Blob` file-set entry
-                // references, and never one we already hold.
+                // DoS guard: reject an absurd advertised size before any disk I/O.
+                if total_len > MAX_INCOMING_BLOB_BYTES {
+                    return Ok(());
+                }
+                // Anti-spam + idempotency: only accept chunks for a hash a Live
+                // `Blob` file-set entry references, and never one we already hold.
                 let accept = {
                     let store = self.store.lock().await;
                     !store.blobs().has(&hash) && Self::fileset_wants(&store, &hash)
@@ -688,6 +716,7 @@ impl<T: Transport + 'static> Engine<T> {
                 if !accept {
                     return Ok(());
                 }
+                // Stream the chunk into the .part file at its offset.
                 {
                     let store = self.store.lock().await;
                     if store
@@ -698,21 +727,38 @@ impl<T: Transport + 'static> Engine<T> {
                         return Ok(());
                     }
                 }
+                // Count DISTINCT offsets. A duplicate offset (another peer serving
+                // the same blob) re-writes identical bytes but must not advance the
+                // completion counter. A peer disagreeing on total_len for the same
+                // hash is malformed and ignored.
                 let complete = {
                     let mut map = self.incoming_blobs.lock().await;
-                    let got = map.entry(hash.clone()).or_insert(0);
-                    *got += bytes.len() as u64;
-                    *got >= total_len
+                    let entry = map.entry(hash.clone()).or_insert_with(|| IncomingBlob {
+                        total_len,
+                        received: 0,
+                        seen: std::collections::HashSet::new(),
+                    });
+                    if entry.total_len == total_len && entry.seen.insert(offset) {
+                        entry.received += bytes.len() as u64;
+                    }
+                    entry.received >= entry.total_len
                 };
                 if !complete {
                     return Ok(());
                 }
                 self.incoming_blobs.lock().await.remove(&hash);
+                // Finalize verifies the full blake3 == hash and atomically moves the
+                // .part into the store (poison guard). Re-check we still don't hold
+                // it: a concurrent `BlobData` transfer of the same hash may have
+                // landed between our accept gate and here.
                 let stored = {
                     let store = self.store.lock().await;
-                    // Verify-then-move; hash mismatch discards the .part and
-                    // stores nothing (poison guard, like BlobData's re-hash).
-                    store.blobs().finalize_incoming(&hash).unwrap_or(false)
+                    if store.blobs().has(&hash) {
+                        let _ = store.blobs().discard_incoming(&hash);
+                        false
+                    } else {
+                        store.blobs().finalize_incoming(&hash).unwrap_or(false)
+                    }
                 };
                 if stored {
                     self.changed.notify_waiters();
