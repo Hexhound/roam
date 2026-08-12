@@ -8,6 +8,8 @@ pub enum CrdtError {
     Loro(String),
     #[error("loro encode failed: {0}")]
     Encode(String),
+    #[error("target frontier is not retained in this oplog (compacted away)")]
+    FrontierNotRetained,
 }
 
 impl From<loro::LoroError> for CrdtError {

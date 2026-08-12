@@ -1,8 +1,15 @@
 use crate::error::CrdtError;
+use crate::history_types::{ChangeInfo, TextDiff, TextSpan};
+use loro::ContainerTrait;
 use loro::LoroDoc;
 use loro::LoroValue;
 use loro::ValueOrContainer;
 use loro::VersionVector;
+
+/// Same-peer, causally-adjacent commits within this many seconds coalesce into
+/// one change (which keeps the earliest timestamp). Bounds op-log growth and
+/// sets the per-file history granularity to "edit session".
+pub const CHANGE_MERGE_SECS: i64 = 10;
 
 /// A serializable snapshot of a document's version (which ops it has seen).
 /// Peers exchange this to compute deltas.
@@ -37,7 +44,7 @@ impl Version {
 /// An opaque handle to a specific point in the op-DAG (a set of leaf op-ids).
 /// Wraps loro's `Frontiers`; `to_bytes`/`from_bytes` give a persistable byte
 /// form used by the storage-layer history index.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Frontier(pub(crate) loro::Frontiers);
 
 impl Frontier {
@@ -47,6 +54,11 @@ impl Frontier {
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, CrdtError> {
         Ok(Frontier(loro::Frontiers::decode(bytes)?))
+    }
+
+    /// The empty frontier (document genesis / before any op).
+    pub fn empty() -> Self {
+        Frontier(loro::Frontiers::default())
     }
 }
 
@@ -61,6 +73,8 @@ impl Document {
     pub fn new(peer_id: u64) -> Result<Self, CrdtError> {
         let doc = LoroDoc::new();
         doc.set_peer_id(peer_id)?;
+        doc.set_record_timestamp(true);
+        doc.set_change_merge_interval(CHANGE_MERGE_SECS);
         Ok(Self { doc })
     }
 
@@ -131,6 +145,8 @@ impl Document {
         let doc = LoroDoc::new();
         doc.import(snapshot)?;
         doc.set_peer_id(peer_id)?;
+        doc.set_record_timestamp(true);
+        doc.set_change_merge_interval(CHANGE_MERGE_SECS);
         Ok(Self { doc })
     }
 
@@ -183,6 +199,102 @@ impl Document {
     /// Re-attach to the latest state after a `checkout`.
     pub fn checkout_latest(&self) {
         self.doc.checkout_to_latest();
+    }
+
+    /// Commit pending edits stamped with an explicit wall-clock time (seconds
+    /// since the Unix epoch). Production uses [`Document::commit`]; this exists
+    /// so history/coalescing behaviour is testable without sleeping.
+    pub fn commit_at(&self, secs: i64) {
+        self.doc
+            .commit_with(loro::CommitOptions::new().timestamp(secs));
+    }
+
+    /// The char-level text delta transforming container `id`'s content at
+    /// `from` into its content at `to`. Empty if untouched between the two.
+    pub fn text_delta(
+        &self,
+        id: &str,
+        from: &Frontier,
+        to: &Frontier,
+    ) -> Result<TextDiff, CrdtError> {
+        let target = self.doc.get_text(id).id();
+        let batch = self.doc.diff(&from.0, &to.0)?;
+        let mut spans = Vec::new();
+        for (cid, diff) in batch.iter() {
+            if *cid != target {
+                continue;
+            }
+            if let loro::event::Diff::Text(deltas) = diff {
+                for delta in deltas {
+                    match delta {
+                        loro::TextDelta::Retain { retain, .. } => {
+                            spans.push(TextSpan::Retain(*retain))
+                        }
+                        loro::TextDelta::Insert { insert, .. } => {
+                            spans.push(TextSpan::Insert(insert.clone()))
+                        }
+                        loro::TextDelta::Delete { delete, .. } => {
+                            spans.push(TextSpan::Delete(*delete))
+                        }
+                    }
+                }
+            }
+        }
+        Ok(TextDiff { spans })
+    }
+
+    /// Every change touching text container `id`, oldest-first. Each carries the
+    /// frontier AS OF that change, its wall-clock ms, and the authoring peer id.
+    pub fn text_changes(&self, id: &str) -> Result<Vec<ChangeInfo>, CrdtError> {
+        let target = self.doc.get_text(id).id();
+        let start = loro::VersionVector::default();
+        let end = self.doc.oplog_vv();
+        let schema = self
+            .doc
+            .export_json_updates_without_peer_compression(&start, &end);
+
+        let mut out: Vec<(u32, ChangeInfo)> = Vec::new();
+        for change in &schema.changes {
+            let touches = change.ops.iter().any(|op| op.container == target);
+            if !touches {
+                continue;
+            }
+            let last_counter = change.id.counter + change.op_len() as i32 - 1;
+            let tip = loro::ID::new(change.id.peer, last_counter);
+            out.push((
+                change.lamport,
+                ChangeInfo {
+                    frontier: Frontier(loro::Frontiers::from_id(tip)),
+                    ts_ms: change.timestamp * 1000,
+                    author_peer: change.id.peer,
+                },
+            ));
+        }
+        out.sort_by_key(|(lamport, _)| *lamport);
+        Ok(out.into_iter().map(|(_, info)| info).collect())
+    }
+
+    /// Non-destructively revert container `id` to its content at `target`:
+    /// compute the delta from the current tip back to `target`, restricted to
+    /// this one container, and apply it as NEW ops on top of tip. Forward
+    /// history is retained; the revert is an ordinary edit that wins the merge.
+    pub fn revert_container(&self, id: &str, target: &Frontier) -> Result<(), CrdtError> {
+        if self.doc.frontiers_to_vv(&target.0).is_none() {
+            return Err(CrdtError::FrontierNotRetained);
+        }
+        let container = self.doc.get_text(id).id();
+        let tip = self.doc.oplog_frontiers();
+        let batch = self.doc.diff(&tip, &target.0)?;
+
+        let mut only = loro::event::DiffBatch::default();
+        for (cid, diff) in batch.iter() {
+            if *cid == container {
+                let _ = only.push(cid.clone(), diff.clone());
+            }
+        }
+        self.doc.apply_diff(only)?;
+        self.doc.commit();
+        Ok(())
     }
 }
 
@@ -477,5 +589,104 @@ mod tests {
         b.insert_text("note", 9, "!").unwrap();
         b.commit();
         assert_eq!(b.text("note"), "persisted!");
+    }
+
+    #[test]
+    fn changes_within_window_coalesce_and_keep_earliest_timestamp() {
+        let doc = Document::new(1).unwrap();
+        doc.insert_text("f", 0, "a").unwrap();
+        doc.commit_at(1000);
+        doc.insert_text("f", 1, "b").unwrap();
+        doc.commit_at(1005);
+        doc.insert_text("f", 2, "c").unwrap();
+        doc.commit_at(1020);
+
+        let changes = doc.text_changes("f").unwrap();
+        assert_eq!(
+            changes.len(),
+            2,
+            "5s-apart commits coalesce; 20s-apart splits"
+        );
+        assert_eq!(
+            changes[0].ts_ms,
+            1000 * 1000,
+            "coalesced change keeps earliest ts"
+        );
+        assert_eq!(changes[1].ts_ms, 1020 * 1000);
+        assert_eq!(changes[0].author_peer, 1);
+    }
+
+    #[test]
+    fn text_delta_between_frontiers_reports_char_spans() {
+        let doc = Document::new(1).unwrap();
+        doc.insert_text("f", 0, "hello").unwrap();
+        doc.commit();
+        let v1 = doc.oplog_frontier();
+        doc.insert_text("f", 5, " world").unwrap();
+        doc.commit();
+        let v2 = doc.oplog_frontier();
+
+        let d = doc.text_delta("f", &v1, &v2).unwrap();
+        assert_eq!(
+            d.spans,
+            vec![TextSpan::Retain(5), TextSpan::Insert(" world".to_string())]
+        );
+
+        let back = doc.text_delta("f", &v2, &v1).unwrap();
+        assert_eq!(back.spans, vec![TextSpan::Retain(5), TextSpan::Delete(6)]);
+    }
+
+    #[test]
+    fn text_changes_are_oldest_first_and_container_scoped() {
+        let doc = Document::new(7).unwrap();
+        doc.insert_text("a", 0, "x").unwrap();
+        doc.commit_at(100);
+        doc.insert_text("b", 0, "y").unwrap();
+        doc.commit_at(200);
+        doc.insert_text("a", 1, "z").unwrap();
+        doc.commit_at(2000);
+
+        let a = doc.text_changes("a").unwrap();
+        assert_eq!(a.len(), 2, "only changes touching container 'a'");
+        assert!(a[0].ts_ms < a[1].ts_ms, "oldest first");
+        assert_eq!(a[0].ts_ms, 100 * 1000);
+        assert_eq!(a[1].ts_ms, 2000 * 1000);
+    }
+
+    #[test]
+    fn revert_container_restores_content_without_losing_forward_history() {
+        let doc = Document::new(1).unwrap();
+        doc.insert_text("f", 0, "version one").unwrap();
+        // Space the two setup commits past the 10s merge window so they stay
+        // two distinct changes (real-time commit() calls would coalesce). The
+        // revert's own commit uses real wall-clock time, far past 2000s, so it
+        // is a third, distinct change.
+        doc.commit_at(1000);
+        let v1 = doc.oplog_frontier();
+        doc.delete_text("f", 0, "version one".chars().count())
+            .unwrap();
+        doc.insert_text("f", 0, "version two BAD").unwrap();
+        doc.commit_at(2000);
+
+        doc.revert_container("f", &v1).unwrap();
+        assert_eq!(doc.text("f"), "version one");
+        let changes = doc.text_changes("f").unwrap();
+        assert_eq!(
+            changes.len(),
+            3,
+            "revert adds a new change; nothing removed"
+        );
+    }
+
+    #[test]
+    fn revert_container_to_unknown_frontier_errs() {
+        let doc = Document::new(1).unwrap();
+        doc.insert_text("f", 0, "a").unwrap();
+        doc.commit();
+        let bogus = Frontier(loro::Frontiers::from_id(loro::ID::new(999, 999)));
+        assert!(matches!(
+            doc.revert_container("f", &bogus),
+            Err(CrdtError::FrontierNotRetained)
+        ));
     }
 }
