@@ -19,6 +19,7 @@ mod snapshot;
 pub mod snapshot_bootstrap;
 pub mod snapshot_msg;
 mod store;
+mod text_history;
 mod vault_key;
 
 pub use blob::BlobStore;
@@ -33,4 +34,5 @@ pub use oplog::{Entry, OpLog};
 pub use paper::PaperKey;
 pub use roster::{merge_roster, PeerRecord, PeerStatus, Role, RosterEntry, RosterLog, RosterOp};
 pub use store::{version_dominates, BackendSnapshot, DataSize, HeldSnapshot, Store};
+pub use text_history::{TextVersion, VersionKind};
 pub use vault_key::{vault_subkeys, VAULT_AEAD_LABEL, VAULT_ID_LABEL};

@@ -9,8 +9,9 @@ use crate::keywrap;
 use crate::oplog::OpLog;
 use crate::roster::{merge_roster, PeerRecord, PeerStatus, Role, RosterEntry, RosterLog, RosterOp};
 use crate::snapshot;
+use crate::text_history::{TextVersion, VersionKind};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
-use roam_crdt::{Document, Version};
+use roam_crdt::{Document, Frontier, Version};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -362,10 +363,15 @@ impl Store {
 
     fn persist_new_ops(&mut self) -> Result<(), StorageError> {
         self.doc.commit();
-        // Guard on the version, not `delta.is_empty()`: loro's updates export is
-        // never byte-empty (it always carries a format header), so an edit that
-        // produced no ops (e.g. a zero-length delete) must be detected by the
-        // version being unchanged — otherwise we'd append header-only junk.
+        self.export_and_append()
+    }
+
+    /// Export/append the pending version-delta after the caller has already
+    /// committed. Guard on the version, not `delta.is_empty()`: loro's updates
+    /// export is never byte-empty (it always carries a format header), so an
+    /// edit that produced no ops (e.g. a zero-length delete) must be detected by
+    /// the version being unchanged — otherwise we'd append header-only junk.
+    fn export_and_append(&mut self) -> Result<(), StorageError> {
         let current = self.doc.version();
         if current != self.persisted {
             let delta = self.doc.export_from(&self.persisted)?;
@@ -373,6 +379,23 @@ impl Store {
             self.persisted = current;
         }
         Ok(())
+    }
+
+    /// Test/seam variant of [`Store::edit_text`] that stamps the commit with an
+    /// explicit wall-clock time (seconds since the Unix epoch) instead of the
+    /// real clock. This lets history/coalescing behaviour be exercised
+    /// deterministically without sleeping: two edits stamped >10s apart land as
+    /// two distinct crdt changes. Production must use [`Store::edit_text`].
+    pub fn edit_text_at(
+        &mut self,
+        id: &str,
+        pos: usize,
+        s: &str,
+        secs: i64,
+    ) -> Result<(), StorageError> {
+        self.doc.insert_text(id, pos, s)?;
+        self.doc.commit_at(secs);
+        self.export_and_append()
     }
 
     /// Whether THIS device may author/propagate content ops (Writer or Admin).
@@ -1432,7 +1455,6 @@ impl Store {
         key: &str,
         before_ts: i64,
     ) -> Result<Option<String>, StorageError> {
-        use roam_crdt::Frontier;
         let idx = HistoryIndex::new(&self.root.join("history"));
         let marker = match idx.marker_before(before_ts)? {
             Some(m) => m,
@@ -1451,6 +1473,57 @@ impl Store {
         let value = self.doc.get_entry(map_id, key);
         self.doc.checkout_latest();
         Ok(value)
+    }
+
+    /// This device's own peer id / verifying key (author-resolution helpers).
+    pub fn self_peer_id(&self) -> u64 {
+        self.identity.peer_id()
+    }
+    pub fn self_key(&self) -> [u8; 32] {
+        self.identity.verifying_key_bytes()
+    }
+
+    /// Per-file text version list, newest-first. Joins the crdt change-walk with
+    /// a roster author lookup and classifies Created vs Edited.
+    pub fn text_history(&self, container: &str) -> Result<Vec<TextVersion>, StorageError> {
+        let changes = self.doc.text_changes(container)?; // oldest-first
+        let mut by_peer: std::collections::HashMap<u64, [u8; 32]> =
+            std::collections::HashMap::new();
+        for rec in self.roster() {
+            by_peer.insert(rec.peer_id, rec.verifying_key);
+        }
+        by_peer
+            .entry(self.self_peer_id())
+            .or_insert(self.self_key());
+
+        let mut prev = Frontier::empty();
+        let mut out = Vec::with_capacity(changes.len());
+        for (i, info) in changes.iter().enumerate() {
+            let diff = self.doc.text_delta(container, &prev, &info.frontier)?;
+            out.push(TextVersion {
+                frontier: info.frontier.clone(),
+                ts_ms: info.ts_ms,
+                author_peer: info.author_peer,
+                author_key: by_peer.get(&info.author_peer).copied(),
+                kind: if i == 0 {
+                    VersionKind::Created
+                } else {
+                    VersionKind::Edited
+                },
+                diff,
+            });
+            prev = info.frontier.clone();
+        }
+        out.reverse(); // newest-first
+        Ok(out)
+    }
+
+    /// Non-destructively revert `container` to the content at `target`. Persists
+    /// the resulting ops. Caller must gate on write-role (bridge does).
+    pub fn revert_text(&mut self, container: &str, target: &Frontier) -> Result<(), StorageError> {
+        self.doc.revert_container(container, target)?;
+        self.persist_new_ops()?;
+        Ok(())
     }
 }
 
