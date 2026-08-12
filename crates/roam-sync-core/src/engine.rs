@@ -56,6 +56,13 @@ pub struct Engine<T: Transport> {
     /// remote-projected change that produced ops). The backend sync task awaits
     /// this to upload promptly instead of waiting for its next poll tick.
     local_flush: Arc<tokio::sync::Notify>,
+    /// Raw 32-byte vault key, held so the adopt path can derive subkeys and
+    /// build a Keychain to decrypt a received snapshot's sealed body. P2P never
+    /// PRODUCES snapshots, so no producer-side key material is needed.
+    // Read by the adopt path in Task 6; held here now so `Engine::new` carries
+    // the key material from the moment the engine is constructed.
+    #[allow(dead_code)]
+    vault_key: [u8; 32],
 }
 
 /// Everything we offer a peer on connect or in a `Hello` reply, gathered under a
@@ -73,7 +80,13 @@ struct Offer {
 }
 
 impl<T: Transport + 'static> Engine<T> {
-    pub fn new(identity: Identity, vault: VaultId, store: Store, transport: Arc<T>) -> Self {
+    pub fn new(
+        identity: Identity,
+        vault: VaultId,
+        store: Store,
+        transport: Arc<T>,
+        vault_key: [u8; 32],
+    ) -> Self {
         Self {
             identity,
             vault,
@@ -84,6 +97,7 @@ impl<T: Transport + 'static> Engine<T> {
             connected: Arc::new(Mutex::new(HashSet::new())),
             changed: Arc::new(tokio::sync::Notify::new()),
             local_flush: Arc::new(tokio::sync::Notify::new()),
+            vault_key,
         }
     }
 
@@ -464,6 +478,10 @@ impl<T: Transport + 'static> Engine<T> {
                     }
                 }
                 self.push_logs(peer).await;
+                // If this peer is behind our document version, advertise the
+                // snapshot objects we hold so it can bootstrap from one instead
+                // of replaying our full oplog.
+                self.offer_snapshots(peer, &incoming).await;
             }
             Frame::Ops { author, jsonl } => {
                 crate::dlog!(
@@ -656,12 +674,47 @@ impl<T: Transport + 'static> Engine<T> {
                     self.changed.notify_waiters();
                 }
             }
-            // P2P snapshot-serving frames (Task 4 wire types). Serve/adopt logic
-            // lands in Tasks 5/6; these no-op arms exist only to keep the
-            // exhaustive match compiling now that the variants exist.
-            Frame::SnapshotHave { .. } => {}
-            Frame::SnapshotWant { .. } => {}
-            Frame::SnapshotData { .. } => {}
+            // P2P snapshot serving. A peer that received our `SnapshotHave`
+            // asks for any advertised id it does not already hold; we answer
+            // each `Want` with the stored framed object. The adopt side
+            // (`SnapshotData`) lands in Task 6.
+            Frame::SnapshotHave { ids } => {
+                // Read-side revoke gate: a revoked peer must not learn or pull
+                // our snapshot objects.
+                if !self.is_active(peer).await {
+                    return Ok(());
+                }
+                let held: HashSet<String> = {
+                    let store = self.store.lock().await;
+                    store
+                        .held_snapshot_ids()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .collect()
+                };
+                for id in ids {
+                    if !held.contains(&id) {
+                        self.send(peer, Frame::SnapshotWant { id }).await;
+                    }
+                }
+            }
+            Frame::SnapshotWant { id } => {
+                // Read-side revoke gate: only serve a snapshot object to a peer
+                // we currently vouch for as Active.
+                if !self.is_active(peer).await {
+                    return Ok(());
+                }
+                // Load the framed object under the store lock, DROP the guard,
+                // then send. Absent object → send nothing, no error.
+                let framed = {
+                    let store = self.store.lock().await;
+                    store.load_snapshot_object(&id).ok().flatten()
+                };
+                if let Some(framed) = framed {
+                    self.send(peer, Frame::SnapshotData { framed }).await;
+                }
+            }
+            Frame::SnapshotData { .. } => {} // Task 6 replaces this with the adopt arm.
             Frame::Ping => {}
         }
         Ok(())
@@ -782,6 +835,36 @@ impl<T: Transport + 'static> Engine<T> {
         }
     }
 
+    /// Advertise the snapshot object ids we hold to a peer whose advertised
+    /// document version is strictly behind ours. A caught-up peer (its version
+    /// includes ours) gets no advert, so the common steady-state case costs
+    /// nothing. The serve side lists ids only — it never decodes or verifies the
+    /// framed objects; that is the receiver's job (Task 6 adopt path).
+    ///
+    /// Lock discipline: gather the id list under the store lock, DROP the guard,
+    /// then await the send (never a lock held across a transport await).
+    async fn offer_snapshots(&self, peer: u64, incoming: &roam_crdt::Version) {
+        let ids = {
+            let store = self.store.lock().await;
+            let ours = store.doc_version_bytes();
+            let behind = match roam_crdt::Version::from_bytes(&ours) {
+                // Peer is behind unless its advertised version already includes
+                // our whole document version.
+                Ok(ours_v) => !incoming.includes(&ours_v),
+                // Our own version bytes failed to decode: don't advertise.
+                Err(_) => false,
+            };
+            if behind {
+                store.held_snapshot_ids().unwrap_or_default()
+            } else {
+                Vec::new()
+            }
+        };
+        if !ids.is_empty() {
+            self.send(peer, Frame::SnapshotHave { ids }).await;
+        }
+    }
+
     /// Snapshot everything needed for a handshake under a single store lock.
     async fn gather_offer(&self) -> Offer {
         let store = self.store.lock().await;
@@ -885,6 +968,7 @@ mod tests {
             vault,
             store,
             Arc::new(board.endpoint(identity.peer_id())),
+            [0u8; 32],
         );
         assert!(engine.connected_peers().await.is_empty());
     }

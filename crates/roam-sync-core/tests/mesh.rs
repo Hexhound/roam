@@ -40,18 +40,21 @@ async fn c_learns_b_transitively_through_a() {
         vault,
         sa,
         Arc::new(board.endpoint(ia.peer_id())),
+        [0u8; 32],
     ));
     let eb = Arc::new(Engine::new(
         ib.clone(),
         vault,
         sb,
         Arc::new(board.endpoint(ib.peer_id())),
+        [0u8; 32],
     ));
     let ec = Arc::new(Engine::new(
         ic.clone(),
         vault,
         sc,
         Arc::new(board.endpoint(ic.peer_id())),
+        [0u8; 32],
     ));
     tokio::spawn(ea.clone().run());
     tokio::spawn(eb.clone().run());
@@ -116,9 +119,9 @@ async fn transitive_learn_adds_a_dynamic_route_under_strict_routing() {
     let tb = board.strict_endpoint(ib.peer_id(), &[ia.peer_id(), ic.peer_id()]);
     let tc = board.strict_endpoint(ic.peer_id(), &[ib.peer_id()]);
 
-    let ea = Arc::new(Engine::new(ia.clone(), vault, sa, Arc::new(ta)));
-    let eb = Arc::new(Engine::new(ib.clone(), vault, sb, Arc::new(tb)));
-    let ec = Arc::new(Engine::new(ic.clone(), vault, sc, Arc::new(tc)));
+    let ea = Arc::new(Engine::new(ia.clone(), vault, sa, Arc::new(ta), [0u8; 32]));
+    let eb = Arc::new(Engine::new(ib.clone(), vault, sb, Arc::new(tb), [0u8; 32]));
+    let ec = Arc::new(Engine::new(ic.clone(), vault, sc, Arc::new(tc), [0u8; 32]));
     tokio::spawn(ea.clone().run());
     tokio::spawn(eb.clone().run());
     tokio::spawn(ec.clone().run());
@@ -158,12 +161,14 @@ async fn revoked_peer_edits_stop_propagating() {
         vault,
         sa,
         Arc::new(board.endpoint(ia.peer_id())),
+        [0u8; 32],
     ));
     let eb = Arc::new(Engine::new(
         ib.clone(),
         vault,
         sb,
         Arc::new(board.endpoint(ib.peer_id())),
+        [0u8; 32],
     ));
     tokio::spawn(ea.clone().run());
     tokio::spawn(eb.clone().run());
