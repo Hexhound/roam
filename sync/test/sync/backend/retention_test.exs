@@ -125,5 +125,27 @@ defmodule Sync.Backend.RetentionTest do
       assert "eold" in Store.list(b, "entries")
       assert "borphan" in Store.list(b, "blobs")
     end
+
+    test "M-A: a manifest with a non-list/non-map shape is skipped, never crashing the sweep",
+         %{bucket: b} do
+      # A snapshot whose manifest parses as JSON but is the wrong SHAPE (a string
+      # where a list is expected, or a non-map) must be SKIPPED like an unparseable
+      # frame — not raise. Otherwise BE4's per-bucket rescue demotes the crash to
+      # PERMANENT starvation: this one poison object makes the bucket's sweep raise
+      # on every run, so its retention never reclaims disk (unbounded growth).
+      good = snapshot_frame(["eold"], ["bkeep"])
+      for id <- ["s1", "s2", "s3", "s4"], do: Store.put(b, "snapshots", id, good)
+
+      wrong_field = Jason.encode!(%{"subsumed_entry_ids" => "not-a-list", "blob_ref_ids" => []})
+      Store.put(b, "snapshots", "poison", <<byte_size(wrong_field)::little-32>> <> wrong_field)
+      non_map = Jason.encode!(5)
+      Store.put(b, "snapshots", "nonmap", <<byte_size(non_map)::little-32>> <> non_map)
+
+      Store.put(b, "entries", "eold", "x")
+
+      # Must not raise; the healthy snapshots still fold and reclaim "eold".
+      result = Retention.sweep(b, keep: 3, grace_ms: 0, now_ms: 9_000_000_000_000)
+      assert "eold" in result.entries
+    end
   end
 end

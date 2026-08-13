@@ -46,11 +46,13 @@ defmodule Sync.Backend.SweeperTest do
     assert Sweeper.sweep_all(keep: 3) == %{}
   end
 
-  test "sweep_all isolates a bucket whose retention raises and still sweeps the healthy buckets" do
-    # BE4: buckets are client-controlled. A snapshot manifest that parses as JSON
-    # but carries a non-list `subsumed_entry_ids` makes Retention.sweep raise
-    # (Enum over a string). One poisoned bucket must not abort the whole periodic
-    # sweep and starve every other bucket of retention.
+  test "sweep_all tolerates a shape-poisoned bucket and still sweeps the healthy buckets" do
+    # BE4 + M-A: buckets are client-controlled. A snapshot manifest that parses as
+    # JSON but carries a non-list `subsumed_entry_ids` is now SKIPPED at parse time
+    # (M-A) rather than raising, so the poisoned bucket sweeps cleanly instead of
+    # crash-looping. Either way, one poisoned bucket must never abort the whole
+    # periodic sweep and starve every other bucket of retention (BE4's per-bucket
+    # isolation remains as defense-in-depth for any other unforeseen raise).
     good = String.duplicate("A", 43)
     bad = String.duplicate("B", 43)
 
@@ -58,15 +60,18 @@ defmodule Sync.Backend.SweeperTest do
     for id <- ["s1", "s2", "s3", "s4"], do: Store.put(good, "snapshots", id, frame)
     Store.put(good, "entries", "esub", "x")
 
-    # subsumed_entry_ids is a bare string, not a list -> Retention.sweep raises.
+    # subsumed_entry_ids is a bare string, not a list -> M-A skips this snapshot.
     Store.put(bad, "snapshots", "s1", snapshot_frame("boom", []))
 
     results = Sweeper.sweep_all(keep: 3, grace_ms: 0, now_ms: 9_000_000_000_000)
 
     # The healthy bucket is still compacted despite the poisoned neighbour.
     assert length(Store.list(good, "snapshots")) == 3
-    # The poisoned bucket is reported (handled), not a crash that killed the run.
+    # The poisoned bucket is handled gracefully (its bad snapshot skipped), never a
+    # crash that killed the run.
     assert Map.has_key?(results, bad)
-    assert match?({:error, _}, results[bad])
+    assert is_map(results[bad])
+    # The poison object parses to no valid snapshot, so nothing is dropped there.
+    assert results[bad] == %{snapshots: [], entries: [], blobs: []}
   end
 end

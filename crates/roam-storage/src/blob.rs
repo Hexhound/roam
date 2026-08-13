@@ -224,12 +224,29 @@ impl BlobStore {
         std::fs::create_dir_all(&dir)?;
         let part = dir.join(format!("{hash}.part"));
 
+        let existed = part.exists();
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
             .open(&part)?;
-        file.set_len(total_len)?;
+        // Pin `total_len` to the first-seen value. It is a property of the
+        // content-addressed hash, so every honest chunk for a hash carries the
+        // same value; a co-serving peer that re-announces a DIFFERENT (smaller)
+        // total_len would otherwise `set_len`-TRUNCATE the `.part` an honest
+        // sender already partially filled — corrupting the transfer so it never
+        // finalizes, repeatable to stall it forever. Size the file once on
+        // creation and refuse any later disagreement.
+        if existed {
+            let pinned = file.metadata()?.len();
+            if pinned != total_len {
+                return Err(StorageError::Blob(format!(
+                    "blob chunk total_len {total_len} disagrees with pinned {pinned} for {hash}"
+                )));
+            }
+        } else {
+            file.set_len(total_len)?;
+        }
         file.seek(SeekFrom::Start(offset))?;
         file.write_all(bytes)?;
         Ok(())
@@ -504,6 +521,45 @@ mod tests {
                 "the part file must never exceed total_len; got {len}"
             );
         }
+    }
+
+    #[test]
+    fn write_incoming_chunk_pins_total_len_and_rejects_a_shrinking_reannounce() {
+        // Grief (2nd-pass "set_len truncation"): `total_len` is a property of the
+        // content-addressed hash, so every honest chunk for a hash carries the
+        // same value. A co-serving peer that sends a chunk with a SMALLER
+        // total_len would, via the unconditional `set_len(total_len)`, TRUNCATE
+        // the `.part` an honest sender already partially filled — corrupting the
+        // transfer so it never finalizes (hash mismatch), and repeatable to stall
+        // it forever. total_len must be pinned to the first-seen value.
+        let dir = tempdir().unwrap();
+        let bs = open(&dir);
+        let hash = BlobStore::hash(b"a three-megabyte-ish blob (pretend)");
+        let total_len = 100u64;
+
+        bs.write_incoming_chunk(&hash, 0, total_len, b"hello")
+            .unwrap();
+        let part = dir
+            .path()
+            .join("assets")
+            .join("incoming")
+            .join(format!("{hash}.part"));
+        assert_eq!(std::fs::metadata(&part).unwrap().len(), total_len);
+
+        // A later chunk claiming a different (smaller) total_len must be refused,
+        // never allowed to shrink the pinned part file.
+        assert!(
+            matches!(
+                bs.write_incoming_chunk(&hash, 0, 1, b"x"),
+                Err(StorageError::Blob(_))
+            ),
+            "a chunk whose total_len disagrees with the pinned value must be rejected"
+        );
+        assert_eq!(
+            std::fs::metadata(&part).unwrap().len(),
+            total_len,
+            "the pinned part file must not be truncated by a hostile re-announce"
+        );
     }
 
     #[test]

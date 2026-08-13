@@ -135,7 +135,7 @@ pub struct PeerRecord {
 /// tie-broken by `added_by` then least privilege. Any admin can thus re-promote
 /// or demote any client; there is no per-granting-admin floor.
 pub fn merge_roster(entries: &mut [RosterEntry], founder: Option<u64>) -> Vec<PeerRecord> {
-    use std::collections::{BTreeMap, HashSet};
+    use std::collections::{BTreeMap, BTreeSet, HashSet};
     let valid: Vec<&RosterEntry> = entries
         .iter()
         .filter(|e| e.subject_peer == u64::from_le_bytes(e.subject_key[0..8].try_into().unwrap()))
@@ -168,6 +168,40 @@ pub fn merge_roster(entries: &mut [RosterEntry], founder: Option<u64>) -> Vec<Pe
     // added_by) — the same admin asserting two roles at one clock, e.g. a
     // hand-built or replayed tie — falls back to least privilege.
     let mut roles: BTreeMap<u64, (u64, u64, Role)> = BTreeMap::new();
+    // H-A causal gap-rule: the per-subject role Lamport is a self-asserted scalar
+    // signed by its author. Honest clocks climb by exactly +1 per decision
+    // (`next_role_lamport` = 1 + max observed for the subject), so a legitimate
+    // sequence is contiguous (concurrent decisions merely SHARE a value — a
+    // duplicate, not a gap). A grant whose lamport jumps more than 1 past the
+    // grounded prefix is a forged clock (e.g. a malicious admin asserting
+    // `u64::MAX` to make a role pin unbeatable — one that would survive even the
+    // attacker's own later revocation via the grandfathered `ever_admin` set).
+    // Per subject, walk its admin-authored grant lamports ascending and take the
+    // contiguous prefix from its floor as the admissible ceiling; grants above it
+    // are ignored for role selection (keys/revocation are unaffected).
+    let mut ceilings: BTreeMap<u64, u64> = BTreeMap::new();
+    {
+        let mut per_subject: BTreeMap<u64, BTreeSet<u64>> = BTreeMap::new();
+        for e in valid.iter().filter(|e| ever_admin.contains(&e.added_by)) {
+            if matches!(&e.op, RosterOp::Add { .. } | RosterOp::SetRole { .. }) {
+                per_subject
+                    .entry(e.subject_peer)
+                    .or_default()
+                    .insert(e.lamport);
+            }
+        }
+        for (subject, lamports) in per_subject {
+            let mut ceiling = 0u64;
+            for (i, lamport) in lamports.into_iter().enumerate() {
+                if i == 0 || lamport <= ceiling + 1 {
+                    ceiling = lamport;
+                } else {
+                    break;
+                }
+            }
+            ceilings.insert(subject, ceiling);
+        }
+    }
     for e in valid.iter().filter(|e| ever_admin.contains(&e.added_by)) {
         keys.entry(e.subject_peer)
             .and_modify(|k| {
@@ -181,6 +215,10 @@ pub fn merge_roster(entries: &mut [RosterEntry], founder: Option<u64>) -> Vec<Pe
                 revoked.insert(e.subject_peer);
             }
             RosterOp::Add { role } | RosterOp::SetRole { role } => {
+                // Ignore forged clock jumps above the subject's causal ceiling.
+                if e.lamport > *ceilings.get(&e.subject_peer).unwrap_or(&0) {
+                    continue;
+                }
                 let cand = (e.lamport, e.added_by, *role);
                 roles
                     .entry(e.subject_peer)
@@ -647,6 +685,52 @@ mod tests {
             peers.iter().find(|p| p.peer_id == b).unwrap().role,
             Role::Admin,
             "the newest decision (f's re-promote) wins; a2's earlier demotion no longer floors"
+        );
+    }
+
+    #[test]
+    fn a_forged_max_lamport_pin_cannot_survive_an_honest_re_promote() {
+        // N3 hardening (H-A): the per-subject role Lamport is a self-asserted
+        // scalar signed by its author. A malicious admin must NOT be able to pin a
+        // victim's role by asserting `u64::MAX` (an unbeatable clock value that no
+        // honest admin could ever exceed, so the pin would survive even the
+        // attacker's own later revocation via the grandfathered ever_admin set).
+        // Honest clocks climb by exactly +1 per decision, so a lamport that jumps
+        // more than 1 past a subject's grounded sequence is a forged jump and must
+        // be ignored for role selection.
+        let (f, f_key) = pid(10);
+        let (a, a_key) = pid(20);
+        let (b, b_key) = pid(30);
+        let grant = |sub, key, by, lamport, role| RosterEntry {
+            seq: lamport,
+            lamport,
+            op: RosterOp::Add { role },
+            subject_peer: sub,
+            subject_key: key,
+            added_by: by,
+        };
+        let set = |sub, key, by, lamport, role| RosterEntry {
+            seq: lamport,
+            lamport,
+            op: RosterOp::SetRole { role },
+            subject_peer: sub,
+            subject_key: key,
+            added_by: by,
+        };
+        let mut entries = vec![
+            grant(f, f_key, f, 1, Role::Admin),
+            grant(a, a_key, f, 1, Role::Admin),
+            grant(b, b_key, f, 1, Role::Admin),
+            // Malicious admin a asserts an unbeatable clock to pin b to Reader.
+            set(b, b_key, a, u64::MAX, Role::Reader),
+            // Honest founder f re-promotes b with a normal causal +1 step.
+            set(b, b_key, f, 2, Role::Admin),
+        ];
+        let peers = merge_roster(&mut entries, Some(f));
+        assert_eq!(
+            peers.iter().find(|p| p.peer_id == b).unwrap().role,
+            Role::Admin,
+            "a forged u64::MAX pin is a non-causal jump and must not floor an honest re-promote"
         );
     }
 

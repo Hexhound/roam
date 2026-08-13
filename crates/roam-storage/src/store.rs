@@ -745,7 +745,13 @@ impl Store {
             .map(|e| e.lamport)
             .max()
             .unwrap_or(0);
-        Ok(max + 1)
+        // H-A: saturate rather than `+ 1`. A hostile/corrupted roster line can
+        // carry `lamport == u64::MAX`; `MAX + 1` would panic under debug
+        // overflow-checks (a remote-triggerable crash) and wrap to 0 under release
+        // (silently losing this honest decision). The fold's causal gap-rule
+        // (see `merge_roster`) additionally ignores such forged jumps for role
+        // selection, so saturating here is a safe, panic-free clock.
+        Ok(max.saturating_add(1))
     }
 
     fn refresh_peers(&mut self) -> Result<(), StorageError> {
@@ -787,12 +793,18 @@ impl Store {
         let roster_log = RosterLog::new(&roster_dir, author);
         let roster_path = roster_log.path();
 
-        // Roster logs are append-only: refuse a shorter/older resend that would
-        // truncate newer entries already on disk.
+        // H-B: roster logs are append-only, so a correct incoming log is a byte
+        // PREFIX extension of what we already hold. `verify_bytes` (below) only
+        // proves each line is author-signed — NOT that the log genuinely extends
+        // ours; a malicious author can sign a DIVERGENT longer fork of its own log
+        // (e.g. omitting a `Revoke`) that a length-only guard would let clobber the
+        // good copy. Take the incoming bytes only when they truly extend ours (or
+        // are an identical resend); refuse a stale prefix, a shrink, or a fork.
         if let Ok(existing) = std::fs::read(&roster_path) {
-            if bytes.len() < existing.len() {
+            if !bytes.starts_with(&existing) {
                 return Err(StorageError::Peer(format!(
-                    "refusing to shrink roster {author} log ({} < {} bytes)",
+                    "refusing to clobber roster {author} log with a non-extending fork \
+                     ({} vs {} bytes on disk)",
                     bytes.len(),
                     existing.len()
                 )));
@@ -1086,10 +1098,16 @@ impl Store {
         std::fs::create_dir_all(&dir)?;
         let log = KeyLog::new(&dir, author);
         let path = log.path();
+        // H-B: key-logs are append-only — a correct incoming log is a byte PREFIX
+        // extension of ours. `verify_bytes` proves author-signing, not prefix
+        // consistency; a divergent longer fork must not clobber ours (which would
+        // drop a previously-published `Rotate`/`Wrap` from the epoch DAG). Refuse
+        // anything that is not a genuine extension (or identical resend).
         if let Ok(existing) = std::fs::read(&path) {
-            if bytes.len() < existing.len() {
+            if !bytes.starts_with(&existing) {
                 return Err(StorageError::Peer(format!(
-                    "refusing to shrink keylog {author} ({} < {} bytes)",
+                    "refusing to clobber keylog {author} with a non-extending fork \
+                     ({} vs {} bytes on disk)",
                     bytes.len(),
                     existing.len()
                 )));
@@ -1821,6 +1839,137 @@ mod tests {
             size.total,
             size.blobs + size.oplog + size.meta,
             "total is the sum of every bucket"
+        );
+    }
+
+    #[test]
+    fn import_roster_refuses_to_clobber_with_a_divergent_fork() {
+        // H-B: roster logs are append-only, so a correct incoming log must be a
+        // byte-PREFIX extension of what we already hold. `verify_bytes` only
+        // proves each line is author-signed — NOT that the log genuinely extends
+        // ours. A malicious author can sign a DIVERGENT fork of its own log (e.g.
+        // one that omits a `Revoke`, padded to be same-or-longer) that passes the
+        // length-only shrink guard and clobbers the good copy on disk, dropping
+        // the revocation (un-revoke). Only `import_roster_bundle` had this guard;
+        // `import_roster` must have it too.
+        let x = Identity::generate();
+        let (v, v_key) = {
+            let k = [9u8; 32];
+            (u64::from_le_bytes(k[0..8].try_into().unwrap()), k)
+        };
+
+        // v1: X vouches V as Admin, then REVOKES V (the good, current history).
+        let d1 = tempdir().unwrap();
+        let mut xs1 = Store::open(d1.path(), x.clone()).unwrap();
+        xs1.declare_founder(Role::Admin).unwrap();
+        xs1.add_peer(v, v_key, Role::Admin).unwrap();
+        xs1.revoke_peer(v, v_key).unwrap();
+        let v1 = xs1.export_own_roster().unwrap();
+
+        // v2: same X, same prefix, but instead of the Revoke it adds filler peers
+        // — a divergent fork that is strictly longer (beats the shrink guard).
+        let d2 = tempdir().unwrap();
+        let mut xs2 = Store::open(d2.path(), x.clone()).unwrap();
+        xs2.declare_founder(Role::Admin).unwrap();
+        xs2.add_peer(v, v_key, Role::Admin).unwrap();
+        let (w, w_key) = {
+            let k = [11u8; 32];
+            (u64::from_le_bytes(k[0..8].try_into().unwrap()), k)
+        };
+        let (w2, w2_key) = {
+            let k = [12u8; 32];
+            (u64::from_le_bytes(k[0..8].try_into().unwrap()), k)
+        };
+        xs2.add_peer(w, w_key, Role::Reader).unwrap();
+        xs2.add_peer(w2, w2_key, Role::Reader).unwrap();
+        let v2 = xs2.export_own_roster().unwrap();
+        assert!(
+            v2.len() >= v1.len(),
+            "the fork is padded to beat the shrink guard"
+        );
+        assert!(!v2.starts_with(&v1), "the fork genuinely diverges from v1");
+
+        // A third device holds X's good log, then sees the fork.
+        let ds = tempdir().unwrap();
+        let mut s = Store::open(ds.path(), Identity::generate()).unwrap();
+        s.import_roster(x.peer_id(), &x.verifying_key(), v1.clone())
+            .unwrap();
+        assert!(
+            s.import_roster(x.peer_id(), &x.verifying_key(), v2)
+                .is_err(),
+            "a divergent fork must be refused, not written over the good log"
+        );
+    }
+
+    #[test]
+    fn import_keylog_refuses_to_clobber_with_a_divergent_fork() {
+        // H-B (keylog sibling): same append-only prefix invariant. A divergent
+        // longer keylog fork must not overwrite ours (which would drop a
+        // previously-published `Rotate`/`Wrap` from the Admin-folded epoch DAG).
+        let x = Identity::generate();
+        const IDK: [u8; 32] = [0x1au8; 32];
+        const E0: [u8; 32] = [0x2bu8; 32];
+
+        let d1 = tempdir().unwrap();
+        let mut xs1 = Store::open(d1.path(), x.clone()).unwrap();
+        xs1.declare_founder(Role::Admin).unwrap();
+        xs1.rotate_epoch(&IDK, &E0, None).unwrap();
+        let k1 = xs1.export_own_keylog().unwrap();
+
+        // Independent keylog from the same identity: a different random epoch, and
+        // two rotations so it is strictly longer and not a prefix of k1.
+        let d2 = tempdir().unwrap();
+        let mut xs2 = Store::open(d2.path(), x.clone()).unwrap();
+        xs2.declare_founder(Role::Admin).unwrap();
+        xs2.rotate_epoch(&IDK, &E0, None).unwrap();
+        xs2.rotate_epoch(&IDK, &E0, None).unwrap();
+        let k2 = xs2.export_own_keylog().unwrap();
+        assert!(k2.len() >= k1.len());
+        assert!(!k2.starts_with(&k1), "the keylog fork genuinely diverges");
+
+        let ds = tempdir().unwrap();
+        let mut s = Store::open(ds.path(), Identity::generate()).unwrap();
+        s.import_keylog(x.peer_id(), &x.verifying_key(), k1.clone())
+            .unwrap();
+        assert!(
+            s.import_keylog(x.peer_id(), &x.verifying_key(), k2)
+                .is_err(),
+            "a divergent keylog fork must be refused, not written over ours"
+        );
+    }
+
+    #[test]
+    fn next_role_lamport_does_not_overflow_on_a_hostile_max_entry() {
+        // H-A: a hostile/corrupted roster line can carry `lamport == u64::MAX`
+        // for a subject. `next_role_lamport` folds it (raw, pre-merge) and must
+        // not compute `MAX + 1` — that panics under debug overflow-checks (a
+        // remote-triggerable crash of any honest admin's role mutation) and wraps
+        // to 0 under release (silently losing the honest decision).
+        let dir = tempdir().unwrap();
+        let mut store = Store::open(dir.path(), Identity::generate()).unwrap();
+        store.declare_founder(Role::Admin).unwrap();
+
+        let victim_key = [7u8; 32];
+        let victim = u64::from_le_bytes(victim_key[0..8].try_into().unwrap());
+        store.add_peer(victim, victim_key, Role::Reader).unwrap();
+
+        // Plant a line with an unbeatable clock value in our own roster log,
+        // simulating a hostile clock value present on disk.
+        store
+            .own_roster
+            .append(
+                &store.identity,
+                u64::MAX,
+                RosterOp::SetRole { role: Role::Reader },
+                victim,
+                victim_key,
+            )
+            .unwrap();
+
+        // An honest role change for that subject must still succeed (no panic).
+        assert!(
+            store.set_role(victim, victim_key, Role::Admin).is_ok(),
+            "an honest role mutation must not overflow on a hostile MAX lamport"
         );
     }
 

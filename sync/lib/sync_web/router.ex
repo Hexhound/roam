@@ -30,6 +30,30 @@ defmodule SyncWeb.Router do
 
   pipeline :raw do
     plug :accepts, ["*/*"]
+    plug :reject_multipart_body
+  end
+
+  # H-C: the raw sync routes carry opaque octet-stream ciphertext. The MULTIPART
+  # Plug.Parser reads the body via `read_part_body`, bypassing the caching
+  # `body_reader`, so a multipart PUT reaches the controller with an empty body
+  # and (first-write-wins, zero-knowledge) would poison the content-addressed id
+  # with a 0-byte object for every peer. A legitimate client never uses multipart
+  # here, so refuse it outright. (json/urlencoded are safe — they read through the
+  # CachingBodyReader and the controller recovers the raw bytes.)
+  defp reject_multipart_body(conn, _opts) do
+    case Plug.Conn.get_req_header(conn, "content-type") do
+      [content_type | _] ->
+        if String.starts_with?(content_type, "multipart/") do
+          conn
+          |> Plug.Conn.send_resp(415, "unsupported media type")
+          |> Plug.Conn.halt()
+        else
+          conn
+        end
+
+      _ ->
+        conn
+    end
   end
 
   scope "/b/:bucket", SyncWeb do

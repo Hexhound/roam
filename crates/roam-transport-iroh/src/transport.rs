@@ -323,12 +323,10 @@ async fn handle_conn(
     crate::dlog!("accept: inbound connection from peer={peer} (node={remote})");
 
     // Register this connection so `remove_route` (revoke) can force-close it and
-    // end this reader (T2). A reconnect from the same peer supersedes the prior
-    // connection, which we close so a peer can't hold two live readers.
-    if let Some(old) = inbound_conns.lock().unwrap().insert(peer, conn.clone()) {
-        if old.stable_id() != conn.stable_id() {
-            old.close(0u32.into(), b"superseded by reconnect");
-        }
+    // end this reader (T2). If the peer's route was concurrently removed, this
+    // self-evicts and we stop before spawning the reader (see the fn).
+    if !register_inbound_conn(peer, remote.as_bytes(), &conn, &routes, &inbound_conns) {
+        return Ok(());
     }
 
     let (_send, recv) = conn.accept_bi().await.context("accept inbound bi stream")?;
@@ -367,6 +365,39 @@ fn routes_contains_key(routes: &Routes, key: &[u8]) -> bool {
         .unwrap()
         .values()
         .any(|node_key| node_key.as_slice() == key)
+}
+
+/// Register `conn` as `peer`'s current inbound connection so a later
+/// `remove_route` (revoke) can force-close it (T2). A reconnect supersedes and
+/// closes the prior connection so a peer can't hold two live readers. Returns
+/// `true` if the caller should keep reading; `false` if it must drop `conn`.
+fn register_inbound_conn(
+    peer: u64,
+    remote_key: &[u8],
+    conn: &Connection,
+    routes: &Routes,
+    inbound_conns: &InboundConns,
+) -> bool {
+    if let Some(old) = inbound_conns.lock().unwrap().insert(peer, conn.clone()) {
+        if old.stable_id() != conn.stable_id() {
+            old.close(0u32.into(), b"superseded by reconnect");
+        }
+    }
+    // M-B: revoke-vs-reconnect TOCTOU. A reconnect can pass the accept-time gate
+    // just before `remove_route` drops the route, then land this insert just
+    // after `remove_route` scanned `inbound_conns` — surviving revoke with a live
+    // reader. `remove_route` removes the route BEFORE it scans the map, so if that
+    // scan missed our insert, the route is already gone: recheck here and
+    // self-evict, closing the window.
+    if !routes_contains_key(routes, remote_key) {
+        let mut map = inbound_conns.lock().unwrap();
+        if map.get(&peer).map(Connection::stable_id) == Some(conn.stable_id()) {
+            map.remove(&peer);
+        }
+        conn.close(0u32.into(), b"revoked (raced reconnect)");
+        return false;
+    }
+    true
 }
 
 /// Map an authenticated remote [`EndpointId`] back to a loro `peer_id`.
@@ -541,6 +572,65 @@ mod tests {
         assert!(
             after.is_err(),
             "a revoked peer's frames must not reach the inbound channel: {after:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn registering_an_inbound_conn_whose_route_was_removed_self_evicts() {
+        // M-B: revoke-vs-reconnect TOCTOU. A reconnect can pass the accept-time
+        // roster gate just BEFORE `remove_route` drops the route, then register
+        // its connection just AFTER `remove_route` scanned `inbound_conns` —
+        // leaving a live reader for a revoked peer (the exact flood T2 closes).
+        // Because `remove_route` removes the route before it scans the map, a
+        // post-insert route recheck catches the race. Drive that recheck directly:
+        // a real connection registered while the peer is NOT in `routes` must be
+        // closed and never retained.
+        use std::sync::{Arc, Mutex};
+
+        let host = Identity::generate();
+        let peer = Identity::generate();
+        let mut routes_host = HashMap::new();
+        routes_host.insert(peer.peer_id(), peer.verifying_key().to_bytes());
+        let mut routes_peer = HashMap::new();
+        routes_peer.insert(host.peer_id(), host.verifying_key().to_bytes());
+        let host_t = IrohTransport::spawn(&host, routes_host).await.unwrap();
+        let peer_t = IrohTransport::spawn(&peer, routes_peer).await.unwrap();
+        peer_t
+            .add_addr(host.peer_id(), host_t.endpoint_addr())
+            .await;
+
+        let mut host_in = host_t.incoming();
+        peer_t.dial(host.peer_id()).await.unwrap();
+        peer_t.send(host.peer_id(), Frame::Ping).await.unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(10), host_in.next())
+            .await
+            .expect("the peer's first frame must arrive")
+            .unwrap();
+
+        // Grab the real inbound Connection the host registered for the peer.
+        let conn = host_t
+            .inbound_conns
+            .lock()
+            .unwrap()
+            .get(&peer.peer_id())
+            .cloned()
+            .expect("peer's inbound conn is registered");
+
+        // Simulate the raced final state: the route is already gone when the
+        // late reconnect registers into a fresh map.
+        let empty_routes: Routes = Arc::new(Mutex::new(HashMap::new()));
+        let empty_inbound: InboundConns = Arc::new(Mutex::new(HashMap::new()));
+        let keep = register_inbound_conn(
+            peer.peer_id(),
+            &peer.verifying_key().to_bytes(),
+            &conn,
+            &empty_routes,
+            &empty_inbound,
+        );
+        assert!(!keep, "a conn whose route is gone must not keep reading");
+        assert!(
+            empty_inbound.lock().unwrap().is_empty(),
+            "the raced conn must be evicted, not left as a live reader"
         );
     }
 

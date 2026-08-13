@@ -142,16 +142,41 @@ defmodule Sync.Backend.Retention do
   end
 
   # Frame: u32-LE manifest_len ‖ manifest_json ‖ sealed_ct. Only the manifest is read.
+  #
+  # M-A: the manifest is attacker-supplied plaintext. Accept it only when it is a
+  # map whose id fields are lists of strings; anything else (a non-map, or a field
+  # of the wrong type) is treated like an unparseable frame and SKIPPED. Without
+  # this, a shape-poisoned-but-valid-JSON manifest raises (`Map.get/3` on a
+  # non-map, or `flat_map` over a non-list) on EVERY sweep of that bucket —
+  # BE4's per-bucket rescue then turns the crash into permanent retention
+  # starvation (unbounded disk growth for that bucket).
   defp parse_manifest(bytes) do
     case bytes do
       <<len::little-32, rest::binary>> when byte_size(rest) >= len ->
         <<json::binary-size(len), _sealed::binary>> = rest
-        Jason.decode(json)
+
+        case Jason.decode(json) do
+          {:ok, manifest}
+          when is_map(manifest) ->
+            if id_list?(Map.get(manifest, "subsumed_entry_ids", [])) and
+                 id_list?(Map.get(manifest, "blob_ref_ids", [])) do
+              {:ok, manifest}
+            else
+              :error
+            end
+
+          _ ->
+            :error
+        end
 
       _ ->
         :error
     end
   end
+
+  # A manifest id field must be a list of opaque string ids — reject any other
+  # shape so downstream `flat_map`/`rm` never raise on attacker-crafted types.
+  defp id_list?(value), do: is_list(value) and Enum.all?(value, &is_binary/1)
 
   defp file_ages(root, bucket, kind) do
     dir = Path.join([root, bucket, kind])

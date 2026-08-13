@@ -128,6 +128,32 @@ defmodule SyncWeb.SyncControllerTest do
     assert got.resp_body == raw
   end
 
+  test "a multipart/form-data PUT cannot poison a content-addressed id (H-C)", %{conn: conn} do
+    # H-C: the BE3 fix caches the raw body only for parsers that use the
+    # configured `body_reader` (json/urlencoded). The MULTIPART parser reads the
+    # body via `read_part_body` and never calls `body_reader`, so a multipart PUT
+    # is consumed but NEVER cached — the controller's read_raw_body then sees ""
+    # and (first-write-wins) stores a 0-byte object under the attacker-chosen id,
+    # permanently poisoning it for every peer. The raw routes are octet-stream
+    # only, so a multipart content-type must be refused, never stored.
+    boundary = "----roamtestboundary"
+
+    body =
+      "--#{boundary}\r\n" <>
+        "Content-Disposition: form-data; name=\"x\"\r\n\r\n\r\n" <>
+        "--#{boundary}--\r\n"
+
+    conn =
+      put_req_header(conn, "content-type", "multipart/form-data; boundary=#{boundary}")
+
+    resp = put(conn, "/b/#{@bucket}/blobs/#{@id}", body)
+    assert resp.status == 415, "a multipart PUT must be refused, not stored empty"
+
+    # The id must NOT have been poisoned with an empty object.
+    got = get(build_conn(), "/b/#{@bucket}/blobs/#{@id}")
+    assert got.status == 404, "the content-addressed id must be untouched"
+  end
+
   test "an oversized body fails closed (413), never 500", %{conn: conn} do
     # >8MB exceeds read_body's default limit -> {:more, ...}; the controller must
     # fail closed with 413, not raise WithClauseError -> 500.
