@@ -14,6 +14,51 @@ use std::collections::{BTreeMap, BTreeSet};
 /// is all-zero with probability 2^-256 — never colliding with this sentinel.
 pub const EPOCH0_ID: [u8; 32] = [0u8; 32];
 
+/// A 32-byte epoch/AEAD secret that wipes itself on drop. The keychain resolves
+/// which epoch keys this device holds and threads them through `EpochNode.key`,
+/// `Keychain.id_key`, `ReadPlan.key`, and the `epoch_key`/`head_write_key`/
+/// `backfill_targets` returns; wrapping them here means a decrypted epoch key
+/// never lingers in freed memory. There is deliberately no `Deref` to the raw
+/// bytes — every use of the secret goes through the explicit [`Self::expose`] so
+/// exposure sites stay greppable — and it compares by value so the structs that
+/// hold it keep `Eq`.
+#[derive(Clone, zeroize::ZeroizeOnDrop)]
+pub struct SecretKey([u8; 32]);
+
+impl SecretKey {
+    pub fn new(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Borrow the raw key bytes (for AEAD seal/open and key-wrap). The one
+    /// sanctioned way to read the secret — no implicit `Deref` coercion.
+    pub fn expose(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+// The keychain never compares secret keys against attacker-supplied input on a
+// timing-sensitive path (equality is used by structural `Eq` on the read plan
+// and in test assertions), so a plain byte compare is sufficient here.
+impl PartialEq for SecretKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+impl Eq for SecretKey {}
+
+impl PartialEq<[u8; 32]> for SecretKey {
+    fn eq(&self, other: &[u8; 32]) -> bool {
+        &self.0 == other
+    }
+}
+
+impl std::fmt::Debug for SecretKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SecretKey(<redacted>)")
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EpochNode {
     pub parents: Vec<[u8; 32]>,
@@ -24,7 +69,7 @@ pub struct EpochNode {
     pub nonce: [u8; 32],
     /// `Some` if this device can decrypt under this epoch; `None` = known to
     /// exist (a `Rotate` seen) but not yet unwrappable → `WaitingKey` fuel.
-    pub key: Option<[u8; 32]>,
+    pub key: Option<SecretKey>,
     /// Recipients this epoch has been wrapped to (from `Wrap` entries).
     pub wrapped_to: BTreeSet<u64>,
     pub wrapped_paper: bool,
@@ -32,7 +77,7 @@ pub struct EpochNode {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Keychain {
-    pub id_key: [u8; 32],
+    pub id_key: SecretKey,
     pub epochs: BTreeMap<[u8; 32], EpochNode>,
     pub head: [u8; 32],
 }
@@ -56,7 +101,7 @@ pub enum VaultIssue {
 pub struct ReadPlan {
     pub epoch: [u8; 32],
     /// The AEAD key to use, or `None` → item is `Undecryptable{epoch}` for now.
-    pub key: Option<[u8; 32]>,
+    pub key: Option<SecretKey>,
     /// Byte offset of `nonce||ct` within the stored payload (32 if epoch-tagged,
     /// 0 if legacy/epoch-0).
     pub body_offset: usize,
@@ -106,7 +151,7 @@ impl Keychain {
                 parents: vec![],
                 minted_by: 0,
                 nonce: [0u8; 32],
-                key: Some(epoch0_key),
+                key: Some(SecretKey::new(epoch0_key)),
                 wrapped_to: BTreeSet::new(),
                 wrapped_paper: false,
             },
@@ -152,7 +197,7 @@ impl Keychain {
                                 if compute_epoch_id(&node.parents, node.minted_by, &node.nonce, &k)
                                     == e.epoch_id
                                 {
-                                    node.key = Some(k);
+                                    node.key = Some(SecretKey::new(k));
                                 }
                             }
                         }
@@ -164,7 +209,7 @@ impl Keychain {
 
         let head = Self::select_head(&epochs);
         Self {
-            id_key,
+            id_key: SecretKey::new(id_key),
             epochs,
             head,
         }
@@ -188,15 +233,15 @@ impl Keychain {
             .unwrap_or(EPOCH0_ID)
     }
 
-    pub fn epoch_key(&self, epoch: &[u8; 32]) -> Option<[u8; 32]> {
-        self.epochs.get(epoch).and_then(|n| n.key)
+    pub fn epoch_key(&self, epoch: &[u8; 32]) -> Option<SecretKey> {
+        self.epochs.get(epoch).and_then(|n| n.key.clone())
     }
 
     /// The AEAD key to seal new writes under (the head epoch's key), plus its id.
     /// `None` when the head epoch's key isn't held yet (a `Rotate` was seen but its
     /// `Wrap` for us hasn't landed). Callers MUST NOT fall back to epoch 0 in that
     /// case unless [`Self::head`] is epoch 0 — see H1 in the security review.
-    pub fn head_write_key(&self) -> Option<([u8; 32], [u8; 32])> {
+    pub fn head_write_key(&self) -> Option<([u8; 32], SecretKey)> {
         self.epoch_key(&self.head).map(|k| (self.head, k))
     }
 
@@ -217,7 +262,7 @@ impl Keychain {
                 if let Some(node) = self.epochs.get(&prefix) {
                     return ReadPlan {
                         epoch: prefix,
-                        key: node.key,
+                        key: node.key.clone(),
                         body_offset: 32,
                     };
                 }
@@ -268,7 +313,7 @@ impl Keychain {
     /// Wrap-back-fill targets: `(epoch_id, epoch_key, recipient_peer)` triples this
     /// device SHOULD publish a `Wrap` for — epochs it can open, and current
     /// members with no wrap yet. The caller looks up member X25519 pubs.
-    pub fn backfill_targets(&self, roster: &[PeerRecord]) -> Vec<([u8; 32], [u8; 32], u64)> {
+    pub fn backfill_targets(&self, roster: &[PeerRecord]) -> Vec<([u8; 32], SecretKey, u64)> {
         let mut out = Vec::new();
         for (epoch, node) in &self.epochs {
             // Epoch 0 is the locally-derived, untagged genesis — never distributed
@@ -276,10 +321,12 @@ impl Keychain {
             if *epoch == EPOCH0_ID {
                 continue;
             }
-            let Some(key) = node.key else { continue };
+            let Some(key) = node.key.as_ref() else {
+                continue;
+            };
             for p in roster.iter().filter(|p| p.status == PeerStatus::Active) {
                 if !node.wrapped_to.contains(&p.peer_id) {
-                    out.push((*epoch, key, p.peer_id));
+                    out.push((*epoch, key.clone(), p.peer_id));
                 }
             }
         }
@@ -328,6 +375,23 @@ mod tests {
     }
 
     #[test]
+    fn an_epoch_secret_key_is_wiped_on_drop() {
+        // The epoch key material threaded through the keychain (EpochNode.key,
+        // Keychain.id_key, ReadPlan.key, and the epoch_key/head_write_key/
+        // backfill_targets returns) is wrapped in SecretKey, which zeroizes its
+        // bytes on drop so a decrypted epoch key never lingers in freed memory.
+        fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<SecretKey>();
+
+        // It still compares by value, so the structs that hold it keep deriving
+        // Eq (the read-classifier and diagnostics rely on structural equality).
+        assert_eq!(SecretKey::new([9u8; 32]), SecretKey::new([9u8; 32]));
+        assert_ne!(SecretKey::new([9u8; 32]), SecretKey::new([1u8; 32]));
+        // ...and compares against raw bytes for ergonomic assertions/lookups.
+        assert_eq!(SecretKey::new([9u8; 32]), [9u8; 32]);
+    }
+
+    #[test]
     fn epoch0_is_always_known_and_is_default_head() {
         let kc = Keychain::build(
             [1u8; 32],
@@ -337,7 +401,7 @@ mod tests {
             &[],
         );
         assert_eq!(kc.head, EPOCH0_ID);
-        assert_eq!(kc.epoch_key(&EPOCH0_ID), Some([2u8; 32]));
+        assert_eq!(kc.epoch_key(&EPOCH0_ID), Some(SecretKey::new([2u8; 32])));
     }
 
     #[test]
@@ -426,7 +490,7 @@ mod tests {
             &me.x25519_secret(),
             &entries,
         );
-        assert_eq!(kc.epoch_key(&epoch), Some(k_new));
+        assert_eq!(kc.epoch_key(&epoch), Some(SecretKey::new(k_new)));
         assert_eq!(kc.head, epoch, "head advances to the new leaf epoch");
     }
 
@@ -513,7 +577,7 @@ mod tests {
         let plan = kc.classify(&tagged);
         assert_eq!(plan.epoch, epoch);
         assert_eq!(plan.body_offset, 32);
-        assert_eq!(plan.key, Some([9u8; 32]));
+        assert_eq!(plan.key, Some(SecretKey::new([9u8; 32])));
 
         // Legacy payload (random 40 bytes, prefix not a known epoch) → epoch 0.
         let legacy = vec![0x11u8; 40];

@@ -20,7 +20,7 @@ const RBSR_ROUND_CAP: usize = 32;
 fn open_classified(kc: &Keychain, payload: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
     let plan = kc.classify(payload);
     let Some(key) = plan.key else { return Ok(None) };
-    match crate::crypto::open_epoch(&key, &payload[plan.body_offset..]) {
+    match crate::crypto::open_epoch(key.expose(), &payload[plan.body_offset..]) {
         Ok(pt) => Ok(Some(pt)),
         // A wrong/unknown-epoch blob mis-read as epoch 0 fails the tag check ->
         // pending Undecryptable, self-heals when the key-log delivers the epoch.
@@ -353,9 +353,11 @@ async fn import_needed_snapshots<B: Backend>(
 /// caller skips the write; it self-heals once the key-log delivers the epoch.
 fn seal_under_head(kc: &Keychain, key: &VaultKey, plaintext: &[u8]) -> Option<Vec<u8>> {
     match kc.head_write_key() {
-        Some((epoch_id, epoch_key)) if epoch_id != EPOCH0_ID => {
-            Some(crate::crypto::seal_epoch(&epoch_key, &epoch_id, plaintext))
-        }
+        Some((epoch_id, epoch_key)) if epoch_id != EPOCH0_ID => Some(crate::crypto::seal_epoch(
+            epoch_key.expose(),
+            &epoch_id,
+            plaintext,
+        )),
         // Head key held and head is epoch 0 -> legacy seal is the correct write.
         Some(_) => Some(key.seal(plaintext)),
         // No head key. Only safe if the vault never rotated (head is epoch 0);

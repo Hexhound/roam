@@ -43,7 +43,7 @@ pub fn open_classified(kc: &Keychain, payload: &[u8]) -> Result<Option<Vec<u8>>,
     let Some(key) = plan.key else {
         return Ok(None);
     };
-    match crate::epoch_crypto::open_epoch(&key, &payload[plan.body_offset..]) {
+    match crate::epoch_crypto::open_epoch(key.expose(), &payload[plan.body_offset..]) {
         Ok(pt) => Ok(Some(pt)),
         Err(_) => Ok(None),
     }

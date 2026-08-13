@@ -1037,7 +1037,7 @@ impl Store {
                 },
                 None => continue,
             };
-            let blob = keywrap::wrap(&pub_x, &key);
+            let blob = keywrap::wrap(&pub_x, key.expose());
             log.append(
                 &self.identity,
                 epoch,
@@ -2677,7 +2677,7 @@ mod tests {
         );
         assert_ne!(
             kc.epoch_key(&new_epoch),
-            Some(epoch0),
+            Some(crate::keychain::SecretKey::new(epoch0)),
             "epoch key is fresh random"
         );
     }
