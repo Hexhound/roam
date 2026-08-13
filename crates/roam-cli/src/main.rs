@@ -125,6 +125,20 @@ enum Command {
         #[arg(long, conflicts_with = "paper")]
         generate_paper: bool,
     },
+    /// Recover epoch keys sealed to a paper-recovery phrase. Use when this device
+    /// joined after a rotation, or every device that held an epoch key was lost:
+    /// re-enter the EXACT phrase printed by `rotate --generate-paper` (or the one
+    /// you passed to `--paper`) to regain read access to data sealed under the
+    /// rotated epoch(s). Local only; re-wraps the recovered keys to this device.
+    Recover {
+        #[arg(long)]
+        vault: PathBuf,
+        #[arg(long)]
+        identity: PathBuf,
+        /// The paper-recovery phrase, entered verbatim (with hyphens).
+        #[arg(long)]
+        paper: String,
+    },
     /// List recoverable history: retained markers (time points) and currently
     /// deleted files that `restore` can bring back.
     History {
@@ -235,6 +249,11 @@ async fn main() -> Result<()> {
             paper,
             generate_paper,
         } => rotate(&vault, &identity, paper, generate_paper).await,
+        Command::Recover {
+            vault,
+            identity,
+            paper,
+        } => recover(&vault, &identity, &paper).await,
         Command::History { vault, identity } => history(&vault, &identity).await,
         Command::Checkpoint {
             vault,
@@ -1161,6 +1180,32 @@ fn parse_before(before: &str) -> anyhow::Result<i64> {
     before
         .parse::<i64>()
         .map_err(|_| anyhow::anyhow!("--before must be 'latest' or epoch-millis, got {before:?}"))
+}
+
+/// Recover epoch keys sealed to a paper-recovery phrase. Loads the shared vault
+/// key (for the id/epoch-0 subkeys), then hands the phrase to
+/// [`Store::recover_with_paper`], which unwraps every `Recipient::Paper` epoch
+/// wrap this device cannot already open and re-wraps it to this device.
+async fn recover(vault: &Path, identity_path: &Path, phrase: &str) -> Result<()> {
+    use roam_backend_client::crypto::VaultKey;
+    let identity = Identity::load(identity_path).context("load identity")?;
+    let vault_key = VaultKey(*load_vault_key(vault)?);
+    let mut store = Store::open(vault, identity).context("open vault store")?;
+    let recovered = store
+        .recover_with_paper(phrase, &vault_key.id_key(), &vault_key.epoch0_key())
+        .context("recover with paper key")?;
+    if recovered == 0 {
+        println!(
+            "no epochs recovered: this device already holds every key it can, or the \
+             phrase matched no paper wrap (check it was entered verbatim, with hyphens)."
+        );
+    } else {
+        println!(
+            "recovered {recovered} epoch key(s) from the paper phrase. \
+             This device can now read data sealed under them."
+        );
+    }
+    Ok(())
 }
 
 /// List recoverable history for a vault (read-only): the retained history markers

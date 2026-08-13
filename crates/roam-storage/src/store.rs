@@ -1076,6 +1076,74 @@ impl Store {
         Ok(published)
     }
 
+    /// Recover epoch keys held only by a paper-recovery key.
+    ///
+    /// The disaster-recovery consume side of [`rotate_epoch`]'s `--paper` wrap:
+    /// for every epoch this device cannot currently open but which carries a
+    /// `Recipient::Paper` wrap in the merged key-log, derive the paper key from
+    /// `phrase`, unwrap that blob, and RE-WRAP the recovered key to this device's
+    /// own key (a self-addressed `Wrap` appended to our own key-log). Subsequent
+    /// keychain builds then treat this device as holding the epoch — so a device
+    /// that was never a wrap recipient (all originals lost, or it joined after the
+    /// rotation) regains read access from the printed phrase alone.
+    ///
+    /// Returns the number of epochs newly recovered. Idempotent: an epoch this
+    /// device already holds is skipped, so re-running recovers nothing more.
+    ///
+    /// `id_key`/`epoch0_key` are the two vault-key subkeys (see
+    /// `roam_backend_client::crypto::VaultKey`), passed in because the Store never
+    /// persists the vault secret.
+    pub fn recover_with_paper(
+        &mut self,
+        phrase: &str,
+        id_key: &[u8; 32],
+        epoch0_key: &[u8; 32],
+    ) -> Result<usize, StorageError> {
+        let paper = crate::paper::PaperKey::from_passphrase(phrase);
+        let paper_secret = paper.secret();
+        // Epochs we already hold are skipped; the rest are recovery candidates.
+        let kc = self.keychain(id_key, epoch0_key)?;
+        let entries = self.merged_keylog()?;
+        let self_pub = self.identity.x25519_public();
+        let log = KeyLog::new(&self.keylog_dir(), self.identity.peer_id());
+
+        let mut recovered = 0usize;
+        let mut done: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+        for entry in &entries {
+            if done.contains(&entry.epoch_id) {
+                continue;
+            }
+            // Already openable (a device wrap, or epoch 0) → nothing to recover.
+            if kc.epoch_key(&entry.epoch_id).is_some() {
+                continue;
+            }
+            let KeyBody::Wrap {
+                recipient: Recipient::Paper,
+                blob,
+            } = &entry.body
+            else {
+                continue;
+            };
+            // A wrong phrase (or a blob for a different paper key) fails the AEAD
+            // tag; skip it rather than abort — another epoch's wrap may still open.
+            let Ok(key) = keywrap::unwrap(&paper_secret, blob) else {
+                continue;
+            };
+            let self_blob = keywrap::wrap(&self_pub, &key);
+            log.append(
+                &self.identity,
+                entry.epoch_id,
+                KeyBody::Wrap {
+                    recipient: Recipient::Device(self.identity.peer_id()),
+                    blob: self_blob,
+                },
+            )?;
+            done.insert(entry.epoch_id);
+            recovered += 1;
+        }
+        Ok(recovered)
+    }
+
     /// The raw bytes of this device's own key-log (for copying to a peer).
     pub fn export_own_keylog(&self) -> Result<Vec<u8>, StorageError> {
         match std::fs::read(KeyLog::new(&self.keylog_dir(), self.identity.peer_id()).path()) {
@@ -2905,6 +2973,81 @@ mod tests {
             a.keychain(&id_key, &epoch0).unwrap().epoch_key(&epoch),
             "B recovered the same epoch key A minted, via back-fill"
         );
+    }
+
+    #[test]
+    fn a_paper_key_recovers_an_epoch_never_wrapped_to_this_device() {
+        let dir_a = tempdir().unwrap();
+        let dir_r = tempdir().unwrap();
+        let id_a = Identity::generate();
+        let id_r = Identity::generate();
+        let (id_key, epoch0) = keys();
+
+        // Admin A rotates, sealing the new epoch to a PAPER recovery key (and to
+        // its own device). The paper wrap replicates in A's key-log.
+        let mut a = Store::open(dir_a.path(), id_a.clone()).unwrap();
+        a.declare_founder(Role::Admin).unwrap();
+        let (paper, phrase) = crate::paper::PaperKey::generate();
+        let epoch = a
+            .rotate_epoch(&id_key, &epoch0, Some(paper.public()))
+            .unwrap();
+
+        // Device R trusts A and holds A's key-log, but the epoch was NEVER wrapped
+        // to R's device key (R joined after the rotation; no back-fill ran).
+        let mut r = Store::open(dir_r.path(), id_r.clone()).unwrap();
+        r.declare_founder(Role::Admin).unwrap();
+        r.add_peer(id_a.peer_id(), id_a.verifying_key().to_bytes(), Role::Admin)
+            .unwrap();
+        r.import_roster(
+            id_a.peer_id(),
+            &id_a.verifying_key(),
+            a.export_own_roster().unwrap(),
+        )
+        .unwrap();
+        r.import_keylog(
+            id_a.peer_id(),
+            &id_a.verifying_key(),
+            a.export_own_keylog().unwrap(),
+        )
+        .unwrap();
+
+        // Precondition: R cannot open the rotated epoch.
+        assert!(
+            r.keychain(&id_key, &epoch0)
+                .unwrap()
+                .epoch_key(&epoch)
+                .is_none(),
+            "R must not hold the epoch before paper recovery"
+        );
+
+        // Recover using ONLY the paper phrase.
+        let recovered = r.recover_with_paper(&phrase, &id_key, &epoch0).unwrap();
+        assert_eq!(
+            recovered, 1,
+            "exactly one epoch recovered from the paper wrap"
+        );
+
+        // R now holds the SAME epoch key A minted.
+        assert_eq!(
+            r.keychain(&id_key, &epoch0).unwrap().epoch_key(&epoch),
+            a.keychain(&id_key, &epoch0).unwrap().epoch_key(&epoch),
+            "recovered epoch key matches the minter's"
+        );
+
+        // Recovery persists across reopen (self-addressed wrap in R's key-log).
+        let reopened = Store::open(dir_r.path(), id_r).unwrap();
+        assert!(
+            reopened
+                .keychain(&id_key, &epoch0)
+                .unwrap()
+                .epoch_key(&epoch)
+                .is_some(),
+            "recovery persists across reopen"
+        );
+
+        // Idempotent: a second run recovers nothing (R already holds the epoch).
+        let again = r.recover_with_paper(&phrase, &id_key, &epoch0).unwrap();
+        assert_eq!(again, 0, "already-held epoch is not recovered twice");
     }
 
     #[test]

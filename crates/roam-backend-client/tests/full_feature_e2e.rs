@@ -34,12 +34,13 @@ use roam_backend_client::crypto::VaultKey;
 use roam_backend_client::http::HttpBackend;
 use roam_backend_client::sync::{produce_held_snapshot, reconcile_once};
 use roam_backend_client::transport::Backend;
-use roam_storage::{Identity, Role, Store, VerifyingKey};
+use roam_storage::{Identity, PaperKey, Role, Store, VerifyingKey};
 use tokio::sync::Mutex;
 
-/// A distinct port from `e2e_backend.rs` (4577) so the two ignored suites never
-/// collide if run together.
-const PORT: u16 = 4578;
+/// Port distinct from `e2e_backend.rs` (4577). All feature sections (F1–F6) run
+/// inside ONE test against ONE server, so only one port is needed — booting a
+/// second `mix phx.server` concurrently races on the shared `_build`.
+const PORT_FEATURES: u16 = 4578;
 
 struct Server {
     child: Child,
@@ -51,14 +52,15 @@ impl Drop for Server {
     }
 }
 
-/// Boot the real Phoenix backend against a throwaway data root and wait until it
-/// answers. (Async reqwest, not the blocking client — the blocking client spins
-/// its own runtime and panics inside `#[tokio::test]`; see e2e_backend.rs.)
-async fn start_server(root: &std::path::Path) -> Server {
+/// Boot the real Phoenix backend against a throwaway data root on `port` and wait
+/// until it answers. (Async reqwest, not the blocking client — the blocking
+/// client spins its own runtime and panics inside `#[tokio::test]`; see
+/// e2e_backend.rs.)
+async fn start_server(root: &std::path::Path, port: u16) -> Server {
     let child = Command::new("mix")
         .arg("phx.server")
         .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../../sync"))
-        .env("PORT", PORT.to_string())
+        .env("PORT", port.to_string())
         .env("ROAM_BACKEND_DATA", root)
         .env("MIX_ENV", "dev")
         .env("PHX_SERVER", "true")
@@ -67,7 +69,7 @@ async fn start_server(root: &std::path::Path) -> Server {
     let client = reqwest::Client::new();
     for _ in 0..600 {
         if client
-            .get(format!("http://127.0.0.1:{PORT}/b/probe/manifest"))
+            .get(format!("http://127.0.0.1:{port}/b/probe/manifest"))
             .send()
             .await
             .map(|r| r.status().is_success())
@@ -132,8 +134,8 @@ async fn get_entry(store: &SharedStore, map: &str, k: &str) -> Option<String> {
 #[ignore = "requires mix on PATH and the sync Phoenix backend; run with --ignored"]
 async fn all_backend_features_end_to_end() {
     let data_root = tempfile::tempdir().unwrap();
-    let _server = start_server(data_root.path()).await;
-    let base = format!("http://127.0.0.1:{PORT}");
+    let _server = start_server(data_root.path(), PORT_FEATURES).await;
+    let base = format!("http://127.0.0.1:{PORT_FEATURES}");
     let backend = Arc::new(HttpBackend::new(&base));
     // One shared vault key; every device of this vault holds it (delivered over
     // pairing in production). Bucket/entry/blob ids all derive from it.
@@ -325,5 +327,78 @@ async fn all_backend_features_end_to_end() {
         get_entry(&b, "kv", "greeting").await,
         Some("hello".to_string()),
         "F5: revoked B keeps the pre-rotation data it already held"
+    );
+
+    // === F6: paper-recovery restore (data-level, through the backend) ====
+    // A device that joined AFTER a rotation (never a wrap recipient) cannot
+    // decrypt post-rotation data — until it re-enters the paper phrase. This is
+    // the consume side of `rotate --generate-paper`: without
+    // `Store::recover_with_paper` the printed phrase would be inert. A fresh vault
+    // key gives F6 its own backend bucket, isolated from F1–F5 above (and it runs
+    // in this SAME test so only one Phoenix server ever boots).
+    let key6 = VaultKey([9u8; 32]);
+    let a6_dir = tempfile::tempdir().unwrap();
+    let a6 = open_store(a6_dir.path()).await;
+    let (a6_peer, a6_key) = peer_and_key(&a6).await;
+    let a6_vkey = VerifyingKey::from_bytes(&a6_key).unwrap();
+    a6.lock().await.declare_founder(Role::Admin).unwrap();
+
+    // A6 rotates, sealing the new epoch to a generated PAPER key, then writes a
+    // secret UNDER the new epoch and pushes it to the backend.
+    let (paper, phrase) = PaperKey::generate();
+    a6.lock()
+        .await
+        .rotate_epoch(&key6.id_key(), &key6.epoch0_key(), Some(paper.public()))
+        .unwrap();
+    a6.lock()
+        .await
+        .set_entry("kv", "vault-secret", "moonlight")
+        .unwrap();
+    sync_round(&[&a6], &backend, &key6).await;
+    sync_round(&[&a6], &backend, &key6).await;
+
+    // Device R6 joins AFTER the rotation: A6 enrolls it and R6 bundle-bootstraps
+    // trust (incl. A6's key-log, which carries the paper wrap + A6's own device
+    // wraps, but NO wrap addressed to R6).
+    let r6_dir = tempfile::tempdir().unwrap();
+    let r6 = open_store(r6_dir.path()).await;
+    let (r6_peer, r6_key) = peer_and_key(&r6).await;
+    a6.lock()
+        .await
+        .add_peer(r6_peer, r6_key, Role::Reader)
+        .unwrap();
+    let roster6 = a6.lock().await.export_all_rosters().unwrap();
+    let a6_keylog = a6.lock().await.export_own_keylog().unwrap();
+    bootstrap_joiner(&r6, a6_peer, &a6_vkey, &roster6, &a6_keylog).await;
+
+    for _ in 0..3 {
+        sync_round(&[&r6], &backend, &key6).await;
+    }
+    // Before recovery: R6 holds the ciphertext but no epoch key → Undecryptable.
+    assert_eq!(
+        get_entry(&r6, "kv", "vault-secret").await,
+        None,
+        "F6: R must NOT read the post-rotation secret before paper recovery"
+    );
+
+    // Recover using ONLY the paper phrase.
+    let recovered = r6
+        .lock()
+        .await
+        .recover_with_paper(&phrase, &key6.id_key(), &key6.epoch0_key())
+        .unwrap();
+    assert!(
+        recovered >= 1,
+        "F6: paper recovery must restore at least one epoch key"
+    );
+
+    // Re-reconcile: the now-decryptable entry is re-fetched and applied.
+    for _ in 0..3 {
+        sync_round(&[&r6], &backend, &key6).await;
+    }
+    assert_eq!(
+        get_entry(&r6, "kv", "vault-secret").await,
+        Some("moonlight".to_string()),
+        "F6: after paper recovery R reads the post-rotation secret"
     );
 }

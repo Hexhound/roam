@@ -139,6 +139,35 @@ fn operator_lifecycle_over_the_real_binary() {
         "rotate should note new writes seal under the new epoch: {out}"
     );
 
+    // --- recover (paper phrase round-trips through the CLI) --------------
+    // Pull the generated phrase out of the rotate output and feed it back to
+    // `roam recover`. This single-admin vault already holds its own epoch key,
+    // so recovery finds nothing to restore — but the command must parse the
+    // phrase, open the vault, and exit 0. (Data-level recovery, where a device
+    // that CANNOT decrypt regains access, is proven end-to-end against the real
+    // backend in roam-backend-client/tests/full_feature_e2e.rs.)
+    let phrase = out
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .skip_while(|l| !l.contains("PAPER RECOVERY PHRASE"))
+        .nth(1)
+        .expect("rotate output must contain the paper phrase line")
+        .to_string();
+    let rec = ok_roam(&[
+        "recover",
+        "--vault",
+        vault_s,
+        "--identity",
+        id_s,
+        "--paper",
+        &phrase,
+    ]);
+    assert!(
+        rec.contains("no epochs recovered"),
+        "a single admin already holds its own epoch key: {rec}"
+    );
+
     // --- status (post-rotation) ------------------------------------------
     // The write-head must have advanced off epoch 0 to a real (hex-prefixed)
     // epoch, and the sole admin still holds the head key → still synced.
