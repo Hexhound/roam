@@ -24,6 +24,14 @@ use tokio::sync::Mutex as AsyncMutex;
 /// hostile 4-byte length (64 MiB is far above any real sync frame).
 const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
 
+/// Depth of the shared inbound frame queue. BOUNDED on purpose: a peer that was
+/// in the roster when it connected keeps an accepted connection until a revoke
+/// force-closes it (T2), and while connected it could stream frames faster than
+/// the engine drains them. An unbounded queue would grow without limit → OOM.
+/// With a bound, excess frames are shed (see [`enqueue_inbound`]) rather than
+/// buffered. Generous enough that honest bursts never shed.
+const INBOUND_QUEUE_CAP: usize = 1024;
+
 /// How long `spawn` waits for the endpoint to discover at least one direct
 /// address, so [`IrohTransport::endpoint_addr`] hands a peer something dialable
 /// before n0 discovery has propagated (loopback / same-LAN tests).
@@ -37,10 +45,10 @@ type PeerStream = Arc<AsyncMutex<SendStream>>;
 type Routes = Arc<Mutex<HashMap<u64, [u8; 32]>>>;
 
 /// Inbound frame sender, cloned into every accept/dial task.
-type InboundTx = mpsc::UnboundedSender<(u64, Frame)>;
+type InboundTx = mpsc::Sender<(u64, Frame)>;
 
 /// The paired inbound receiver, taken once by [`IrohTransport::incoming`].
-type InboundRx = Arc<Mutex<Option<mpsc::UnboundedReceiver<(u64, Frame)>>>>;
+type InboundRx = Arc<Mutex<Option<mpsc::Receiver<(u64, Frame)>>>>;
 
 /// peer_id -> the peer's currently-open inbound connection. Kept so a revoke
 /// (`remove_route`) can force-close a formerly-roster peer's reader (T2).
@@ -85,7 +93,7 @@ impl IrohTransport {
 
         let routes = Arc::new(Mutex::new(routes));
         let inbound_conns: InboundConns = Arc::new(Mutex::new(HashMap::new()));
-        let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
+        let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_QUEUE_CAP);
 
         // Accept loop: one task per inbound connection.
         let accept_ep = endpoint.clone();
@@ -350,11 +358,31 @@ async fn read_loop(mut recv: RecvStream, peer: u64, tx: InboundTx) -> Result<()>
     // A read error (clean EOF or reset) or a dropped receiver ends the loop.
     while let Ok(frame) = read_frame(&mut recv).await {
         crate::dlog!("recv peer={peer} frame={}", frame.kind());
-        if tx.send((peer, frame)).is_err() {
+        if enqueue_inbound(&tx, peer, frame).is_break() {
             break;
         }
     }
     Ok(())
+}
+
+/// Hand one inbound frame to the shared queue with a NON-BLOCKING `try_send`,
+/// returning whether the reader should continue or stop.
+///
+/// `try_send` (not `send().await`) is deliberate: the engine's run loop awaits
+/// outbound sends *inside* its inbound-frame handler, so blocking the reader on a
+/// full queue could deadlock two peers that are each waiting to send to the
+/// other. Instead we SHED — drop the frame — when the bounded queue is full. That
+/// is safe because sync is convergent and idempotent: whatever a shed frame
+/// carried is re-derived on the next `Have`/handshake exchange. Shedding only
+/// happens under a flood (hostile peer) or extreme backpressure, never in normal
+/// operation. A closed receiver (the transport was dropped) stops the reader.
+fn enqueue_inbound(tx: &InboundTx, peer: u64, frame: Frame) -> std::ops::ControlFlow<()> {
+    use std::ops::ControlFlow;
+    match tx.try_send((peer, frame)) {
+        Ok(()) => ControlFlow::Continue(()),
+        Err(mpsc::error::TrySendError::Full(_)) => ControlFlow::Continue(()),
+        Err(mpsc::error::TrySendError::Closed(_)) => ControlFlow::Break(()),
+    }
 }
 
 /// Whether `key` (a remote NodeId's 32 bytes) is a known route — i.e. the peer
@@ -677,5 +705,45 @@ mod tests {
             matches!(after, Ok(Err(TransportError::Unreachable(_)))),
             "remove_route did not undo the route: {after:?}"
         );
+    }
+
+    fn a_frame() -> Frame {
+        Frame::Hello { vault: [0u8; 32] }
+    }
+
+    #[test]
+    fn a_full_inbound_queue_sheds_frames_instead_of_growing() {
+        use std::ops::ControlFlow;
+        // A bounded queue (cap 1 here) must SHED once full — a hostile but still-
+        // rostered peer flooding frames faster than the engine drains cannot grow
+        // it without bound (the OOM vector), and the reader keeps going.
+        let (tx, mut rx) = mpsc::channel::<(u64, Frame)>(1);
+        assert!(matches!(
+            enqueue_inbound(&tx, 1, a_frame()),
+            ControlFlow::Continue(())
+        ));
+        // Slot full: the next frame is dropped, not queued, and the reader is told
+        // to CONTINUE (never block, never stop).
+        assert!(matches!(
+            enqueue_inbound(&tx, 1, a_frame()),
+            ControlFlow::Continue(())
+        ));
+        assert!(rx.try_recv().is_ok(), "the first frame should be buffered");
+        assert!(
+            rx.try_recv().is_err(),
+            "the second frame must have been shed, not queued"
+        );
+    }
+
+    #[test]
+    fn a_closed_inbound_receiver_stops_the_reader() {
+        use std::ops::ControlFlow;
+        let (tx, rx) = mpsc::channel::<(u64, Frame)>(1);
+        drop(rx);
+        // Receiver gone (transport dropped): the reader must break, not spin.
+        assert!(matches!(
+            enqueue_inbound(&tx, 1, a_frame()),
+            ControlFlow::Break(())
+        ));
     }
 }

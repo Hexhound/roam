@@ -147,5 +147,32 @@ defmodule Sync.Backend.RetentionTest do
       result = Retention.sweep(b, keep: 3, grace_ms: 0, now_ms: 9_000_000_000_000)
       assert "eold" in result.entries
     end
+
+    test "the sweep reads only the manifest prefix, not the (large) sealed body", %{bucket: b} do
+      # The sweep must parse the manifest without slurping the sealed ciphertext
+      # body (which can be tens of MB per object). We assert the manifest is still
+      # folded when the body is enormous — the reader stops after `len` bytes — and
+      # that a frame truncated right after its manifest (no body at all) is handled
+      # too. Correctness is body-size-independent.
+      json =
+        Jason.encode!(%{
+          "subsumed_entry_ids" => ["eold"],
+          "blob_ref_ids" => ["bkeep"],
+          "author" => 1,
+          "sig" => "x"
+        })
+
+      big_body = :binary.copy(<<0>>, 5_000_000)
+      big = <<byte_size(json)::little-32>> <> json <> big_body
+      no_body = <<byte_size(json)::little-32>> <> json
+
+      for id <- ["s1", "s2", "s3", "s4"], do: Store.put(b, "snapshots", id, big)
+      Store.put(b, "snapshots", "prefix-only", no_body)
+      Store.put(b, "entries", "eold", "x")
+
+      result = Retention.sweep(b, keep: 5, grace_ms: 0, now_ms: 9_000_000_000_000)
+      # The manifest folded from the large-body frames, so "eold" is reclaimed.
+      assert "eold" in result.entries
+    end
   end
 end

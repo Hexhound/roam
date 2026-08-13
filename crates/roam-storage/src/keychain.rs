@@ -218,6 +218,12 @@ impl Keychain {
     /// Deterministic write-head: among the DAG leaves (epochs that are no node's
     /// parent), the lowest `epoch_id`. Ties across concurrent rotations converge
     /// because every writer picks the same lowest id.
+    ///
+    /// WONTFIX (keyless-Rotate head-poison): a malicious Admin can parent a
+    /// `Rotate` on the head and wrap its key only to itself, making the head
+    /// keyless for everyone else and stalling writes. It is admin-only,
+    /// recoverable by an honest re-rotation, and unfixable here without
+    /// reopening H1. See docs/security.md.
     fn select_head(epochs: &BTreeMap<[u8; 32], EpochNode>) -> [u8; 32] {
         let mut is_parent: BTreeSet<[u8; 32]> = BTreeSet::new();
         for node in epochs.values() {

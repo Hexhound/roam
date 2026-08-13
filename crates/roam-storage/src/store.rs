@@ -287,6 +287,19 @@ impl Store {
             for entry in &entries {
                 // Learn subject keys this author vouches for (Add or Revoke both
                 // carry the key; a later fixpoint pass never removes trust).
+                //
+                // Gate the learn step on the SAME peer-id binding the founder pin
+                // (above) and `add_peer` enforce: a subject_key is only trusted for
+                // `subject_peer` if it derives to it. Without this, any trusted
+                // member could first-writer-win a bogus key for another peer (the
+                // `trusted` map's iteration order is randomized per rebuild), pinning
+                // that peer to a wrong key so its real self-signed log fails
+                // verification and is silently dropped — censoring its grants/
+                // revokes on ~half of all rebuilds. Grinding a colliding key is a
+                // 64-bit search, so the binding makes the poison infeasible.
+                if derived_peer_id(&entry.subject_key) != entry.subject_peer {
+                    continue;
+                }
                 trusted
                     .entry(entry.subject_peer)
                     .or_insert(entry.subject_key);
@@ -3495,5 +3508,97 @@ mod tests {
         std::fs::write(snapdir.join("held.jsonl"), b"x").unwrap();
         std::fs::write(snapdir.join("real.tmp"), b"x").unwrap();
         assert_eq!(store.held_snapshot_ids().unwrap(), vec!["real".to_string()]);
+    }
+
+    #[test]
+    fn a_member_cannot_poison_another_peers_roster_key_binding() {
+        // A trusted member M signs into ITS OWN roster log a vouch for a DIFFERENT
+        // admin A carrying a bogus subject_key (one that does not derive to A's
+        // peer_id). `collect_roster_entries` learns author->key on a first-writer-
+        // wins HashMap whose iteration order is randomized per rebuild; without a
+        // `derived_peer_id` binding at the learn step, ~half of all rebuilds pin A
+        // to the bogus key, so A's real self-signed log fails verification and is
+        // dropped — silently censoring A's grants (here, A's Add(Z)). The peer-id
+        // binding (as enforced at the founder pin) must gate the learn step so the
+        // poison is ALWAYS ignored. We reopen many times to exercise both orders.
+        let f = Identity::generate();
+        let p2 = Identity::generate();
+        let a = Identity::generate();
+        let m = Identity::generate();
+        let z = Identity::generate();
+        let victim = Identity::generate();
+
+        // F (founder) vouches M and P2 as admins — but NOT A. A is vouched only by
+        // P2, so A's key is learned from a different author than the poisoner M.
+        let f_dir = tempdir().unwrap();
+        let mut fs = Store::open(f_dir.path(), f.clone()).unwrap();
+        fs.declare_founder(Role::Admin).unwrap();
+        fs.add_peer(m.peer_id(), m.verifying_key().to_bytes(), Role::Admin)
+            .unwrap();
+        fs.add_peer(p2.peer_id(), p2.verifying_key().to_bytes(), Role::Admin)
+            .unwrap();
+
+        // P2 vouches A (admin).
+        let p2_dir = tempdir().unwrap();
+        let mut p2s = Store::open(p2_dir.path(), p2.clone()).unwrap();
+        p2s.declare_founder(Role::Admin).unwrap();
+        p2s.add_peer(a.peer_id(), a.verifying_key().to_bytes(), Role::Admin)
+            .unwrap();
+
+        // A vouches Z (reader) — the grant that must survive.
+        let a_dir = tempdir().unwrap();
+        let mut a_store = Store::open(a_dir.path(), a.clone()).unwrap();
+        a_store.declare_founder(Role::Admin).unwrap();
+        a_store
+            .add_peer(z.peer_id(), z.verifying_key().to_bytes(), Role::Reader)
+            .unwrap();
+
+        let read_log = |dir: &std::path::Path, id: u64| {
+            std::fs::read(RosterLog::new(&dir.join("roster"), id).path()).unwrap()
+        };
+        let f_bytes = read_log(f_dir.path(), f.peer_id());
+        let p2_bytes = read_log(p2_dir.path(), p2.peer_id());
+        let a_bytes = read_log(a_dir.path(), a.peer_id());
+
+        // Assemble the victim vault: pin F, import the honest logs, then plant M's
+        // malicious log.
+        let v_dir = tempdir().unwrap();
+        {
+            let mut vs = Store::open(v_dir.path(), victim.clone()).unwrap();
+            vs.pin_founder(f.peer_id()).unwrap();
+            vs.import_roster(f.peer_id(), &f.verifying_key(), f_bytes)
+                .unwrap();
+            vs.import_roster(p2.peer_id(), &p2.verifying_key(), p2_bytes)
+                .unwrap();
+            vs.import_roster(a.peer_id(), &a.verifying_key(), a_bytes)
+                .unwrap();
+
+            // M's malicious vouch for A with a bogus key (first-8-LE != a_id, so it
+            // fails the peer-id binding). Signed by M, so it verifies under the key
+            // the victim learned for M from F's log.
+            let bogus = [0xFFu8; 32];
+            assert_ne!(derived_peer_id(&bogus), a.peer_id());
+            let m_log = RosterLog::new(&v_dir.path().join("roster"), m.peer_id());
+            m_log
+                .append(
+                    &m,
+                    1,
+                    RosterOp::Add { role: Role::Reader },
+                    a.peer_id(),
+                    bogus,
+                )
+                .unwrap();
+        }
+
+        // Reopen many times; each rebuild randomizes the trust-learning order. A's
+        // grant to Z must fold on EVERY rebuild — never censored by M's poison.
+        for i in 0..100 {
+            let vs = Store::open(v_dir.path(), victim.clone()).unwrap();
+            assert_eq!(
+                vs.role_of(z.peer_id()),
+                Some(Role::Reader),
+                "rebuild {i}: A's grant to Z was censored by M's key-binding poison",
+            );
+        }
     }
 }

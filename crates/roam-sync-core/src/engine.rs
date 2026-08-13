@@ -42,6 +42,27 @@ fn chunk_offset_is_admissible(offset: u64, total_len: u64) -> bool {
     offset < total_len && offset % BLOB_CHUNK_SIZE as u64 == 0
 }
 
+/// The exact byte length a legitimate sender emits for the chunk at `offset`:
+/// a full [`BLOB_CHUNK_SIZE`] except the final chunk, which carries the
+/// remainder (see the send loop's `want`).
+fn expected_chunk_len(offset: u64, total_len: u64) -> u64 {
+    std::cmp::min(BLOB_CHUNK_SIZE as u64, total_len - offset)
+}
+
+/// A chunk is admissible only if BOTH its offset is aligned/in-range AND its
+/// length is exactly what a legitimate sender would emit for that offset.
+///
+/// The length check is not redundant: completion is measured by summing the
+/// FIRST length seen at each distinct offset. Without it, a malicious peer could
+/// race a 1-byte chunk to every aligned offset — each is offset-admissible, so
+/// `seen` records the tiny length and the honest full-size chunk for the same
+/// offset is then deduped and never recounted, so `received` never reaches
+/// `total_len` and the transfer stalls forever (a censorship/availability DoS).
+fn chunk_is_admissible(offset: u64, total_len: u64, len: usize) -> bool {
+    chunk_offset_is_admissible(offset, total_len)
+        && len as u64 == expected_chunk_len(offset, total_len)
+}
+
 /// Drives sync for one device over a [`Transport`]. Owns the [`Store`]; local
 /// edits go through the engine so it can live-push.
 pub struct Engine<T: Transport> {
@@ -738,11 +759,13 @@ impl<T: Transport + 'static> Engine<T> {
                 if total_len > MAX_INCOMING_BLOB_BYTES {
                     return Ok(());
                 }
-                // EN2 DoS guard: only accept chunk offsets a legitimate sender
-                // could emit (multiples of BLOB_CHUNK_SIZE, in range). This caps
-                // the distinct-offset `seen` set at total_len / BLOB_CHUNK_SIZE,
-                // so an attacker cannot exhaust memory with tiny misaligned chunks.
-                if !chunk_offset_is_admissible(offset, total_len) {
+                // EN2 DoS guard: only accept chunks a legitimate sender could emit
+                // — offsets that are multiples of BLOB_CHUNK_SIZE and in range
+                // (caps the distinct-offset `seen` set at total_len / BLOB_CHUNK_SIZE
+                // against a tiny-misaligned-chunk memory DoS), AND whose length is
+                // exactly the sender's `want` for that offset (else a 1-byte chunk
+                // would dedup the honest full chunk and stall the transfer forever).
+                if !chunk_is_admissible(offset, total_len, bytes.len()) {
                     return Ok(());
                 }
                 // Anti-spam + idempotency: only accept chunks for a hash a Live
@@ -1129,7 +1152,7 @@ impl<T: Transport + 'static> Engine<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::{chunk_offset_is_admissible, Engine, BLOB_CHUNK_SIZE};
+    use super::{chunk_is_admissible, chunk_offset_is_admissible, Engine, BLOB_CHUNK_SIZE};
     use crate::memory::MemorySwitchboard;
     use roam_storage::{Identity, Store, VaultId};
     use std::sync::Arc;
@@ -1155,6 +1178,40 @@ mod tests {
         // Zero-byte blob: only the single (offset 0, total_len 0) chunk is valid.
         assert!(chunk_offset_is_admissible(0, 0));
         assert!(!chunk_offset_is_admissible(BLOB_CHUNK_SIZE as u64, 0));
+    }
+
+    #[test]
+    fn a_short_chunk_at_a_valid_offset_is_inadmissible() {
+        let total = 8 * 1024 * 1024;
+        // Honest chunks carry exactly BLOB_CHUNK_SIZE (full chunks) or the
+        // remainder (final chunk).
+        assert!(chunk_is_admissible(0, total, BLOB_CHUNK_SIZE));
+        let last = total - BLOB_CHUNK_SIZE as u64;
+        assert!(chunk_is_admissible(last, total, BLOB_CHUNK_SIZE));
+        // The stall attack: a 1-byte chunk at an aligned, in-range offset passes
+        // the offset check but is NOT the length a real sender emits, so it must be
+        // rejected — otherwise it dedups the honest full-size chunk and the blob
+        // never completes.
+        assert!(!chunk_is_admissible(0, total, 1));
+        assert!(!chunk_is_admissible(BLOB_CHUNK_SIZE as u64, total, 1));
+        // An over-long chunk (would run past total_len for a non-final offset) is
+        // likewise rejected.
+        assert!(!chunk_is_admissible(0, total, BLOB_CHUNK_SIZE + 1));
+        // A ragged final chunk must be exactly the remainder.
+        let ragged_total = BLOB_CHUNK_SIZE as u64 + 100;
+        assert!(chunk_is_admissible(
+            BLOB_CHUNK_SIZE as u64,
+            ragged_total,
+            100
+        ));
+        assert!(!chunk_is_admissible(
+            BLOB_CHUNK_SIZE as u64,
+            ragged_total,
+            1
+        ));
+        // Zero-byte blob: the sole chunk is (offset 0, len 0).
+        assert!(chunk_is_admissible(0, 0, 0));
+        assert!(!chunk_is_admissible(0, 0, 1));
     }
 
     #[tokio::test]

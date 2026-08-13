@@ -41,14 +41,20 @@ defmodule SyncWeb.Router do
   # here, so refuse it outright. (json/urlencoded are safe — they read through the
   # CachingBodyReader and the controller recovers the raw bytes.)
   defp reject_multipart_body(conn, _opts) do
+    # Match the media type the SAME way Plug.Parsers picks its parser —
+    # `content_type/1` downcases the type and trims params — so a header like
+    # `Multipart/form-data` or ` MULTIPART/mixed` cannot slip past a naive
+    # case-sensitive `starts_with?` while still triggering the multipart parser.
     case Plug.Conn.get_req_header(conn, "content-type") do
       [content_type | _] ->
-        if String.starts_with?(content_type, "multipart/") do
-          conn
-          |> Plug.Conn.send_resp(415, "unsupported media type")
-          |> Plug.Conn.halt()
-        else
-          conn
+        case Plug.Conn.Utils.content_type(content_type) do
+          {:ok, "multipart", _subtype, _params} ->
+            conn
+            |> Plug.Conn.send_resp(415, "unsupported media type")
+            |> Plug.Conn.halt()
+
+          _ ->
+            conn
         end
 
       _ ->

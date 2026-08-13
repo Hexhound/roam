@@ -154,6 +154,30 @@ defmodule SyncWeb.SyncControllerTest do
     assert got.status == 404, "the content-addressed id must be untouched"
   end
 
+  test "a multipart PUT with a non-lowercase content-type is still refused (H-C case bypass)",
+       %{conn: conn} do
+    # Plug.Parsers matches the multipart parser via Plug.Conn.Utils.content_type/1,
+    # which DOWNCASES the media type — so `Multipart/form-data` (capital M, or a
+    # leading space) still triggers the multipart parser and drains the body past
+    # the CachingBodyReader. A case-sensitive `starts_with?(ct, "multipart/")` guard
+    # misses it, re-opening H-C. The guard must normalize the same way Plug does.
+    boundary = "----roamtestboundary"
+
+    body =
+      "--#{boundary}\r\n" <>
+        "Content-Disposition: form-data; name=\"x\"\r\n\r\n\r\n" <>
+        "--#{boundary}--\r\n"
+
+    conn =
+      put_req_header(conn, "content-type", "Multipart/form-data; boundary=#{boundary}")
+
+    resp = put(conn, "/b/#{@bucket}/blobs/#{@id}", body)
+    assert resp.status == 415, "a multipart PUT must be refused regardless of header casing"
+
+    got = get(build_conn(), "/b/#{@bucket}/blobs/#{@id}")
+    assert got.status == 404, "the content-addressed id must be untouched"
+  end
+
   test "an oversized body fails closed (413), never 500", %{conn: conn} do
     # >8MB exceeds read_body's default limit -> {:more, ...}; the controller must
     # fail closed with 413, not raise WithClauseError -> 500.

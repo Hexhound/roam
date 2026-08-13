@@ -119,8 +119,8 @@ defmodule Sync.Backend.Retention do
         |> Enum.flat_map(fn id ->
           path = Path.join(dir, id)
 
-          with {:ok, bytes} <- File.read(path),
-               {:ok, manifest} <- parse_manifest(bytes) do
+          with {:ok, json} <- read_manifest_json(path),
+               {:ok, manifest} <- decode_manifest(json) do
             [
               %{
                 id: id,
@@ -141,8 +141,35 @@ defmodule Sync.Backend.Retention do
     end
   end
 
-  # Frame: u32-LE manifest_len ‖ manifest_json ‖ sealed_ct. Only the manifest is read.
+  # Frame: u32-LE manifest_len ‖ manifest_json ‖ sealed_ct.
   #
+  # Read ONLY the length prefix and the manifest, never the sealed ciphertext body
+  # that follows. The body can be up to the PUT cap (tens of MB), and the sweep
+  # loads EVERY snapshot object in the bucket on EVERY pass — slurping the whole
+  # file (`File.read`) meant a bucket full of large snapshots transiently pulled
+  # hundreds of MB into the BEAM per sweep, a cross-tenant memory-pressure DoS.
+  # Sequential `:file.read` in `:raw` mode stops after the manifest, so the body is
+  # never touched.
+  defp read_manifest_json(path) do
+    case :file.open(path, [:read, :binary, :raw]) do
+      {:ok, io} ->
+        result =
+          with {:ok, <<len::little-32>>} <- :file.read(io, 4),
+               true <- len > 0,
+               {:ok, json} when byte_size(json) == len <- :file.read(io, len) do
+            {:ok, json}
+          else
+            _ -> :error
+          end
+
+        :file.close(io)
+        result
+
+      {:error, _} ->
+        :error
+    end
+  end
+
   # M-A: the manifest is attacker-supplied plaintext. Accept it only when it is a
   # map whose id fields are lists of strings; anything else (a non-map, or a field
   # of the wrong type) is treated like an unparseable frame and SKIPPED. Without
@@ -150,23 +177,14 @@ defmodule Sync.Backend.Retention do
   # non-map, or `flat_map` over a non-list) on EVERY sweep of that bucket —
   # BE4's per-bucket rescue then turns the crash into permanent retention
   # starvation (unbounded disk growth for that bucket).
-  defp parse_manifest(bytes) do
-    case bytes do
-      <<len::little-32, rest::binary>> when byte_size(rest) >= len ->
-        <<json::binary-size(len), _sealed::binary>> = rest
-
-        case Jason.decode(json) do
+  defp decode_manifest(json) do
+    case Jason.decode(json) do
+      {:ok, manifest} when is_map(manifest) ->
+        if id_list?(Map.get(manifest, "subsumed_entry_ids", [])) and
+             id_list?(Map.get(manifest, "blob_ref_ids", [])) do
           {:ok, manifest}
-          when is_map(manifest) ->
-            if id_list?(Map.get(manifest, "subsumed_entry_ids", [])) and
-                 id_list?(Map.get(manifest, "blob_ref_ids", [])) do
-              {:ok, manifest}
-            else
-              :error
-            end
-
-          _ ->
-            :error
+        else
+          :error
         end
 
       _ ->
