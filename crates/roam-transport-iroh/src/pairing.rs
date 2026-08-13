@@ -44,6 +44,11 @@
 //! - **Single-use secret**: [`PairingHost::accept_auto`] consumes `self`,
 //!   accepts exactly one join, then drops the secret and closes the endpoint —
 //!   a second join cannot reuse it.
+//! - **Bounded token lifetime (P1)**: the token carries a host-authoritative
+//!   expiry ([`PAIRING_TOKEN_TTL`]); `accept_auto` accepts only within the
+//!   remaining window and an honest joiner refuses an expired token. This bounds
+//!   how long a *leaked* token stays usable but does not close the bearer model —
+//!   an attacker who redeems the token inside the window still succeeds.
 //! - **Vault match**: the joiner aborts if `accept.vault != token.vault`.
 //! - **Fail-closed**: any malformed message or verify error aborts pairing
 //!   without mutating trust.
@@ -71,9 +76,20 @@ use serde::{Deserialize, Serialize};
 
 use crate::endpoint::{build_endpoint, PAIRING_ALPN};
 
-/// How long the host waits for the one inbound pairing connection before giving
-/// up. Pairing is an interactive, user-driven action, so this is generous.
-const ACCEPT_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long a minted pairing token stays valid (P1). The token is a *bearer*
+/// secret — whoever holds it can prove the secret and obtain the vault key — so
+/// its lifetime is a security parameter: it bounds how long a LEAKED token
+/// (screenshot, chat log, shoulder-surf) stays usable. The host enforces this
+/// deadline against ITS OWN clock (the `expires_at` it minted), never the
+/// attacker-editable field carried in the token. Kept short; pairing is an
+/// interactive, user-present action.
+///
+/// This does NOT close the bearer model: an attacker who obtains the token and
+/// races the real joiner *within* the window still wins (its proof is valid).
+/// The window only bounds the exposure; unforgeable device-to-device
+/// confirmation (a human-compared short authentication string) is an app-layer
+/// concern, out of scope here.
+const PAIRING_TOKEN_TTL: Duration = Duration::from_secs(120);
 
 /// How long a single handshake half may take once the connection is up, before
 /// we abort it — a peer that connects and then stalls must not park the host
@@ -90,19 +106,38 @@ const ADDR_READY_TIMEOUT: Duration = Duration::from_secs(8);
 /// hostile 4-byte length; real messages are a few hundred bytes to a few KiB).
 const MAX_MSG_LEN: usize = 1024 * 1024;
 
+/// Signature domain tag for the pairing proof (M1: cross-protocol reuse guard).
+/// Distinct from [`roam_storage::oplog::OPLOG_SIG_DOMAIN`] so a pairing proof
+/// (a signature over the token secret) can never be replayed as an op-log
+/// signature attributed to the same key, or vice versa. Fixed length.
+const PAIRING_PROOF_DOMAIN: &[u8] = b"roam-pairing-proof-v1\x00";
+
 /// The out-of-band token the trusted device A shows the joiner B.
-#[derive(Serialize, Deserialize)]
+///
+/// The single-use `secret` is wiped on drop; the other fields are public
+/// (address, keys, opaque ids) and skipped.
+#[derive(Serialize, Deserialize, zeroize::ZeroizeOnDrop)]
 pub struct PairingToken {
     /// How to reach A right now (discovery may lag, so carry the full addr).
+    #[zeroize(skip)]
     pub addr: EndpointAddr,
     /// A's ed25519 verifying key == A's iroh `NodeId`.
+    #[zeroize(skip)]
     pub verifying_key: [u8; 32],
     /// A's loro peer id.
+    #[zeroize(skip)]
     pub peer_id: u64,
     /// The vault B is joining.
+    #[zeroize(skip)]
     pub vault: [u8; 32],
     /// One-time nonce; B proves it saw the token by signing these bytes.
     pub secret: [u8; 32],
+    /// Wall-clock expiry (seconds since the Unix epoch), set at mint to
+    /// `now + PAIRING_TOKEN_TTL`. Advisory for an honest joiner (it refuses to
+    /// act on an expired token); the host enforces its OWN copy, not this field
+    /// (an attacker could edit it, since the token is unsigned).
+    #[zeroize(skip)]
+    pub expires_at_unix_secs: u64,
 }
 
 impl PairingToken {
@@ -135,9 +170,13 @@ pub struct JoinRequest {
 
 /// A → B: accepted; here is the vault, the shared vault key, and A's signed
 /// roster snapshot.
-#[derive(Serialize, Deserialize)]
+///
+/// The `vault_key` (the backend decryption secret) is wiped on drop; every other
+/// field is public roster/key-log material and skipped.
+#[derive(Serialize, Deserialize, zeroize::ZeroizeOnDrop)]
 pub struct JoinAccept {
     /// The vault B is joining (B re-validates it against its token).
+    #[zeroize(skip)]
     pub vault: [u8; 32],
     /// The shared vault key (backend decryption secret). Only ever sent here,
     /// after the joiner's proof verifies, over the encrypted pairing stream.
@@ -147,16 +186,20 @@ pub struct JoinAccept {
     /// (e.g. `roster-<founder>.jsonl`) plus the host's own log, so a joiner behind
     /// a non-founder admin folds the full founder->host->joiner chain. Verified
     /// per-author during the joiner's roster fold, not here.
+    #[zeroize(skip)]
     pub rosters: Vec<(u64, Vec<u8>)>,
     /// The host's signed key-log (author = `keylog_author`), so the joiner learns
     /// the epoch DAG and any wraps addressed to it. Empty for an un-rotated vault.
+    #[zeroize(skip)]
     pub keylog_author: u64,
+    #[zeroize(skip)]
     pub keylog_jsonl: Vec<u8>,
     /// The pinned vault founder's `peer_id`. The joiner writes this to its own
     /// `<vault>/founder` pin so its roster fold seeds `ever_admin` and it can
     /// materialize the role the host just granted (without it a Reader/Writer
     /// joiner folds NO role and is inert). Delivered ONLY here, over the proven
     /// stream — never in the out-of-band token.
+    #[zeroize(skip)]
     pub founder: u64,
 }
 
@@ -176,7 +219,22 @@ pub struct PairingHost<'a> {
     /// The role this host grants the joiner it approves (applied in the host's
     /// `add_peer`). Admin-gated: the host must itself be an admin.
     role: Role,
+    /// Host-authoritative token expiry (Unix secs). This is the value the host
+    /// minted, held in the host's own memory — NOT read back from the token — so
+    /// an attacker who edits the token's field cannot extend the accept window.
+    expires_at_unix_secs: u64,
     store: &'a mut Store,
+}
+
+impl Drop for PairingHost<'_> {
+    /// Wipe the single-use secret and the shared vault key when the host is
+    /// dropped, so neither lingers in freed memory after pairing (`PairingHost`
+    /// holds borrows, so it uses a manual `Drop` rather than the derive).
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.secret.zeroize();
+        self.vault_key.zeroize();
+    }
 }
 
 /// The generating (host) side of pairing.
@@ -191,6 +249,20 @@ pub async fn host_pairing<'a>(
     role: Role,
     store: &'a mut Store,
 ) -> Result<(String, PairingHost<'a>)> {
+    host_pairing_with_ttl(identity, vault, vault_key, role, store, PAIRING_TOKEN_TTL).await
+}
+
+/// [`host_pairing`] with an explicit token time-to-live. Production callers use
+/// [`host_pairing`] (the default [`PAIRING_TOKEN_TTL`]); this seam lets tests
+/// arm a token that is already expired without waiting out the real window.
+pub async fn host_pairing_with_ttl<'a>(
+    identity: &'a Identity,
+    vault: VaultId,
+    vault_key: [u8; 32],
+    role: Role,
+    store: &'a mut Store,
+    ttl: Duration,
+) -> Result<(String, PairingHost<'a>)> {
     let endpoint = build_endpoint(identity)
         .await
         .context("bind one-shot pairing endpoint")?;
@@ -201,6 +273,7 @@ pub async fn host_pairing<'a>(
     // A fresh, single-use random nonce. `VaultId::generate` is just a 32-byte
     // OS-random helper; reuse it rather than pulling in `rand` here.
     let secret = VaultId::generate().0;
+    let expires_at_unix_secs = now_unix_secs().saturating_add(ttl.as_secs());
 
     let token = PairingToken {
         addr,
@@ -208,6 +281,7 @@ pub async fn host_pairing<'a>(
         peer_id: identity.peer_id(),
         vault: vault.0,
         secret,
+        expires_at_unix_secs,
     };
     let token_str = token.encode();
 
@@ -220,6 +294,7 @@ pub async fn host_pairing<'a>(
             vault,
             vault_key,
             role,
+            expires_at_unix_secs,
             store,
         },
     ))
@@ -233,26 +308,71 @@ impl PairingHost<'_> {
     /// Verifies the joiner's proof-of-secret BEFORE adding it to the roster;
     /// a bad or absent proof returns `Err` and leaves the roster untouched.
     /// Returns the added peer's loro id on success.
-    pub async fn accept_auto(mut self) -> Result<u64> {
-        // Accept exactly ONE inbound connection.
-        let incoming = tokio::time::timeout(ACCEPT_TIMEOUT, self.endpoint.accept())
-            .await
-            .context("timed out waiting for a device to connect for pairing")?
-            .context("pairing endpoint closed before a connection arrived")?;
-        let conn = incoming
-            .accept()
-            .context("accept inbound pairing connection")?
-            .await
-            .context("complete pairing handshake")?;
+    ///
+    /// The accept window is the token's remaining lifetime (P1): once the
+    /// host-minted expiry lapses the window is zero and no join is accepted, so
+    /// a leaked token cannot be redeemed after the host's own deadline.
+    pub async fn accept_auto(self) -> Result<u64> {
+        let window = Duration::from_secs(self.expires_at_unix_secs.saturating_sub(now_unix_secs()));
+        self.accept_for(window).await
+    }
 
-        // Run the guarded handshake, always closing the one-shot endpoint after —
-        // even on rejection — so the secret is consumed exactly once.
-        let result = self.handshake(&conn).await;
-        // On success the host wrote LAST, so let the joiner read our accept
-        // before we tear the connection (and endpoint) down.
-        if result.is_ok() {
-            conn.closed().await;
-        }
+    /// Accept joins for at most `window`, returning the first that proves the
+    /// secret. Split out so tests can drive a short window without waiting the
+    /// full [`PAIRING_TOKEN_TTL`]; production calls [`accept_auto`].
+    pub async fn accept_for(mut self, window: Duration) -> Result<u64> {
+        // P2 (pairing DoS): keep accepting until a proof VERIFIES or the accept
+        // window closes. A hostile peer that connects first with a garbage proof
+        // must not burn the single-use secret and force the user to restart —
+        // only a successful join consumes the session. Each failed handshake
+        // closes just that connection and we loop for the next one.
+        let deadline = tokio::time::Instant::now() + window;
+        let result = loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let incoming = match tokio::time::timeout(remaining, self.endpoint.accept()).await {
+                Err(_elapsed) => {
+                    break Err(anyhow::anyhow!(
+                        "timed out waiting for a device to pair (no valid proof arrived)"
+                    ))
+                }
+                Ok(None) => {
+                    break Err(anyhow::anyhow!(
+                        "pairing endpoint closed before a valid join arrived"
+                    ))
+                }
+                Ok(Some(incoming)) => incoming,
+            };
+
+            let conn = match incoming
+                .accept()
+                .context("accept inbound pairing connection")
+            {
+                Ok(connecting) => match connecting.await {
+                    Ok(conn) => conn,
+                    // A connection that never completes its handshake is not a
+                    // reason to abort the whole session — wait for another.
+                    Err(_) => continue,
+                },
+                Err(_) => continue,
+            };
+
+            match self.handshake(&conn).await {
+                Ok(peer) => {
+                    // The host wrote LAST, so let the joiner read our accept
+                    // before we tear the connection (and endpoint) down.
+                    conn.closed().await;
+                    break Ok(peer);
+                }
+                // Reject THIS connection only; the secret is still unspent.
+                Err(_rejected) => {
+                    conn.close(0u32.into(), b"pairing rejected");
+                    continue;
+                }
+            }
+        };
+
+        // The secret is consumed exactly once — on success, or when the window
+        // closes with no valid join. Close the one-shot endpoint either way.
         self.endpoint.close().await;
         result
     }
@@ -278,7 +398,7 @@ impl PairingHost<'_> {
             .try_into()
             .context("proof must be a 64-byte ed25519 signature")?;
         let proof = Signature::from_bytes(&proof_bytes);
-        if !joiner_key.verify(&self.secret, &proof) {
+        if !joiner_key.verify_in_domain(PAIRING_PROOF_DOMAIN, &self.secret, &proof) {
             bail!("pairing proof did not verify — rejecting join (peer not added)");
         }
 
@@ -340,7 +460,7 @@ pub async fn join_pairing(
     identity: Identity,
     vault_root: PathBuf,
     token_str: String,
-) -> Result<(Store, [u8; 32], u64)> {
+) -> Result<(Store, zeroize::Zeroizing<[u8; 32]>, u64)> {
     let token = PairingToken::decode(&token_str).context("decode pairing token")?;
 
     let mut store =
@@ -363,7 +483,15 @@ async fn run_join(
     identity: &Identity,
     token: &PairingToken,
     store: &mut Store,
-) -> Result<([u8; 32], u64)> {
+) -> Result<(zeroize::Zeroizing<[u8; 32]>, u64)> {
+    // P1: an honest joiner refuses an expired token before dialing, so it never
+    // leaks its proof-of-secret to a stale or replayed token. (This does not
+    // constrain an attacker — who skips the check — but the host enforces its own
+    // deadline in `accept_auto`; that is the authoritative bound.)
+    if now_unix_secs() >= token.expires_at_unix_secs {
+        bail!("pairing token has expired — ask the other device for a fresh one");
+    }
+
     let conn = endpoint
         .connect(token.addr.clone(), PAIRING_ALPN)
         .await
@@ -372,7 +500,10 @@ async fn run_join(
 
     // We opened the stream, so we speak first: prove we saw the token by signing
     // its secret, then read the host's accept.
-    let proof = identity.sign(&token.secret).to_bytes().to_vec();
+    let proof = identity
+        .sign_in_domain(PAIRING_PROOF_DOMAIN, &token.secret)
+        .to_bytes()
+        .to_vec();
     let req = JoinRequest {
         verifying_key: identity.verifying_key().to_bytes(),
         peer_id: identity.peer_id(),
@@ -383,7 +514,7 @@ async fn run_join(
         .context("send pairing request")?;
     send.finish().context("finish pairing send")?;
 
-    let accept: JoinAccept = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_msg(&mut recv))
+    let mut accept: JoinAccept = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_msg(&mut recv))
         .await
         .context("timed out reading the host's accept")??;
 
@@ -409,20 +540,30 @@ async fn run_join(
     // (`rebuild_peers`); the founder pin above anchors trust in the founder.
     let host_key = VerifyingKey::from_bytes(&token.verifying_key)
         .context("token carried a malformed host key")?;
+    // `JoinAccept` wipes its `vault_key` on drop (`ZeroizeOnDrop`), so its fields
+    // can't be moved out by value — take the owned Vecs with `mem::take`, leaving
+    // empties the Drop can harmlessly run over.
     store
-        .import_roster_bundle(accept.rosters)
+        .import_roster_bundle(std::mem::take(&mut accept.rosters))
         .context("import host transitive roster")?;
     // Import the host's key-log so we learn the epoch DAG and any wraps addressed
     // to us (the host published them via backfill during accept). Authenticated by
     // the same host key as the roster.
     if !accept.keylog_jsonl.is_empty() {
         store
-            .import_keylog(accept.keylog_author, &host_key, accept.keylog_jsonl)
+            .import_keylog(
+                accept.keylog_author,
+                &host_key,
+                std::mem::take(&mut accept.keylog_jsonl),
+            )
             .context("import host keylog")?;
     }
 
     conn.close(0u32.into(), b"paired");
-    Ok((accept.vault_key, accept.founder))
+    // Copy the vault key out of the `ZeroizeOnDrop` `JoinAccept` into a
+    // `Zeroizing` wrapper so the caller's copy is wiped on drop too (the accept
+    // itself wipes its field when it drops at the end of this fn).
+    Ok((zeroize::Zeroizing::new(accept.vault_key), accept.founder))
 }
 
 /// Snapshot a dialable [`EndpointAddr`], waiting (bounded) for a direct address
@@ -437,6 +578,15 @@ async fn ready_addr(endpoint: &Endpoint) -> EndpointAddr {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     endpoint.addr()
+}
+
+/// Seconds since the Unix epoch, saturating to 0 before it (clock skew guard).
+/// Used only for the pairing-token TTL, where second granularity is ample.
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Write a value as `len(4, big-endian) || json`.
@@ -475,6 +625,52 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn a_pairing_proof_cannot_be_forged_from_an_oplog_signature() {
+        // M1: an op-log signature captured off the wire/backend must not verify
+        // as a pairing proof over the same secret bytes, even if the attacker
+        // sets the secret == an op-log update they authored. Distinct domain
+        // tags on each protocol's signature make the two mutually unverifiable.
+        use roam_storage::OPLOG_SIG_DOMAIN;
+        let victim = roam_storage::Identity::generate();
+        let secret = [9u8; 32];
+
+        // A signature the victim made in the OP-LOG domain over `secret`.
+        let oplog_sig = victim.sign_in_domain(OPLOG_SIG_DOMAIN, &secret);
+        // Replayed as a pairing proof: MUST be rejected by the pairing verify.
+        assert!(!victim.verifying_key().verify_in_domain(
+            PAIRING_PROOF_DOMAIN,
+            &secret,
+            &oplog_sig
+        ));
+
+        // And the reverse: a genuine pairing proof must not verify as an op.
+        let pairing_proof = victim.sign_in_domain(PAIRING_PROOF_DOMAIN, &secret);
+        assert!(!victim.verifying_key().verify_in_domain(
+            OPLOG_SIG_DOMAIN,
+            &secret,
+            &pairing_proof
+        ));
+
+        // Sanity: each still verifies in its own domain.
+        assert!(victim.verifying_key().verify_in_domain(
+            PAIRING_PROOF_DOMAIN,
+            &secret,
+            &pairing_proof
+        ));
+    }
+
+    #[test]
+    fn pairing_secrets_are_wiped_on_drop() {
+        // The pairing token's single-use secret and the vault key delivered in a
+        // JoinAccept are the two most sensitive bytes crossing this crate — the
+        // vault key decrypts the whole backend store. Both structs must wipe
+        // their secret on drop rather than leave it in freed memory.
+        fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<PairingToken>();
+        assert_zeroize_on_drop::<JoinAccept>();
+    }
+
+    #[test]
     fn token_roundtrips_through_base64() {
         let secret = iroh::SecretKey::generate();
         let token = PairingToken {
@@ -483,6 +679,7 @@ mod tests {
             peer_id: 42,
             vault: [7u8; 32],
             secret: [9u8; 32],
+            expires_at_unix_secs: 1_700_000_000,
         };
         let decoded = PairingToken::decode(&token.encode()).expect("decode");
         assert_eq!(decoded.verifying_key, token.verifying_key);
@@ -490,6 +687,59 @@ mod tests {
         assert_eq!(decoded.vault, token.vault);
         assert_eq!(decoded.secret, token.secret);
         assert_eq!(decoded.addr.id, token.addr.id);
+        assert_eq!(decoded.expires_at_unix_secs, token.expires_at_unix_secs);
+    }
+
+    /// P1 (leaked-token bearer window): a pairing token carries a
+    /// host-authoritative expiry. Once it lapses the armed host refuses every
+    /// join — even one that could prove the secret — so a token that leaks
+    /// (screenshot, chat log) is only usable inside the short mint window, not
+    /// indefinitely while the host process stays up.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_expired_pairing_session_refuses_all_joins() {
+        let da = tempdir().unwrap();
+        let ia = Identity::generate();
+        let vault = VaultId::generate();
+        let mut sa = Store::open(da.path(), ia.clone()).unwrap();
+        sa.declare_founder(Role::Admin).unwrap();
+
+        // Arm with a zero TTL: the token is already expired the instant it is
+        // minted, so the host's own deadline (not the attacker-editable token
+        // field) has already lapsed before any join can arrive.
+        let (_token, host) =
+            host_pairing_with_ttl(&ia, vault, [42u8; 32], Role::Admin, &mut sa, Duration::ZERO)
+                .await
+                .unwrap();
+        let res = host.accept_auto().await;
+        assert!(res.is_err(), "an expired session must accept no join");
+        // The founder self-entry is expected; no OTHER peer may be added.
+        assert!(
+            sa.roster().iter().all(|p| p.peer_id == ia.peer_id()),
+            "no foreign peer may be added by an expired pairing session"
+        );
+    }
+
+    /// P1: an honest joiner refuses a token whose expiry has already passed — so
+    /// it never leaks its proof to a stale or replayed token — and does so
+    /// without dialing the host at all.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_joiner_refuses_an_expired_token() {
+        let db = tempdir().unwrap();
+        let ib = Identity::generate();
+        let secret = iroh::SecretKey::generate();
+        let token = PairingToken {
+            addr: EndpointAddr::new(secret.public()),
+            verifying_key: [3u8; 32],
+            peer_id: 42,
+            vault: [7u8; 32],
+            secret: [9u8; 32],
+            expires_at_unix_secs: 1, // one second past the epoch — long expired
+        };
+        let res = join_pairing(ib.clone(), db.path().to_path_buf(), token.encode()).await;
+        assert!(
+            res.is_err(),
+            "an honest joiner must refuse an already-expired token"
+        );
     }
 
     #[test]
@@ -524,7 +774,7 @@ mod tests {
 
         let (sb, joiner_vault_key, joiner_founder) = join.await.unwrap().unwrap();
         assert_eq!(
-            joiner_vault_key, vault_key,
+            *joiner_vault_key, vault_key,
             "the joiner must receive the host's shared vault key"
         );
         assert_eq!(
@@ -624,6 +874,83 @@ mod tests {
         );
     }
 
+    /// P2 (pairing DoS): a hostile peer that connects FIRST with a garbage proof
+    /// must not burn the single-use secret. The host keeps accepting until a
+    /// valid proof arrives (or the accept window closes), so the real joiner —
+    /// arriving after the attacker is rejected — still pairs successfully.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_bad_proof_does_not_consume_the_pairing_session() {
+        let da = tempdir().unwrap();
+        let db = tempdir().unwrap();
+        let ia = Identity::generate();
+        let attacker = Identity::generate();
+        let ib = Identity::generate();
+        let vault = VaultId::generate();
+
+        let mut sa = Store::open(da.path(), ia.clone()).unwrap();
+        sa.declare_founder(Role::Admin).unwrap();
+
+        let vault_key = [42u8; 32];
+        let attacker_peer = attacker.peer_id();
+        let (token, host) = host_pairing(&ia, vault, vault_key, Role::Admin, &mut sa)
+            .await
+            .unwrap();
+        let token_decoded = PairingToken::decode(&token).unwrap();
+        let attacker_addr = token_decoded.addr.clone();
+        let db_path = db.path().to_path_buf();
+
+        // `PairingHost` borrows the store, so it cannot be spawned; run it inline
+        // via `join!` alongside the joiners, which are chained attacker-then-real
+        // so the host provably handles (and rejects) the bad proof first.
+        let joiners = async {
+            // Attacker connects FIRST, signs the wrong bytes.
+            let bad = async {
+                let endpoint = build_endpoint(&attacker).await?;
+                let conn = endpoint.connect(attacker_addr, PAIRING_ALPN).await?;
+                let (mut send, mut recv) = conn.open_bi().await?;
+                let proof = attacker.sign(b"not the pairing secret").to_bytes().to_vec();
+                let req = JoinRequest {
+                    verifying_key: attacker.verifying_key().to_bytes(),
+                    peer_id: attacker.peer_id(),
+                    proof,
+                };
+                write_msg(&mut send, &req).await?;
+                send.finish()?;
+                let accepted: Result<JoinAccept> = read_msg(&mut recv).await;
+                endpoint.close().await;
+                anyhow::Ok(accepted.is_ok())
+            }
+            .await
+            .unwrap_or(false);
+            // Then the real joiner — the session must have survived the rejection.
+            let real = join_pairing(ib.clone(), db_path, token).await;
+            (bad, real)
+        };
+
+        let (host_res, (attacker_got_accept, real)) = tokio::join!(host.accept_auto(), joiners);
+
+        assert!(!attacker_got_accept, "attacker must not be accepted");
+        let (sb, joiner_vault_key, _founder) = real.unwrap();
+        assert_eq!(*joiner_vault_key, vault_key);
+        assert_eq!(
+            host_res.unwrap(),
+            ib.peer_id(),
+            "host pairs the real joiner despite the earlier bad proof"
+        );
+
+        assert!(
+            sa.roster()
+                .iter()
+                .any(|p| p.peer_id == ib.peer_id() && p.status == PeerStatus::Active),
+            "the real joiner must be trusted"
+        );
+        assert!(
+            !sa.roster().iter().any(|p| p.peer_id == attacker_peer),
+            "the attacker must never be added"
+        );
+        let _ = &sb;
+    }
+
     /// Fail-closed: a joiner whose proof signs the WRONG bytes is rejected, and
     /// A's roster does NOT gain B.
     #[tokio::test(flavor = "multi_thread")]
@@ -661,7 +988,9 @@ mod tests {
             anyhow::Ok(accepted.is_ok())
         });
 
-        let host_res = host.accept_auto().await;
+        // Only a malicious joiner connects; accept over a short window so the
+        // test does not wait the full interactive timeout for the Err.
+        let host_res = host.accept_for(Duration::from_secs(5)).await;
         assert!(host_res.is_err(), "forged proof must be rejected");
 
         // The joiner must not have received an accept.
@@ -704,7 +1033,10 @@ mod tests {
                 .connect(token_decoded.addr.clone(), PAIRING_ALPN)
                 .await?;
             let (mut send, mut recv) = conn.open_bi().await?;
-            let proof = ib.sign(&token_decoded.secret).to_bytes().to_vec();
+            let proof = ib
+                .sign_in_domain(PAIRING_PROOF_DOMAIN, &token_decoded.secret)
+                .to_bytes()
+                .to_vec();
             let req = JoinRequest {
                 verifying_key: ib.verifying_key().to_bytes(),
                 peer_id: bad_peer_id,
@@ -717,7 +1049,9 @@ mod tests {
             anyhow::Ok(accepted.is_ok())
         });
 
-        let host_res = host.accept_auto().await;
+        // Only a malicious joiner connects; accept over a short window so the
+        // test does not wait the full interactive timeout for the Err.
+        let host_res = host.accept_for(Duration::from_secs(5)).await;
         assert!(host_res.is_err(), "a mismatched peer_id must be rejected");
 
         let joiner_got_accept = bad_join.await.unwrap().unwrap_or(false);

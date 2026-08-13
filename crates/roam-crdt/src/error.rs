@@ -10,6 +10,8 @@ pub enum CrdtError {
     Encode(String),
     #[error("target frontier is not retained in this oplog (compacted away)")]
     FrontierNotRetained,
+    #[error("update authored by peer {found} but attributed to {expected}")]
+    ForeignAuthor { expected: u64, found: u64 },
 }
 
 impl From<loro::LoroError> for CrdtError {

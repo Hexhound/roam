@@ -19,7 +19,7 @@ defmodule SyncWeb.SyncController do
   def reconcile(conn, %{"bucket" => bucket, "kind" => kind}) do
     with :ok <- guard(conn, [bucket]),
          {:ok, kind_dir} <- fetch_kind(kind),
-         {:ok, body, conn} <- read_body(conn) do
+         {:ok, body, conn} <- read_raw_body(conn) do
       items = Store.id_bytes(bucket, kind_dir)
 
       case Sync.Rbsr.reconcile_server(items, body) do
@@ -41,6 +41,18 @@ defmodule SyncWeb.SyncController do
     case Map.fetch(@kinds, kind) do
       {:ok, dir} -> {:ok, dir}
       :error -> :error
+    end
+  end
+
+  # BE3: if Plug.Parsers already consumed the body (e.g. a Content-Type:
+  # application/json PUT of opaque ciphertext), recover the untouched raw bytes
+  # from the caching body reader instead of read_body's now-empty stream.
+  # Otherwise (octet-stream passed through) read the body ourselves, preserving
+  # the length cap so oversized payloads still fail closed via {:more, ...}.
+  defp read_raw_body(conn, opts \\ []) do
+    case SyncWeb.CachingBodyReader.cached_body(conn) do
+      {:ok, body} -> {:ok, body, conn}
+      :none -> read_body(conn, opts)
     end
   end
 
@@ -75,7 +87,7 @@ defmodule SyncWeb.SyncController do
 
   defp do_put(conn, bucket, kind, id) do
     with :ok <- guard(conn, [bucket, id]),
-         {:ok, body, conn} <- read_body(conn, length: 64_000_000) do
+         {:ok, body, conn} <- read_raw_body(conn, length: 64_000_000) do
       case Store.put(bucket, kind, id, body) do
         :created -> send_resp(conn, 201, "")
         :exists -> send_resp(conn, 409, "")

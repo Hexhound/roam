@@ -176,6 +176,34 @@ impl Document {
         Ok(())
     }
 
+    /// Merge a single-author delta, rejecting any update whose INTERNAL loro
+    /// peer_id is not `author` (EN1). The enclosing op-log signature only covers
+    /// the opaque `bytes`, so a signer could embed ops attributed to another
+    /// device's peer id — forging authorship and, because loro op-ids are
+    /// idempotent, silently censoring that device's genuine future ops. The
+    /// update is probed in a throwaway document first, so a foreign-author update
+    /// is rejected WITHOUT mutating this document.
+    pub fn import_authored_by(&self, author: u64, bytes: &[u8]) -> Result<(), CrdtError> {
+        let probe = LoroDoc::new();
+        let status = probe.import(bytes)?;
+        let mut peers = status
+            .success
+            .iter()
+            .map(|(peer, _)| *peer)
+            .collect::<Vec<u64>>();
+        if let Some(pending) = &status.pending {
+            peers.extend(pending.iter().map(|(peer, _)| *peer));
+        }
+        if let Some(&found) = peers.iter().find(|&&p| p != author) {
+            return Err(CrdtError::ForeignAuthor {
+                expected: author,
+                found,
+            });
+        }
+        self.doc.import(bytes)?;
+        Ok(())
+    }
+
     /// The current op-log frontier (leaf op-ids of everything committed).
     pub fn oplog_frontier(&self) -> Frontier {
         Frontier(self.doc.oplog_frontiers())
@@ -334,6 +362,31 @@ mod tests {
         doc.insert_text("note", 3, "→x").unwrap();
         doc.commit();
         assert_eq!(doc.text("note"), "caf→x");
+    }
+
+    #[test]
+    fn import_authored_by_rejects_a_foreign_internal_peer() {
+        // EN1: an update whose INTERNAL loro peer_id differs from the claimed
+        // author must be rejected before mutating the doc. Otherwise a signer can
+        // embed ops attributed to another device — forging authorship and (via
+        // idempotent op-ids) censoring that device's real future ops.
+        let victim = Document::new(7).unwrap();
+        victim.insert_text("note", 0, "secret").unwrap();
+        victim.commit();
+        let from_empty = Document::new(99).unwrap().version();
+        let update = victim.export_from(&from_empty).unwrap();
+
+        let target = Document::new(1).unwrap();
+        // Claimed author 9 != internal peer 7 → reject, no mutation.
+        assert!(target.import_authored_by(9, &update).is_err());
+        assert_eq!(
+            target.text("note"),
+            "",
+            "a rejected update must not mutate the document"
+        );
+        // Correct author 7 → accepted.
+        target.import_authored_by(7, &update).unwrap();
+        assert_eq!(target.text("note"), "secret");
     }
 
     #[test]

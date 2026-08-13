@@ -34,14 +34,39 @@ defmodule Sync.Backend.SweeperTest do
     assert Map.has_key?(results, b2)
 
     for bucket <- [b1, b2] do
-      # One snapshot dropped, subsumed entry + orphan blob purged.
+      # One snapshot dropped, subsumed entry purged. BE2: "borphan" is in no
+      # manifest, so the backend has no evidence it's dead — it is kept.
       assert length(Store.list(bucket, "snapshots")) == 3
       assert Store.list(bucket, "entries") == []
-      assert Store.list(bucket, "blobs") == []
+      assert Store.list(bucket, "blobs") == ["borphan"]
     end
   end
 
   test "sweep_all on an empty data root is a no-op" do
     assert Sweeper.sweep_all(keep: 3) == %{}
+  end
+
+  test "sweep_all isolates a bucket whose retention raises and still sweeps the healthy buckets" do
+    # BE4: buckets are client-controlled. A snapshot manifest that parses as JSON
+    # but carries a non-list `subsumed_entry_ids` makes Retention.sweep raise
+    # (Enum over a string). One poisoned bucket must not abort the whole periodic
+    # sweep and starve every other bucket of retention.
+    good = String.duplicate("A", 43)
+    bad = String.duplicate("B", 43)
+
+    frame = snapshot_frame(["esub"], [])
+    for id <- ["s1", "s2", "s3", "s4"], do: Store.put(good, "snapshots", id, frame)
+    Store.put(good, "entries", "esub", "x")
+
+    # subsumed_entry_ids is a bare string, not a list -> Retention.sweep raises.
+    Store.put(bad, "snapshots", "s1", snapshot_frame("boom", []))
+
+    results = Sweeper.sweep_all(keep: 3, grace_ms: 0, now_ms: 9_000_000_000_000)
+
+    # The healthy bucket is still compacted despite the poisoned neighbour.
+    assert length(Store.list(good, "snapshots")) == 3
+    # The poisoned bucket is reported (handled), not a crash that killed the run.
+    assert Map.has_key?(results, bad)
+    assert match?({:error, _}, results[bad])
   end
 end

@@ -112,6 +112,22 @@ defmodule SyncWeb.SyncControllerTest do
     assert post(conn, "/b/#{@bucket}/reconcile/bogus", <<>>).status == 400
   end
 
+  test "a body sent with a application/json content-type is stored raw, not eaten by Plug.Parsers",
+       %{conn: conn} do
+    # BE3: Plug.Parsers runs on every request. If a client (buggy or hostile)
+    # PUTs opaque ciphertext under Content-Type: application/json, Parsers must
+    # NOT consume the body and leave the controller's read_body with "". The
+    # backend is zero-knowledge and cannot re-verify id == hash(body), so a
+    # silently-emptied body would poison the content-addressed id for every peer.
+    raw = ~s({"looks":"like json","but":"is ciphertext"})
+    conn = put_req_header(conn, "content-type", "application/json")
+    assert put(conn, "/b/#{@bucket}/entries/#{@id}", raw).status == 201
+
+    got = get(build_conn(), "/b/#{@bucket}/entries/#{@id}")
+    assert got.status == 200
+    assert got.resp_body == raw
+  end
+
   test "an oversized body fails closed (413), never 500", %{conn: conn} do
     # >8MB exceeds read_body's default limit -> {:more, ...}; the controller must
     # fail closed with 413, not raise WithClauseError -> 500.

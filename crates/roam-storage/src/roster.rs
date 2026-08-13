@@ -42,6 +42,14 @@ pub enum RosterOp {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RosterEntry {
     pub seq: u64,
+    /// Per-SUBJECT Lamport clock for role resolution (N3). When an admin authors
+    /// an `Add`/`SetRole`/`Revoke` for a subject it sets `lamport = 1 + max` of
+    /// every lamport it has observed for that subject, so the newest admin
+    /// decision wins the role fold regardless of WHICH admin made it — any admin
+    /// can freely re-promote or demote any client. Distinct from `seq` (the
+    /// per-author append-only log position); this is signed and compared ACROSS
+    /// authors. Ties (equal lamport) break by `added_by`, then least privilege.
+    pub lamport: u64,
     pub op: RosterOp,
     pub subject_peer: u64,
     /// The subject's ed25519 verifying key — ALSO its iroh NodeId.
@@ -53,6 +61,7 @@ pub struct RosterEntry {
 #[derive(Serialize, Deserialize)]
 struct RosterLine {
     seq: u64,
+    lamport: u64,
     op: RosterOp,
     subject_peer: u64,
     subject_key: String, // base64 of [u8;32]
@@ -65,9 +74,10 @@ impl RosterEntry {
     /// across encode/decode (do not sign the JSON — field order/formatting is
     /// not guaranteed).
     pub fn canonical_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(1 + 8 + 2 + 8 + 32 + 8);
-        buf.extend_from_slice(b"roam.roster.v2");
+        let mut buf = Vec::with_capacity(14 + 8 + 8 + 2 + 8 + 32 + 8);
+        buf.extend_from_slice(b"roam.roster.v3");
         buf.extend_from_slice(&self.seq.to_le_bytes());
+        buf.extend_from_slice(&self.lamport.to_le_bytes());
         let (op_tag, role_tag) = match &self.op {
             RosterOp::Add { role } => (0u8, role_byte(*role)),
             RosterOp::SetRole { role } => (2u8, role_byte(*role)),
@@ -118,12 +128,14 @@ pub struct PeerRecord {
 }
 
 /// Fold a set of signed roster entries into the current peer set using the
-/// grant-certificate model. Purely a function of the signed entry set (no causal
-/// metadata): `ever_admin` is a monotone closure seeded by `founder`; a `Revoke`
-/// by any `ever_admin` peer is terminal (prefer-deny); the role is the
-/// least-privilege combination of each `ever_admin` author's latest intent.
+/// grant-certificate model. Purely a function of the signed entry set:
+/// `ever_admin` is a monotone closure seeded by `founder`; a `Revoke` by any
+/// `ever_admin` peer is terminal (prefer-deny); and the role is the NEWEST admin
+/// decision — the `Add`/`SetRole` with the highest per-subject `lamport` (N3),
+/// tie-broken by `added_by` then least privilege. Any admin can thus re-promote
+/// or demote any client; there is no per-granting-admin floor.
 pub fn merge_roster(entries: &mut [RosterEntry], founder: Option<u64>) -> Vec<PeerRecord> {
-    use std::collections::{BTreeMap, HashMap, HashSet};
+    use std::collections::{BTreeMap, HashSet};
     let valid: Vec<&RosterEntry> = entries
         .iter()
         .filter(|e| e.subject_peer == u64::from_le_bytes(e.subject_key[0..8].try_into().unwrap()))
@@ -149,7 +161,13 @@ pub fn merge_roster(entries: &mut [RosterEntry], founder: Option<u64>) -> Vec<Pe
     }
     let mut keys: BTreeMap<u64, [u8; 32]> = BTreeMap::new();
     let mut revoked: HashSet<u64> = HashSet::new();
-    let mut intents: BTreeMap<u64, HashMap<u64, (u64, Role)>> = BTreeMap::new();
+    // N3: newest admin decision wins. Per subject we keep the single winning role
+    // op ordered by (lamport, added_by) — the highest Lamport is the most recent
+    // decision ANY admin has made about this subject, so any admin can freely
+    // re-promote or demote it (no per-granting-admin floor). Equal (lamport,
+    // added_by) — the same admin asserting two roles at one clock, e.g. a
+    // hand-built or replayed tie — falls back to least privilege.
+    let mut roles: BTreeMap<u64, (u64, u64, Role)> = BTreeMap::new();
     for e in valid.iter().filter(|e| ever_admin.contains(&e.added_by)) {
         keys.entry(e.subject_peer)
             .and_modify(|k| {
@@ -163,14 +181,18 @@ pub fn merge_roster(entries: &mut [RosterEntry], founder: Option<u64>) -> Vec<Pe
                 revoked.insert(e.subject_peer);
             }
             RosterOp::Add { role } | RosterOp::SetRole { role } => {
-                let role = *role;
-                let per = intents.entry(e.subject_peer).or_default();
-                let slot = per.entry(e.added_by).or_insert((0, Role::Reader));
-                match e.seq.cmp(&slot.0) {
-                    std::cmp::Ordering::Greater => *slot = (e.seq, role),
-                    std::cmp::Ordering::Equal => slot.1 = slot.1.min(role),
-                    std::cmp::Ordering::Less => {}
-                }
+                let cand = (e.lamport, e.added_by, *role);
+                roles
+                    .entry(e.subject_peer)
+                    .and_modify(|cur| {
+                        if (cand.0, cand.1) > (cur.0, cur.1) {
+                            *cur = cand;
+                        } else if (cand.0, cand.1) == (cur.0, cur.1) {
+                            // True tie (same clock AND author): least privilege.
+                            cur.2 = cur.2.min(cand.2);
+                        }
+                    })
+                    .or_insert(cand);
             }
             // Names are folded separately (see below); a SetName is never a grant.
             RosterOp::SetName { .. } => {}
@@ -194,14 +216,10 @@ pub fn merge_roster(entries: &mut [RosterEntry], founder: Option<u64>) -> Vec<Pe
             }
         }
     }
-    let mut out: Vec<PeerRecord> = intents
+    let mut out: Vec<PeerRecord> = roles
         .iter()
-        .map(|(subject, per_author)| {
-            let role = per_author
-                .values()
-                .map(|(_, r)| *r)
-                .min()
-                .unwrap_or(Role::Reader);
+        .map(|(subject, (_, _, role))| {
+            let role = *role;
             let status = if revoked.contains(subject) {
                 PeerStatus::Revoked
             } else {
@@ -249,6 +267,7 @@ impl RosterLog {
     pub fn append(
         &self,
         id: &Identity,
+        lamport: u64,
         op: RosterOp,
         subject_peer: u64,
         subject_key: [u8; 32],
@@ -267,6 +286,7 @@ impl RosterLog {
         let seq = self.last_seq(&id.verifying_key())? + 1;
         let entry = RosterEntry {
             seq,
+            lamport,
             op,
             subject_peer,
             subject_key,
@@ -275,6 +295,7 @@ impl RosterLog {
         let sig = id.sign(&entry.canonical_bytes());
         let line = RosterLine {
             seq: entry.seq,
+            lamport: entry.lamport,
             op: entry.op.clone(),
             subject_peer: entry.subject_peer,
             subject_key: B64.encode(entry.subject_key),
@@ -400,6 +421,7 @@ impl RosterLog {
             let sig = Signature::from_bytes(&sig_arr);
             let entry = RosterEntry {
                 seq: parsed.seq,
+                lamport: parsed.lamport,
                 op: parsed.op,
                 subject_peer: parsed.subject_peer,
                 subject_key,
@@ -432,6 +454,7 @@ mod tests {
         // Two same-author (founder) entries for b at the SAME seq, different roles.
         let e_admin = RosterEntry {
             seq: 2,
+            lamport: 2,
             op: RosterOp::SetRole { role: Role::Admin },
             subject_peer: b,
             subject_key: bk,
@@ -439,6 +462,7 @@ mod tests {
         };
         let e_reader = RosterEntry {
             seq: 2,
+            lamport: 2,
             op: RosterOp::SetRole { role: Role::Reader },
             subject_peer: b,
             subject_key: bk,
@@ -446,6 +470,7 @@ mod tests {
         };
         let seed = RosterEntry {
             seq: 1,
+            lamport: 1,
             op: RosterOp::Add { role: Role::Admin },
             subject_peer: f,
             subject_key: fk,
@@ -475,6 +500,7 @@ mod tests {
             // Honest entry: peer_id derives from the key.
             RosterEntry {
                 seq: 1,
+                lamport: 1,
                 op: RosterOp::Add { role: Role::Admin },
                 subject_peer: b.peer_id(),
                 subject_key: b_key,
@@ -483,6 +509,7 @@ mod tests {
             // Poisoned entry: peer_id does NOT derive from the key.
             RosterEntry {
                 seq: 2,
+                lamport: 2,
                 op: RosterOp::Add { role: Role::Admin },
                 subject_peer: b.peer_id().wrapping_add(999),
                 subject_key: b_key,
@@ -501,6 +528,7 @@ mod tests {
         let mut entries = vec![
             RosterEntry {
                 seq: 1,
+                lamport: 1,
                 op: RosterOp::Add { role: Role::Admin },
                 subject_peer: f,
                 subject_key: f_key,
@@ -508,6 +536,7 @@ mod tests {
             },
             RosterEntry {
                 seq: 1,
+                lamport: 1,
                 op: RosterOp::Add { role: Role::Admin },
                 subject_peer: b,
                 subject_key: b_key,
@@ -531,6 +560,7 @@ mod tests {
         let mut entries = vec![
             RosterEntry {
                 seq: 1,
+                lamport: 1,
                 op: RosterOp::Add { role: Role::Admin },
                 subject_peer: f,
                 subject_key: f_key,
@@ -538,6 +568,7 @@ mod tests {
             },
             RosterEntry {
                 seq: 2,
+                lamport: 2,
                 op: RosterOp::Add { role: Role::Writer },
                 subject_peer: w,
                 subject_key: w_key,
@@ -545,6 +576,7 @@ mod tests {
             },
             RosterEntry {
                 seq: 1,
+                lamport: 1,
                 op: RosterOp::Add { role: Role::Admin },
                 subject_peer: c,
                 subject_key: c_key,
@@ -559,43 +591,103 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_setrole_resolves_to_least_privilege() {
+    fn newest_admin_decision_wins_regardless_of_which_admin_made_it() {
+        // N3: any admin can change any client's role; the NEWEST decision (highest
+        // per-subject lamport) wins, no matter which admin authored it — there is
+        // no "only the granting admin can override" floor. Here founder f grants b
+        // Admin (lamport 3), a DIFFERENT admin a2 later demotes b to Reader
+        // (lamport 4), then f re-promotes b to Admin (lamport 5, newest of all).
         let (f, f_key) = pid(10);
         let (a2, a2_key) = pid(20);
         let (b, b_key) = pid(30);
-        let mut entries = vec![
-            RosterEntry {
-                seq: 1,
-                op: RosterOp::Add { role: Role::Admin },
-                subject_peer: f,
-                subject_key: f_key,
-                added_by: f,
-            },
-            RosterEntry {
-                seq: 2,
-                op: RosterOp::Add { role: Role::Admin },
-                subject_peer: a2,
-                subject_key: a2_key,
-                added_by: f,
-            },
-            RosterEntry {
-                seq: 3,
-                op: RosterOp::Add { role: Role::Admin },
-                subject_peer: b,
-                subject_key: b_key,
-                added_by: f,
-            },
-            RosterEntry {
-                seq: 1,
-                op: RosterOp::SetRole { role: Role::Reader },
-                subject_peer: b,
-                subject_key: b_key,
-                added_by: a2,
-            },
+        let grant = |sub, key, by, lamport, role| RosterEntry {
+            seq: lamport,
+            lamport,
+            op: RosterOp::Add { role },
+            subject_peer: sub,
+            subject_key: key,
+            added_by: by,
+        };
+        let mut base = vec![
+            grant(f, f_key, f, 1, Role::Admin),
+            grant(a2, a2_key, f, 2, Role::Admin),
+            grant(b, b_key, f, 3, Role::Admin),
         ];
+        // a2 (not the granter of b's Admin was also f, but a2 is a peer admin)
+        // demotes b — newer than f's grant, so it takes effect.
+        let demote = RosterEntry {
+            seq: 4,
+            lamport: 4,
+            op: RosterOp::SetRole { role: Role::Reader },
+            subject_peer: b,
+            subject_key: b_key,
+            added_by: a2,
+        };
+        let mut demoted = base.clone();
+        demoted.push(demote.clone());
+        let peers = merge_roster(&mut demoted, Some(f));
+        assert_eq!(
+            peers.iter().find(|p| p.peer_id == b).unwrap().role,
+            Role::Reader,
+            "a newer decision by a DIFFERENT admin (a2) overrides f's grant"
+        );
+
+        // f re-promotes b with an even-newer lamport — no per-admin floor blocks it.
+        base.push(demote);
+        base.push(RosterEntry {
+            seq: 5,
+            lamport: 5,
+            op: RosterOp::SetRole { role: Role::Admin },
+            subject_peer: b,
+            subject_key: b_key,
+            added_by: f,
+        });
+        let peers = merge_roster(&mut base, Some(f));
+        assert_eq!(
+            peers.iter().find(|p| p.peer_id == b).unwrap().role,
+            Role::Admin,
+            "the newest decision (f's re-promote) wins; a2's earlier demotion no longer floors"
+        );
+    }
+
+    #[test]
+    fn a_true_concurrent_role_tie_is_deterministic_and_least_privilege_on_full_tie() {
+        // Equal lamport AND equal author is the only genuine tie (a replay/hand-
+        // built duplicate); it resolves to least privilege. Distinct authors at
+        // equal lamport resolve deterministically by added_by (higher wins).
+        let (f, f_key) = pid(10);
+        let (b, b_key) = pid(30);
+        let seed = RosterEntry {
+            seq: 1,
+            lamport: 1,
+            op: RosterOp::Add { role: Role::Admin },
+            subject_peer: f,
+            subject_key: f_key,
+            added_by: f,
+        };
+        let admin = RosterEntry {
+            seq: 2,
+            lamport: 2,
+            op: RosterOp::SetRole { role: Role::Admin },
+            subject_peer: b,
+            subject_key: b_key,
+            added_by: f,
+        };
+        let reader = RosterEntry {
+            seq: 2,
+            lamport: 2,
+            op: RosterOp::SetRole { role: Role::Reader },
+            subject_peer: b,
+            subject_key: b_key,
+            added_by: f,
+        };
+        let mut entries = vec![seed, admin, reader];
         let peers = merge_roster(&mut entries, Some(f));
-        let brec = peers.iter().find(|p| p.peer_id == b).unwrap();
-        assert_eq!(brec.role, Role::Reader);
+        assert_eq!(
+            peers.iter().find(|p| p.peer_id == b).unwrap().role,
+            Role::Reader,
+            "same-clock same-author conflict → least privilege"
+        );
     }
 
     #[test]
@@ -606,6 +698,7 @@ mod tests {
         let mut entries = vec![
             RosterEntry {
                 seq: 1,
+                lamport: 1,
                 op: RosterOp::Add { role: Role::Admin },
                 subject_peer: a,
                 subject_key: a_key,
@@ -613,6 +706,7 @@ mod tests {
             },
             RosterEntry {
                 seq: 2,
+                lamport: 2,
                 op: RosterOp::Add { role: Role::Admin },
                 subject_peer: b,
                 subject_key: b_key,
@@ -620,6 +714,7 @@ mod tests {
             },
             RosterEntry {
                 seq: 1,
+                lamport: 1,
                 op: RosterOp::Add { role: Role::Admin },
                 subject_peer: c,
                 subject_key: c_key,
@@ -627,6 +722,7 @@ mod tests {
             },
             RosterEntry {
                 seq: 3,
+                lamport: 3,
                 op: RosterOp::SetRole { role: Role::Reader },
                 subject_peer: b,
                 subject_key: b_key,
@@ -634,6 +730,7 @@ mod tests {
             },
             RosterEntry {
                 seq: 4,
+                lamport: 4,
                 op: RosterOp::Revoke,
                 subject_peer: b,
                 subject_key: b_key,
@@ -656,6 +753,7 @@ mod tests {
         let mut entries = vec![
             RosterEntry {
                 seq: 1,
+                lamport: 1,
                 op: RosterOp::Add { role: Role::Admin },
                 subject_peer: f,
                 subject_key: f_key,
@@ -663,6 +761,7 @@ mod tests {
             },
             RosterEntry {
                 seq: 2,
+                lamport: 2,
                 op: RosterOp::Add { role: Role::Reader },
                 subject_peer: b,
                 subject_key: b_key,
@@ -670,6 +769,7 @@ mod tests {
             },
             RosterEntry {
                 seq: 3,
+                lamport: 3,
                 op: RosterOp::SetRole { role: Role::Writer },
                 subject_peer: b,
                 subject_key: b_key,
@@ -691,6 +791,7 @@ mod tests {
         let e1 = log
             .append(
                 &a,
+                1,
                 RosterOp::Add { role: Role::Admin },
                 b.peer_id(),
                 b.verifying_key().to_bytes(),
@@ -700,6 +801,7 @@ mod tests {
         let e2 = log
             .append(
                 &a,
+                1,
                 RosterOp::Revoke,
                 b.peer_id(),
                 b.verifying_key().to_bytes(),
@@ -722,6 +824,7 @@ mod tests {
         let log = RosterLog::new(dir.path(), a.peer_id());
         log.append(
             &a,
+            1,
             RosterOp::Add { role: Role::Admin },
             b.peer_id(),
             b.verifying_key().to_bytes(),
@@ -750,6 +853,7 @@ mod tests {
         let mut entries = vec![
             RosterEntry {
                 seq: 1,
+                lamport: 1,
                 op: RosterOp::Add { role: Role::Writer },
                 subject_peer: x,
                 subject_key: key,
@@ -757,6 +861,7 @@ mod tests {
             },
             RosterEntry {
                 seq: 2,
+                lamport: 2,
                 op: RosterOp::Revoke,
                 subject_peer: x,
                 subject_key: key,
@@ -765,6 +870,7 @@ mod tests {
             // Stale Add from a DIFFERENT, higher-id author must NOT resurrect X.
             RosterEntry {
                 seq: 1,
+                lamport: 1,
                 op: RosterOp::Add { role: Role::Writer },
                 subject_peer: x,
                 subject_key: key,
@@ -787,7 +893,13 @@ mod tests {
         let other = Identity::generate();
         let log = RosterLog::new(dir.path(), a.peer_id());
         // `other` is not this log's author -> append must refuse.
-        let err = log.append(&other, RosterOp::Add { role: Role::Reader }, 7, [0u8; 32]);
+        let err = log.append(
+            &other,
+            1,
+            RosterOp::Add { role: Role::Reader },
+            7,
+            [0u8; 32],
+        );
         assert!(matches!(err, Err(StorageError::Peer(_))));
     }
 
@@ -806,8 +918,11 @@ mod tests {
         subject_key: [u8; 32],
         added_by: u64,
     ) -> RosterEntry {
+        // Default the per-subject Lamport to `seq` for the single-author tests
+        // that use this helper; cross-author LWW tests build entries explicitly.
         RosterEntry {
             seq,
+            lamport: seq,
             op,
             subject_peer,
             subject_key,
@@ -876,6 +991,7 @@ mod tests {
     fn set_name_is_covered_by_canonical_bytes() {
         let base = RosterEntry {
             seq: 1,
+            lamport: 1,
             op: RosterOp::SetName {
                 name: "Sam's laptop".to_string(),
             },
@@ -907,6 +1023,7 @@ mod tests {
         let log = RosterLog::new(dir.path(), a.peer_id());
         log.append(
             &a,
+            1,
             RosterOp::Add { role: Role::Admin },
             b.peer_id(),
             b.verifying_key().to_bytes(),

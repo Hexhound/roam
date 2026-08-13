@@ -206,6 +206,20 @@ impl BlobStore {
             return Err(StorageError::Blob(format!("invalid blob hash {hash}")));
         }
 
+        // Opus #1: a chunk MUST lie wholly within the declared blob. Without this,
+        // an `offset` far past `total_len` seeks and writes beyond the pre-sized
+        // file, ballooning the `.part` into a huge sparse file that
+        // `finalize_incoming` later reads wholesale into memory (OOM). Reject
+        // before touching disk.
+        let end = offset
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| StorageError::Blob("blob chunk offset overflow".into()))?;
+        if end > total_len {
+            return Err(StorageError::Blob(format!(
+                "blob chunk [{offset}, {end}) exceeds total_len {total_len}"
+            )));
+        }
+
         let dir = self.incoming_dir();
         std::fs::create_dir_all(&dir)?;
         let part = dir.join(format!("{hash}.part"));
@@ -464,6 +478,35 @@ mod tests {
     }
 
     #[test]
+    fn write_incoming_chunk_rejects_a_chunk_extending_past_total_len() {
+        let dir = tempdir().unwrap();
+        let bs = open(&dir);
+        let hash = BlobStore::hash(b"small blob");
+        let total_len = 10u64;
+
+        // A chunk claiming to sit far beyond `total_len` would balloon the `.part`
+        // into a terabyte-scale sparse file that `finalize_incoming` then reads
+        // wholesale into memory (Opus #1 OOM). It must be refused.
+        assert!(
+            matches!(
+                bs.write_incoming_chunk(&hash, 1 << 40, total_len, b"x"),
+                Err(StorageError::Blob(_))
+            ),
+            "a chunk whose offset+len exceeds total_len must be rejected"
+        );
+
+        // A chunk that fits at the tail exactly is still fine.
+        let part = dir.path().join("incoming").join(format!("{hash}.part"));
+        if part.exists() {
+            let len = std::fs::metadata(&part).unwrap().len();
+            assert!(
+                len <= total_len,
+                "the part file must never exceed total_len; got {len}"
+            );
+        }
+    }
+
+    #[test]
     fn finalize_incoming_rejects_content_that_does_not_match_the_hash() {
         let dir = tempdir().unwrap();
         let bs = open(&dir);
@@ -515,6 +558,9 @@ mod tests {
         std::fs::create_dir(assets.join(&hash)).unwrap();
 
         assert!(bs.finalize_incoming(&hash).is_err());
-        assert!(!assets.join("incoming").join(format!("{hash}.part")).exists());
+        assert!(!assets
+            .join("incoming")
+            .join(format!("{hash}.part"))
+            .exists());
     }
 }

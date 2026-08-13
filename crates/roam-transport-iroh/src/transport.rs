@@ -281,6 +281,21 @@ async fn handle_conn(incoming: Incoming, routes: Routes, tx: InboundTx) -> Resul
         .await
         .context("complete inbound handshake")?;
     let remote = conn.remote_id();
+
+    // Roster gate (spec §6): only accept inbound SYNC connections from a NodeId
+    // already in `routes`. A stranger's key is refused HERE — before a reader
+    // task is spawned or a single frame is forwarded — so a non-roster peer
+    // cannot pin an accept task or flood the unbounded inbound channel with
+    // frames the app layer would only discard after decoding. Confidentiality
+    // never depended on this (replies route by NodeId and ops verify against
+    // roster keys); this closes the DoS surface. Pairing runs on its own
+    // endpoint over PAIRING_ALPN and never reaches this sync accept loop.
+    if conn.alpn() != SYNC_ALPN || !routes_contains_key(&routes, remote.as_bytes()) {
+        crate::dlog!("accept: REFUSED non-roster inbound (node={remote})");
+        conn.close(0u32.into(), b"not in roster");
+        return Ok(());
+    }
+
     let peer = peer_id_for(&routes, &remote);
     crate::dlog!("accept: inbound connection from peer={peer} (node={remote})");
     let (_send, recv) = conn.accept_bi().await.context("accept inbound bi stream")?;
@@ -300,6 +315,16 @@ async fn read_loop(mut recv: RecvStream, peer: u64, tx: InboundTx) -> Result<()>
         }
     }
     Ok(())
+}
+
+/// Whether `key` (a remote NodeId's 32 bytes) is a known route — i.e. the peer
+/// is in this device's roster. The accept loop uses this to refuse strangers.
+fn routes_contains_key(routes: &Routes, key: &[u8]) -> bool {
+    routes
+        .lock()
+        .unwrap()
+        .values()
+        .any(|node_key| node_key.as_slice() == key)
 }
 
 /// Map an authenticated remote [`EndpointId`] back to a loro `peer_id`.
@@ -392,6 +417,39 @@ mod tests {
             .unwrap();
         assert_eq!(from, id_a.peer_id());
         assert_eq!(frame, Frame::Ping);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_inbound_sync_connection_from_a_non_roster_peer_is_refused() {
+        // Transport DoS (spec §6): the accept loop must reject inbound SYNC
+        // connections whose NodeId is not in `routes`. Otherwise any stranger who
+        // learns the NodeId can open a connection, pin an accept task, and flood
+        // the unbounded inbound channel with frames the app layer only discards
+        // later. Gating at accept — before a reader is spawned — closes that.
+        let host = Identity::generate();
+        let stranger = Identity::generate();
+
+        // Host knows NOBODY. The stranger knows the host (so it can dial).
+        let host_t = IrohTransport::spawn(&host, HashMap::new()).await.unwrap();
+        let mut routes_s = HashMap::new();
+        routes_s.insert(host.peer_id(), host.verifying_key().to_bytes());
+        let stranger_t = IrohTransport::spawn(&stranger, routes_s).await.unwrap();
+        stranger_t
+            .add_addr(host.peer_id(), host_t.endpoint_addr())
+            .await;
+
+        let mut host_in = host_t.incoming();
+        // The stranger dials the host and pushes a frame.
+        stranger_t.dial(host.peer_id()).await.unwrap();
+        let _ = stranger_t.send(host.peer_id(), Frame::Ping).await;
+
+        // The host must NOT surface the stranger's frame — the connection was
+        // refused at accept, so nothing reaches the inbound channel.
+        let got = tokio::time::timeout(Duration::from_secs(2), host_in.next()).await;
+        assert!(
+            got.is_err(),
+            "a frame from a non-roster peer must not reach the inbound channel: {got:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

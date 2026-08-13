@@ -624,6 +624,9 @@ impl FolderBridge {
             }
         }
 
+        // FS1: refuse a target that escapes the vault via a symlinked component
+        // before creating dirs / writing.
+        self.ensure_within_vault(file)?;
         if let Some(parent) = file.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -661,12 +664,46 @@ impl FolderBridge {
     ///   rename, as elsewhere), byte-identical to the stored payload, and record
     ///   the presence marker. This is the ONLY case that touches disk — a
     ///   remote-new blob-ref whose bytes have now transferred.
+    /// Filesystem-level containment guard (FS1): reject a projection target whose
+    /// deepest EXISTING ancestor resolves (via `canonicalize`, following
+    /// symlinks) outside the vault. `container_id` is purely lexical and cannot
+    /// catch a symlinked intermediate component (`vault/sub -> /outside`); a write
+    /// through it would land bytes outside the vault. This runs before any
+    /// create/write/delete so a remote-controlled key can never escape.
+    fn ensure_within_vault(&self, file: &Path) -> Result<(), FilesError> {
+        let root = self
+            .vault_root
+            .canonicalize()
+            .map_err(|_| FilesError::PathEscapesVault(file.to_path_buf()))?;
+        let mut ancestor: &Path = file;
+        loop {
+            match ancestor.canonicalize() {
+                Ok(real) => {
+                    return if real.starts_with(&root) {
+                        Ok(())
+                    } else {
+                        Err(FilesError::PathEscapesVault(file.to_path_buf()))
+                    };
+                }
+                Err(_) => {
+                    ancestor = ancestor
+                        .parent()
+                        .ok_or_else(|| FilesError::PathEscapesVault(file.to_path_buf()))?;
+                }
+            }
+        }
+    }
+
     fn project_blob(
         &self,
         store: &mut Store,
         file: &Path,
         content_hash: &str,
     ) -> Result<SyncOutcome, FilesError> {
+        // FS1: refuse a target that escapes the vault through a symlinked
+        // component BEFORE `file.exists()` (which follows symlinks) or any write.
+        self.ensure_within_vault(file)?;
+
         // Graceful skip: the bytes for this ref are not local yet.
         let Some(bytes) = store.blobs().get(content_hash)? else {
             return Ok(SyncOutcome::unchanged());
@@ -928,6 +965,15 @@ impl FolderBridge {
         for (key, value) in store.entries(FILESET_MAP_ID) {
             let entry = FileEntry::from_value(&value)?;
             let file = key_to_path(&self.vault_root, &key);
+            // FS1 / C1b: a remote-controlled key that resolves OUTSIDE the vault
+            // (a `..` walk, or an intermediate on-disk symlink) is skipped, not
+            // `?`-propagated. Propagating would abort the whole reconcile on a
+            // single poisoned key and wedge all future sync; nothing on disk is
+            // touched for a skipped key (neither projection write nor delete).
+            if let Err(err) = self.ensure_within_vault(&file) {
+                eprintln!("roam: skipping fileset key that escapes the vault: {key:?} ({err})");
+                continue;
+            }
             let file_present = present.contains(&key);
             match entry.status {
                 EntryStatus::Live => {
@@ -1708,6 +1754,77 @@ mod tests {
     fn tsidecar_path(root: &Path, file: &Path) -> PathBuf {
         let container = container_id(&root.join("vault"), file).unwrap();
         sidecar_path(&tmeta(root), &container)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_skips_a_fileset_key_that_escapes_via_symlink_without_wedging() {
+        // C1b/FS1: a poisoned Live blob entry whose key escapes the vault (via a
+        // symlinked component) must be SKIPPED — `scan` returns Ok (no wedge) and
+        // writes nothing outside the vault.
+        let dir = tempdir().unwrap();
+        let (b, mut store) = bridge(dir.path());
+        let vault = dir.path().join("vault");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, vault.join("sub")).unwrap();
+
+        let hash = store.blobs().put(b"pwned").unwrap();
+        store
+            .set_entry(
+                FILESET_MAP_ID,
+                "sub/evil.bin",
+                &FileEntry {
+                    kind: EntryKind::Blob,
+                    status: EntryStatus::Live,
+                    content_hash: hash,
+                    renamed_from: None,
+                    tombstoned_at: None,
+                }
+                .to_value(),
+            )
+            .unwrap();
+
+        let res = b.scan(&mut store);
+        assert!(
+            res.is_ok(),
+            "a poisoned key must not wedge the whole reconcile: {res:?}"
+        );
+        assert!(
+            !outside.join("evil.bin").exists(),
+            "nothing may be written outside the vault"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_blob_refuses_to_write_through_a_symlinked_subdir() {
+        // FS1: a synced fileset key whose intermediate component is an on-disk
+        // symlink must not let projection write OUTSIDE the vault. `container_id`
+        // is purely lexical (no canonicalize), so following the symlink needs a
+        // filesystem-level containment guard before the write.
+        let dir = tempdir().unwrap();
+        let (b, mut store) = bridge(dir.path());
+        let vault = dir.path().join("vault");
+
+        // A directory OUTSIDE the vault, reached via a symlink placed inside it.
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, vault.join("sub")).unwrap();
+
+        // Stage the attacker bytes so `project_blob` has them locally.
+        let hash = store.blobs().put(b"pwned").unwrap();
+        let file = vault.join("sub").join("evil.bin"); // key "sub/evil.bin"
+
+        let res = b.project_blob(&mut store, &file, &hash);
+        assert!(
+            res.is_err(),
+            "projection through a symlinked subdir must be refused"
+        );
+        assert!(
+            !outside.join("evil.bin").exists(),
+            "no bytes may be written outside the vault"
+        );
     }
 
     #[test]

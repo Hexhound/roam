@@ -41,11 +41,23 @@ defmodule Sync.Backend.Retention do
     |> Enum.sort()
   end
 
-  @doc "Blob ids referenced by NO retained snapshot, past `grace`."
-  def blobs_to_delete(retained_blob_refs, blob_ages, now, grace) do
+  @doc """
+  Blob ids safe to delete: referenced by a DROPPED snapshot but NOT by any
+  retained snapshot, past `grace`.
+
+  BE2: the zero-knowledge backend cannot see an encrypted entry's blob refs, so a
+  blob newer than every snapshot appears in NO manifest — and a live, non-subsumed
+  entry may still reference it. Requiring membership in `dropped_blob_refs`
+  (evidence the blob was in the snapshot lineage and is now superseded) mirrors
+  `entries_to_delete` deleting only `subsumed` entries, and never reaps a blob the
+  backend has no evidence is dead.
+  """
+  def blobs_to_delete(retained_blob_refs, dropped_blob_refs, blob_ages, now, grace) do
     blob_ages
     |> Enum.filter(fn {id, born} ->
-      not MapSet.member?(retained_blob_refs, id) and now - born >= grace
+      MapSet.member?(dropped_blob_refs, id) and
+        not MapSet.member?(retained_blob_refs, id) and
+        now - born >= grace
     end)
     |> Enum.map(&elem(&1, 0))
     |> Enum.sort()
@@ -68,7 +80,7 @@ defmodule Sync.Backend.Retention do
     snaps = load_snapshots(root, bucket)
     dropped_ids = snapshots_to_drop(snaps, keep)
     dropped_set = MapSet.new(dropped_ids)
-    retained = Enum.reject(snaps, &MapSet.member?(dropped_set, &1.id))
+    {dropped, retained} = Enum.split_with(snaps, &MapSet.member?(dropped_set, &1.id))
 
     # Delete the dropped snapshot files.
     Enum.each(dropped_ids, &rm(root, bucket, "snapshots", &1))
@@ -79,12 +91,17 @@ defmodule Sync.Backend.Retention do
     retained_blob_refs =
       retained |> Enum.flat_map(& &1.blob_refs) |> MapSet.new()
 
+    # BE2: only blobs the DROPPED snapshots referenced are GC candidates — a blob
+    # in no manifest (newer than every snapshot) may still back a live entry.
+    dropped_blob_refs =
+      dropped |> Enum.flat_map(& &1.blob_refs) |> MapSet.new()
+
     entry_ages = file_ages(root, bucket, "entries")
     del_entries = entries_to_delete(retained_subsumed, entry_ages, now, grace)
     Enum.each(del_entries, &rm(root, bucket, "entries", &1))
 
     blob_ages = file_ages(root, bucket, "blobs")
-    del_blobs = blobs_to_delete(retained_blob_refs, blob_ages, now, grace)
+    del_blobs = blobs_to_delete(retained_blob_refs, dropped_blob_refs, blob_ages, now, grace)
     Enum.each(del_blobs, &rm(root, bucket, "blobs", &1))
 
     %{snapshots: dropped_ids, entries: del_entries, blobs: del_blobs}

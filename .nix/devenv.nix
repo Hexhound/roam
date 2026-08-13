@@ -1,10 +1,21 @@
 {
   inputs,
+  pkgs,
   ...
 }: {
   imports = [
     inputs.devkit.devenvModule
   ];
+
+  # cargo-nextest: compact, per-test-isolated runner. Far quieter output than
+  # `cargo test` (one line/test, filter expressions) — cuts context/token cost.
+  # Project-scoped for now; promote to the devkit rust module if funsy wants it.
+  packages = [pkgs.cargo-nextest];
+
+  # Claude Code CLI + agent-acp, sourced from the shared devkit. Pins
+  # CLAUDE_CONFIG_DIR under DEVENV_STATE so per-project memory/config is
+  # isolated. hexdocs/mempalace/postgres MCP left off — Rust-first workspace.
+  modules.claude.enable = true;
 
   # Rust toolchain (rustc/cargo/rustfmt) + Tauri GUI system libs, sourced from
   # the shared devkit. CARGO_HOME is pinned under DEVENV_STATE by the module.

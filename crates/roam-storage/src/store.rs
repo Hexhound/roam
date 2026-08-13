@@ -225,6 +225,20 @@ impl Store {
         self_key: &VerifyingKey,
         founder: Option<u64>,
     ) -> Result<Vec<PeerRecord>, StorageError> {
+        let mut all_entries = Self::collect_roster_entries(root, self_id, self_key, founder)?;
+        Ok(merge_roster(&mut all_entries, founder))
+    }
+
+    /// Walk every trusted author's roster log (fixpoint over discovered subject
+    /// keys, seeded by self + pinned founder) and return the union of their
+    /// verified entries. Shared by [`Self::rebuild_peers`] (which folds them into
+    /// the peer set) and the Lamport-clock lookup used when authoring a role op.
+    fn collect_roster_entries(
+        root: &Path,
+        self_id: u64,
+        self_key: &VerifyingKey,
+        founder: Option<u64>,
+    ) -> Result<Vec<RosterEntry>, StorageError> {
         let roster_dir = root.join("roster");
 
         // Trusted author keys (as raw bytes; `VerifyingKey` is not `Copy`), seeded
@@ -280,7 +294,7 @@ impl Store {
             all_entries.extend(entries);
         }
 
-        Ok(merge_roster(&mut all_entries, founder))
+        Ok(all_entries)
     }
 
     pub fn text(&self, id: &str) -> String {
@@ -555,8 +569,14 @@ impl Store {
     ) -> Result<(), StorageError> {
         self.require_admin()?;
         Self::check_peer_id_binding(peer_id, &key_bytes)?;
-        self.own_roster
-            .append(&self.identity, RosterOp::Add { role }, peer_id, key_bytes)?;
+        let lamport = self.next_role_lamport(peer_id)?;
+        self.own_roster.append(
+            &self.identity,
+            lamport,
+            RosterOp::Add { role },
+            peer_id,
+            key_bytes,
+        )?;
         self.refresh_peers()
     }
 
@@ -569,8 +589,10 @@ impl Store {
     ) -> Result<(), StorageError> {
         self.require_admin()?;
         Self::check_peer_id_binding(peer_id, &key_bytes)?;
+        let lamport = self.next_role_lamport(peer_id)?;
         self.own_roster.append(
             &self.identity,
+            lamport,
             RosterOp::SetRole { role },
             peer_id,
             key_bytes,
@@ -586,12 +608,15 @@ impl Store {
             .map(|p| p.role)
     }
 
-    /// Guard for Admin-only mutations.
+    /// Guard for Admin-only mutations. Requires BOTH an Active status and the
+    /// Admin role — role and status are independent fields, so a device revoked
+    /// by another admin still materializes role==Admin and must not keep signing
+    /// roster/keylog ops (N1).
     fn require_admin(&self) -> Result<(), StorageError> {
-        if self.self_role() == Some(Role::Admin) {
-            Ok(())
-        } else {
-            Err(StorageError::Peer("device is not an admin".into()))
+        let me = self.identity.peer_id();
+        match self.peers.iter().find(|p| p.peer_id == me) {
+            Some(p) if p.status == PeerStatus::Active && p.role == Role::Admin => Ok(()),
+            _ => Err(StorageError::Peer("device is not an active admin".into())),
         }
     }
 
@@ -600,8 +625,14 @@ impl Store {
     pub fn revoke_peer(&mut self, peer_id: u64, key_bytes: [u8; 32]) -> Result<(), StorageError> {
         self.require_admin()?;
         Self::check_peer_id_binding(peer_id, &key_bytes)?;
-        self.own_roster
-            .append(&self.identity, RosterOp::Revoke, peer_id, key_bytes)?;
+        let lamport = self.next_role_lamport(peer_id)?;
+        self.own_roster.append(
+            &self.identity,
+            lamport,
+            RosterOp::Revoke,
+            peer_id,
+            key_bytes,
+        )?;
         self.refresh_peers()
     }
 
@@ -620,8 +651,9 @@ impl Store {
         crate::founder::write_founder(&self.root, me)?;
         self.founder = Some(me);
         let key = self.identity.verifying_key().to_bytes();
+        let lamport = self.next_role_lamport(me)?;
         self.own_roster
-            .append(&self.identity, RosterOp::Add { role }, me, key)?;
+            .append(&self.identity, lamport, RosterOp::Add { role }, me, key)?;
         self.refresh_peers()
     }
 
@@ -636,8 +668,12 @@ impl Store {
         }
         let me = self.identity.peer_id();
         let my_key = self.self_key();
+        // A name is folded by its own highest-`seq` rule, not the role Lamport;
+        // carry a fresh lamport only to keep the signed field monotone per subject.
+        let lamport = self.next_role_lamport(me)?;
         self.own_roster.append(
             &self.identity,
+            lamport,
             RosterOp::SetName {
                 name: name.to_string(),
             },
@@ -691,6 +727,27 @@ impl Store {
 
     /// Re-run the roster fixpoint from disk and rewrite the cache. Called after
     /// any roster mutation so `self.peers` and `peers.json` stay in sync.
+    /// Next per-subject Lamport for a role decision (N3): `1 + max` of every
+    /// lamport this device has observed for `subject` across all trusted roster
+    /// logs. A freshly authored op is thus causally newer than everything we have
+    /// seen, so the newest-decision role fold lets ANY admin re-promote/demote a
+    /// client (no dependence on which admin granted the prior role).
+    fn next_role_lamport(&self, subject: u64) -> Result<u64, StorageError> {
+        let entries = Self::collect_roster_entries(
+            &self.root,
+            self.identity.peer_id(),
+            &self.identity.verifying_key(),
+            self.founder,
+        )?;
+        let max = entries
+            .iter()
+            .filter(|e| e.subject_peer == subject)
+            .map(|e| e.lamport)
+            .max()
+            .unwrap_or(0);
+        Ok(max + 1)
+    }
+
     fn refresh_peers(&mut self) -> Result<(), StorageError> {
         self.peers = Self::rebuild_peers(
             &self.root,
@@ -799,10 +856,20 @@ impl Store {
             }
             let roster_log = RosterLog::new(&roster_dir, author);
             let roster_path = roster_log.path();
-            // Append-only: refuse a shorter/older resend that would truncate newer
-            // entries already on disk.
+            // M6/N4: roster logs are append-only, so a correct incoming log is
+            // byte-PREFIX-consistent with what we already hold. Because these
+            // bundle bytes are UNVERIFIED at this point (keys not yet held), a mere
+            // length check is not enough: a same-or-longer log that DIVERGES from
+            // ours could install a forked roster history that never extends it.
+            // Take the incoming bytes only when they genuinely EXTEND ours; keep
+            // ours for a stale prefix; and REFUSE a fork (neither is a prefix of
+            // the other). Bundles always ship an author's FULL log, so there is no
+            // mid-log suffix case to reconcile (unlike `apply_peer_ops`).
             if let Ok(existing) = std::fs::read(&roster_path) {
-                if bytes.len() < existing.len() {
+                if bytes.starts_with(&existing) {
+                    // Genuine append-only extension (or an identical resend) → take it.
+                } else {
+                    // Stale prefix (existing is longer) or a divergent fork → keep ours.
                     continue;
                 }
             }
@@ -824,7 +891,15 @@ impl Store {
         let own = KeyLog::new(&dir, self.identity.peer_id());
         all.extend(own.read_verified(&self.identity.verifying_key())?);
         for peer in self.peers.iter() {
-            if peer.status != PeerStatus::Active || peer.peer_id == self.identity.peer_id() {
+            // N5: epoch rotation is Admin-only. Fold a peer's key-log ONLY if its
+            // roster role is Admin — a Reader/Writer `Rotate`/`Wrap` must never
+            // reach the epoch DAG (would let a non-admin install epoch keys or
+            // steer the write head, KC1's reachability). Own log is folded
+            // unconditionally above; local authoring is `require_admin`-gated.
+            if peer.status != PeerStatus::Active
+                || peer.role != Role::Admin
+                || peer.peer_id == self.identity.peer_id()
+            {
                 continue;
             }
             let Ok(pkey) = VerifyingKey::from_bytes(&peer.verifying_key) else {
@@ -883,7 +958,7 @@ impl Store {
         rand::rngs::OsRng.fill_bytes(&mut nonce);
         let mut new_key = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut new_key);
-        let epoch_id = compute_epoch_id(&parents, self.identity.peer_id(), &nonce);
+        let epoch_id = compute_epoch_id(&parents, self.identity.peer_id(), &nonce, &new_key);
 
         let log = KeyLog::new(&self.keylog_dir(), self.identity.peer_id());
         log.append(
@@ -1090,6 +1165,18 @@ impl Store {
         // peer logs). Only after full verification do we write, then merge.
         let peer_log = OpLog::new(&ops_dir, peer_id);
         let entries = peer_log.verify_bytes(key, &log_bytes)?;
+        // EN1: reject BEFORE persisting if any entry's update carries ops
+        // attributed to a loro peer other than `peer_id`. The ed25519 signature
+        // only covers the opaque update blob, so a signer could embed ops under
+        // another device's peer id — forging authorship and censoring that
+        // device's genuine future ops. Verify every update against the author
+        // first; only then write the log and merge.
+        for entry in &entries {
+            let probe = Document::new(self.identity.peer_id())?;
+            probe.import_authored_by(peer_id, &entry.update)?;
+        }
+        // All entries are author-clean; persist and merge (plain import — the
+        // authorship invariant is already established above).
         std::fs::write(&peer_log_path, &log_bytes)?;
         for entry in entries {
             self.doc.import(&entry.update)?;
@@ -1368,6 +1455,41 @@ impl Store {
             out.push(serde_json::from_str(line)?);
         }
         Ok(out)
+    }
+
+    /// Record a backend id (entry or blob) whose fetched ciphertext decrypted to
+    /// content that does NOT re-derive that id (BE1: the backend is first-writer-
+    /// wins with no id↔content check, so a member — or a compromised backend — can
+    /// squat an id with the wrong bytes). Poisoned ids are skipped on subsequent
+    /// backend fetches; the correct content still arrives peer-to-peer, whose id
+    /// binding is verified independently. Local-only cache; append + dedup.
+    pub fn mark_poisoned(&self, id: &str) -> Result<(), StorageError> {
+        if self.poisoned_ids()?.contains(id) {
+            return Ok(());
+        }
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.root.join("poisoned.jsonl"))?;
+        writeln!(f, "{id}")?;
+        Ok(())
+    }
+
+    /// Backend ids this device has marked poisoned (see [`Store::mark_poisoned`]).
+    pub fn poisoned_ids(&self) -> Result<std::collections::BTreeSet<String>, StorageError> {
+        let path = self.root.join("poisoned.jsonl");
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
+            Err(e) => return Err(e.into()),
+        };
+        Ok(text
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect())
     }
 
     /// Persist the signed framed snapshot object (`[len][manifest][sealed_ct]`)
@@ -1699,6 +1821,40 @@ mod tests {
             size.total,
             size.blobs + size.oplog + size.meta,
             "total is the sum of every bucket"
+        );
+    }
+
+    #[test]
+    fn import_peer_rejects_a_cross_peer_forged_update() {
+        // EN1: a Writer B signs (with B's key) an update whose INTERNAL loro
+        // peer_id is a victim C. The outer signature verifies against B's roster
+        // key, but the ops are attributed to C. import_peer must reject it — else
+        // B forges authorship as C and censors C's real future ops.
+        let dir = tempdir().unwrap();
+        let ib = Identity::generate();
+        let mut a = Store::open(dir.path(), Identity::generate()).unwrap();
+        a.declare_founder(Role::Admin).unwrap();
+        a.add_peer(ib.peer_id(), ib.verifying_key().to_bytes(), Role::Writer)
+            .unwrap();
+
+        // Build an update whose internal peer is a DIFFERENT device (victim C).
+        let victim_peer = ib.peer_id().wrapping_add(1);
+        let victim = Document::new(victim_peer).unwrap();
+        victim.insert_text("note", 0, "forged as C").unwrap();
+        victim.commit();
+        let from_empty = Document::new(777).unwrap().version();
+        let update = victim.export_from(&from_empty).unwrap();
+
+        // Sign C's update with B's key and read back the JSONL log bytes.
+        let logdir = tempdir().unwrap();
+        let log = OpLog::new(logdir.path(), ib.peer_id());
+        log.append(&ib, &update).unwrap();
+        let forged = std::fs::read(log.path()).unwrap();
+
+        let result = a.import_peer(ib.peer_id(), &ib.verifying_key(), forged);
+        assert!(
+            result.is_err(),
+            "import_peer must reject an update authored by a different loro peer"
         );
     }
 
@@ -2706,6 +2862,74 @@ mod tests {
     }
 
     #[test]
+    fn import_roster_bundle_refuses_to_clobber_with_a_divergent_fork() {
+        // M6/N4: the bundle path writes UNVERIFIED foreign roster logs (keys are
+        // not yet held; verification is deferred to the fold). A relayed log that
+        // is same-or-longer but DIVERGES from the prefix-consistent one we already
+        // hold must NOT overwrite it — accepting a fork could install a divergent
+        // roster history (e.g. an equivocating admin, or reordered/omitted
+        // validly-signed entries). Only a genuine append-only EXTENSION is taken.
+        let a = Identity::generate();
+
+        // Genuine log L1 under author A: A founds (Admin) and adds B.
+        let da1 = tempfile::tempdir().unwrap();
+        let mut sa1 = Store::open(da1.path(), a.clone()).unwrap();
+        sa1.declare_founder(Role::Admin).unwrap();
+        let b = Identity::generate();
+        sa1.add_peer(b.peer_id(), b.verifying_key().to_bytes(), Role::Admin)
+            .unwrap();
+        let l1 = sa1.export_all_rosters().unwrap();
+        let l1_a = l1
+            .iter()
+            .find(|(auth, _)| *auth == a.peer_id())
+            .map(|(_, bytes)| bytes.clone())
+            .expect("A's log is in the bundle");
+
+        // A DIVERGENT, LONGER log L2 under the SAME author A: founds, then adds two
+        // DIFFERENT peers. Shares L1's founder entry as a prefix but forks at the
+        // next entry, and is longer (so the old length-only guard would clobber).
+        let da2 = tempfile::tempdir().unwrap();
+        let mut sa2 = Store::open(da2.path(), a.clone()).unwrap();
+        sa2.declare_founder(Role::Admin).unwrap();
+        let x = Identity::generate();
+        let y = Identity::generate();
+        sa2.add_peer(x.peer_id(), x.verifying_key().to_bytes(), Role::Admin)
+            .unwrap();
+        sa2.add_peer(y.peer_id(), y.verifying_key().to_bytes(), Role::Admin)
+            .unwrap();
+        let l2 = sa2.export_all_rosters().unwrap();
+        let l2_a = l2
+            .iter()
+            .find(|(auth, _)| *auth == a.peer_id())
+            .map(|(_, bytes)| bytes.clone())
+            .unwrap();
+        assert!(l2_a.len() >= l1_a.len(), "the fork must be same-or-longer");
+        assert!(
+            !l2_a.starts_with(&l1_a),
+            "the fork must diverge, not extend"
+        );
+
+        // Victim V imports the genuine L1 first, then a relayed forked L2.
+        let dv = tempfile::tempdir().unwrap();
+        let mut sv = Store::open(dv.path(), Identity::generate()).unwrap();
+        sv.pin_founder(a.peer_id()).unwrap();
+        sv.import_roster_bundle(l1.clone()).unwrap();
+        sv.import_roster_bundle(l2).unwrap();
+
+        let held_a = sv
+            .export_all_rosters()
+            .unwrap()
+            .into_iter()
+            .find(|(auth, _)| *auth == a.peer_id())
+            .map(|(_, bytes)| bytes)
+            .expect("V still holds A's log");
+        assert_eq!(
+            held_a, l1_a,
+            "a divergent (fork) roster log must not clobber the prefix-consistent one we hold"
+        );
+    }
+
+    #[test]
     fn historical_entry_none_when_no_markers() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path(), Identity::generate()).unwrap();
@@ -2825,6 +3049,62 @@ mod tests {
                 Role::Admin
             )
             .is_err());
+    }
+
+    #[test]
+    fn any_admin_can_repromote_a_client_end_to_end() {
+        // N3 authoring wiring: a role change by ANY admin takes effect via the
+        // per-subject Lamport (1 + max observed). Founder A grants bob Reader; a
+        // DIFFERENT admin B re-promotes bob to Admin (newer) and A's fold adopts
+        // it; then A demotes bob again (newest) and it wins — no per-granter floor.
+        let a_id = Identity::generate();
+        let b_id = Identity::generate();
+        let bob = Identity::generate();
+
+        let da = tempfile::tempdir().unwrap();
+        let mut a = Store::open(da.path(), a_id.clone()).unwrap();
+        a.declare_founder(Role::Admin).unwrap();
+        a.add_peer(b_id.peer_id(), b_id.verifying_key().to_bytes(), Role::Admin)
+            .unwrap();
+        a.add_peer(bob.peer_id(), bob.verifying_key().to_bytes(), Role::Reader)
+            .unwrap();
+
+        // B (a second admin) learns the roster, then re-promotes bob to Admin.
+        let db = tempfile::tempdir().unwrap();
+        let mut b = Store::open(db.path(), b_id.clone()).unwrap();
+        b.pin_founder(a_id.peer_id()).unwrap();
+        b.import_roster(
+            a_id.peer_id(),
+            &a_id.verifying_key(),
+            a.export_own_roster().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(b.role_of(bob.peer_id()), Some(Role::Reader));
+        b.set_role(bob.peer_id(), bob.verifying_key().to_bytes(), Role::Admin)
+            .unwrap();
+
+        // A folds B's newer decision: bob is Admin even though A granted the
+        // original Reader role (any admin may override, newest wins).
+        a.import_roster(
+            b_id.peer_id(),
+            &b_id.verifying_key(),
+            b.export_own_roster().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            a.role_of(bob.peer_id()),
+            Some(Role::Admin),
+            "B's newer re-promote overrides A's original grant"
+        );
+
+        // A demotes bob again with a still-newer Lamport — it wins over B's.
+        a.set_role(bob.peer_id(), bob.verifying_key().to_bytes(), Role::Reader)
+            .unwrap();
+        assert_eq!(
+            a.role_of(bob.peer_id()),
+            Some(Role::Reader),
+            "A's newest decision wins; no floor from B's earlier promote"
+        );
     }
 
     #[test]

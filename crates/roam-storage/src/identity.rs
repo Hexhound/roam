@@ -53,6 +53,18 @@ impl Identity {
         self.signing_key.sign(msg)
     }
 
+    /// Sign `msg` bound to a protocol `domain` tag. The tag is prepended to the
+    /// signed bytes so a signature is valid ONLY within its own protocol — a
+    /// signature produced in one domain never verifies in another, even over
+    /// identical `msg` bytes. Use a distinct fixed tag per signing purpose
+    /// (op-log vs pairing proof) to prevent cross-protocol signature reuse.
+    pub fn sign_in_domain(&self, domain: &[u8], msg: &[u8]) -> Signature {
+        let mut buf = Vec::with_capacity(domain.len() + msg.len());
+        buf.extend_from_slice(domain);
+        buf.extend_from_slice(msg);
+        self.signing_key.sign(&buf)
+    }
+
     /// Sign `msg`, returning the raw 64-byte signature. Byte-level seam for
     /// crates that never depend on `ed25519` (e.g. the backend client).
     pub fn sign_bytes(&self, msg: &[u8]) -> [u8; 64] {
@@ -153,6 +165,16 @@ impl VerifyingKey {
         self.0.verify_strict(msg, sig).is_ok()
     }
 
+    /// Verify a signature made with [`Identity::sign_in_domain`] under the same
+    /// `domain` tag. Fails if the signature was produced in a different domain,
+    /// closing cross-protocol signature-reuse.
+    pub fn verify_in_domain(&self, domain: &[u8], msg: &[u8], sig: &Signature) -> bool {
+        let mut buf = Vec::with_capacity(domain.len() + msg.len());
+        buf.extend_from_slice(domain);
+        buf.extend_from_slice(msg);
+        self.0.verify_strict(&buf, sig).is_ok()
+    }
+
     /// Verify a raw 64-byte signature over `msg`. A byte-level seam so crates
     /// that never touch `ed25519` (e.g. the backend client) can verify signed
     /// artifacts using only storage types.
@@ -175,6 +197,29 @@ mod tests {
         assert!(id.verifying_key().verify(msg, &sig));
         // A different message must not verify.
         assert!(!id.verifying_key().verify(b"tampered", &sig));
+    }
+
+    #[test]
+    fn a_signature_is_bound_to_its_domain() {
+        // M1: a signature made in one protocol's domain must NOT verify in
+        // another's, even over identical message bytes. This is what stops a
+        // captured pairing proof from being replayed as an op-log signature
+        // (and vice versa) when both sign raw bytes with the same key.
+        let id = Identity::generate();
+        let msg = b"identical bytes in both protocols";
+        let sig = id.sign_in_domain(b"roam-domain-a\x00", msg);
+
+        // Same domain, same bytes: verifies.
+        assert!(id
+            .verifying_key()
+            .verify_in_domain(b"roam-domain-a\x00", msg, &sig));
+        // Different domain, same bytes: MUST fail.
+        assert!(!id
+            .verifying_key()
+            .verify_in_domain(b"roam-domain-b\x00", msg, &sig));
+        // A plain (untagged) verify of the same bytes MUST also fail — the tag
+        // is inside the signed message, so bare bytes never match.
+        assert!(!id.verifying_key().verify(msg, &sig));
     }
 
     #[test]

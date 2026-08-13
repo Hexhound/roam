@@ -19,6 +19,7 @@ serde_json.workspace = true
 base64.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
+zeroize = { workspace = true }
 
 [dev-dependencies]
 tempfile.workspace = true

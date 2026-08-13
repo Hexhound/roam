@@ -45,7 +45,12 @@ pub enum Frame {
     /// completion without a separate announce frame. The receiver verifies the
     /// full blob hash only once every byte has landed (poison-safe like the old
     /// single-frame `BlobData`). Supersedes `BlobData` on the send path.
-    BlobChunk { hash: String, offset: u64, total_len: u64, bytes: Vec<u8> },
+    BlobChunk {
+        hash: String,
+        offset: u64,
+        total_len: u64,
+        bytes: Vec<u8>,
+    },
 }
 
 impl Frame {

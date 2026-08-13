@@ -8,6 +8,7 @@ defmodule Sync.Backend.Sweeper do
   keep it out of the supervision tree and drive `sweep_all/1` directly.
   """
   use GenServer
+  require Logger
 
   alias Sync.Backend.{Retention, Store}
 
@@ -40,8 +41,20 @@ defmodule Sync.Backend.Sweeper do
     root = Keyword.get(opts, :data_root, Store.data_root())
 
     for bucket <- buckets(root), into: %{} do
-      {bucket, Retention.sweep(bucket, opts)}
+      {bucket, sweep_one(bucket, opts)}
     end
+  end
+
+  # BE4: buckets are client-controlled, so a single poisoned bucket (e.g. a
+  # snapshot manifest with a non-list field) can make Retention.sweep raise.
+  # Isolate each bucket: one failure is logged and reported, never aborting the
+  # periodic sweep and starving every other bucket of retention.
+  defp sweep_one(bucket, opts) do
+    Retention.sweep(bucket, opts)
+  rescue
+    error ->
+      Logger.error("retention sweep failed for bucket #{inspect(bucket)}: #{inspect(error)}")
+      {:error, error}
   end
 
   defp buckets(root) do

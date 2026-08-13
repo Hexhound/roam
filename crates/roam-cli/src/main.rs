@@ -113,10 +113,17 @@ enum Command {
         #[arg(long)]
         identity: PathBuf,
         /// Also wrap the new epoch to a paper-recovery key derived from this
-        /// passphrase. Guard the passphrase: it recovers the epoch if every
-        /// device is lost.
+        /// EXACT passphrase. Recovery re-enters it verbatim. Prefer
+        /// `--generate-paper`: a user-chosen phrase is usually low-entropy, and
+        /// the replicated wrap blobs let an attacker brute-force it offline.
         #[arg(long)]
         paper: Option<String>,
+        /// Mint a fresh high-entropy paper phrase, wrap the new epoch to it, and
+        /// PRINT it once. This is the safe default — the phrase carries 160 bits
+        /// of OS randomness, so it cannot be guessed. Mutually exclusive with
+        /// `--paper`.
+        #[arg(long, conflicts_with = "paper")]
+        generate_paper: bool,
     },
     /// List recoverable history: retained markers (time points) and currently
     /// deleted files that `restore` can bring back.
@@ -226,7 +233,8 @@ async fn main() -> Result<()> {
             vault,
             identity,
             paper,
-        } => rotate(&vault, &identity, paper).await,
+            generate_paper,
+        } => rotate(&vault, &identity, paper, generate_paper).await,
         Command::History { vault, identity } => history(&vault, &identity).await,
         Command::Checkpoint {
             vault,
@@ -1102,7 +1110,12 @@ fn fmt_issue(issue: &roam_storage::VaultIssue) -> String {
 
 /// Mint a fresh epoch and wrap its key to every active member (+ optional paper
 /// key). Requires the real identity: the new key-log entries are signed by it.
-async fn rotate(vault: &Path, identity_path: &Path, paper: Option<String>) -> Result<()> {
+async fn rotate(
+    vault: &Path,
+    identity_path: &Path,
+    paper: Option<String>,
+    generate_paper: bool,
+) -> Result<()> {
     use roam_backend_client::crypto::VaultKey;
     use roam_storage::PaperKey;
 
@@ -1110,16 +1123,26 @@ async fn rotate(vault: &Path, identity_path: &Path, paper: Option<String>) -> Re
     let vault_key = VaultKey(load_vault_key(vault)?);
     let mut store = Store::open(vault, identity).context("open vault store")?;
 
-    let paper_public = paper
-        .as_deref()
-        .map(|passphrase| PaperKey::from_passphrase(passphrase).public());
+    // Prefer generation: mint a high-entropy phrase the user prints once. Fall
+    // back to a verbatim `--paper` phrase only when explicitly given (recovery
+    // re-entry, or a user who insists — with the offline-brute-force caveat).
+    let generated_phrase = generate_paper.then(PaperKey::generate);
+    let paper_public = match (&generated_phrase, paper.as_deref()) {
+        (Some((key, _)), _) => Some(key.public()),
+        (None, Some(passphrase)) => Some(PaperKey::from_passphrase(passphrase).public()),
+        (None, None) => None,
+    };
 
     let epoch = store
         .rotate_epoch(&vault_key.id_key(), &vault_key.epoch0_key(), paper_public)
         .context("rotate epoch")?;
 
     println!("rotated to epoch {}", fmt_epoch(&epoch));
-    if paper_public.is_some() {
+    if let Some((_, phrase)) = &generated_phrase {
+        println!("\nPAPER RECOVERY PHRASE — write it down NOW, it is shown only once:");
+        println!("\n    {phrase}\n");
+        println!("Re-enter it verbatim (with hyphens) to recover if every device is lost.");
+    } else if paper_public.is_some() {
         println!("wrapped to paper-recovery key (keep the passphrase safe)");
     }
     println!("new writes seal under this epoch; existing data is unchanged.");
@@ -1183,8 +1206,7 @@ async fn checkpoint(vault: &Path, identity_path: &Path, before: &str, dry_run: b
                 use roam_backend_client::crypto::VaultKey;
                 use roam_backend_client::sync::produce_held_snapshot;
                 let key = VaultKey(raw);
-                produce_held_snapshot(&store, &key, cutoff)
-                    .context("produce bootstrap snapshot")?
+                produce_held_snapshot(&store, &key, cutoff).context("produce bootstrap snapshot")?
             }
             // No vault key on disk => vault was never wired for sync (purely
             // local). Nothing to bootstrap; checkpoint is safe as-is.
@@ -1199,9 +1221,7 @@ async fn checkpoint(vault: &Path, identity_path: &Path, before: &str, dry_run: b
                  Bootstrap snapshot {id} published for lagging peers."
             ),
             None => {
-                println!(
-                    "checkpoint done: freed {freed} bytes; op history compacted. Local only."
-                );
+                println!("checkpoint done: freed {freed} bytes; op history compacted. Local only.");
                 // Distinguish the risky case: a non-Admin on a sync-wired vault
                 // truncated but cannot sign a bootstrap snapshot.
                 if load_vault_key(vault).is_ok() && store.self_role() != Some(Role::Admin) {

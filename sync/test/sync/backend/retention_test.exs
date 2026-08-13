@@ -23,15 +23,33 @@ defmodule Sync.Backend.RetentionTest do
       assert Retention.entries_to_delete(MapSet.new(), %{"e1" => 0}, 1000, 0) == []
     end
 
-    test "a blob referenced by no retained snapshot, past grace, is deletable" do
+    test "a blob dropped from the retained set (was in a dropped snapshot), past grace, is deletable" do
       now = 10_000
       retained = MapSet.new(["b_keep"])
+      dropped = MapSet.new(["b_orphan"])
       blob_ages = %{"b_keep" => 0, "b_orphan" => 0}
-      assert Retention.blobs_to_delete(retained, blob_ages, now, 5000) == ["b_orphan"]
+      assert Retention.blobs_to_delete(retained, dropped, blob_ages, now, 5000) == ["b_orphan"]
     end
 
     test "a blob still referenced by a retained snapshot survives even past grace" do
-      assert Retention.blobs_to_delete(MapSet.new(["b"]), %{"b" => 0}, 10_000, 5000) == []
+      assert Retention.blobs_to_delete(
+               MapSet.new(["b"]),
+               MapSet.new(["b"]),
+               %{"b" => 0},
+               10_000,
+               5000
+             ) == []
+    end
+
+    test "BE2: a blob in NO snapshot manifest (post-snapshot live entry ref) is never deleted" do
+      # The zero-knowledge backend cannot see an encrypted entry's blob refs, so
+      # a blob newer than every snapshot appears in no manifest. It must NOT be
+      # GC'd — a live, non-subsumed entry may still reference it.
+      now = 10_000
+      retained = MapSet.new(["b_live"])
+      dropped = MapSet.new(["b_old"])
+      blob_ages = %{"b_new" => 0}
+      assert Retention.blobs_to_delete(retained, dropped, blob_ages, now, 5000) == []
     end
   end
 
@@ -56,12 +74,14 @@ defmodule Sync.Backend.RetentionTest do
       <<byte_size(json)::little-32>> <> json <> "sealed-ciphertext"
     end
 
-    test "drops old snapshots, subsumed entries, orphan blobs; keeps referenced", %{bucket: b} do
-      # Four snapshots. Only the retained ones' manifests count for keep-sets, so
-      # to make the assertions deterministic regardless of WHICH snapshot is
-      # dropped, every snapshot carries the same manifest: subsumes "eold",
-      # references "bkeep". Thus "eold" is subsumed by a retained snapshot and
-      # "borphan" is referenced by none.
+    test "drops old snapshots, subsumed entries; keeps referenced and unmanifested blobs", %{
+      bucket: b
+    } do
+      # Four snapshots, all carrying the same manifest: subsumes "eold", references
+      # "bkeep". So "eold" is subsumed by a retained snapshot; "bkeep" is retained.
+      # "borphan" is in NO manifest at all — which, post-BE2, means the backend has
+      # no evidence it's dead (it may back a live post-snapshot entry), so it is
+      # KEPT, not reaped.
       frame = snapshot_frame(["eold"], ["bkeep"])
       for id <- ["s1", "s2", "s3", "s4"], do: Store.put(b, "snapshots", id, frame)
 
@@ -83,10 +103,11 @@ defmodule Sync.Backend.RetentionTest do
       refute "efresh" in result.entries
       assert "efresh" in Store.list(b, "entries")
 
-      # "borphan" referenced by no retained snapshot -> deleted; "bkeep" kept.
-      assert result.blobs == ["borphan"]
+      # BE2: no blob is dropped-but-not-retained here, so nothing is reaped.
+      # "bkeep" (referenced) and "borphan" (in no manifest) both survive.
+      assert result.blobs == []
       assert "bkeep" in Store.list(b, "blobs")
-      refute "borphan" in Store.list(b, "blobs")
+      assert "borphan" in Store.list(b, "blobs")
     end
 
     test "nothing is deleted while still within the grace window", %{bucket: b} do

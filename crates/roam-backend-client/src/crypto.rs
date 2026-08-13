@@ -6,7 +6,11 @@ pub use roam_storage::epoch_crypto::{open_epoch, seal_epoch, CryptoError};
 
 /// 256-bit symmetric vault key. Shared across a vault's devices; never sent to
 /// the backend. Derives all opaque ids and seals/opens all payloads.
-#[derive(Clone)]
+///
+/// The root secret is wiped on drop ([`ZeroizeOnDrop`]) so it does not linger in
+/// freed memory. (Derived subkeys copied out via [`VaultKey::id_key`] /
+/// [`VaultKey::epoch0_key`] are short-lived and not separately wrapped.)
+#[derive(Clone, zeroize::ZeroizeOnDrop)]
 pub struct VaultKey(pub [u8; 32]);
 
 impl VaultKey {
@@ -118,6 +122,17 @@ mod tests {
 
     fn key() -> VaultKey {
         VaultKey([7u8; 32])
+    }
+
+    #[test]
+    fn the_vault_key_is_wiped_on_drop() {
+        // `VaultKey` is the root secret: it derives every id and seals/opens every
+        // payload, and it lives for the whole process (held in `Engine`, the CLI,
+        // and the pairing host). It must not survive in freed memory. The
+        // `ZeroizeOnDrop` bound is the only portable proxy (freed memory can't be
+        // inspected).
+        fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<VaultKey>();
     }
 
     #[test]

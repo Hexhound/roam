@@ -7,6 +7,11 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+/// Signature domain tag for op-log updates (M1: cross-protocol reuse guard).
+/// Distinct from the pairing-proof tag so an op signature can never be replayed
+/// as a pairing proof, or vice versa, even over identical bytes. Fixed length.
+pub const OPLOG_SIG_DOMAIN: &[u8] = b"roam-oplog-update-v1\x00";
+
 /// One signed update in a peer's append-only log.
 #[derive(Debug, Clone)]
 pub struct Entry {
@@ -49,7 +54,7 @@ impl OpLog {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let sig = id.sign(update);
+        let sig = id.sign_in_domain(OPLOG_SIG_DOMAIN, update);
         let line = EntryLine {
             peer: self.peer_id,
             sig: B64.encode(sig.to_bytes()),
@@ -143,7 +148,7 @@ impl OpLog {
                 .try_into()
                 .map_err(|_| StorageError::MalformedEntry("signature length".into()))?;
             let sig = Signature::from_bytes(&sig_arr);
-            if !key.verify(&update, &sig) {
+            if !key.verify_in_domain(OPLOG_SIG_DOMAIN, &update, &sig) {
                 return Err(StorageError::BadSignature(parsed.peer));
             }
             out.push(Entry {

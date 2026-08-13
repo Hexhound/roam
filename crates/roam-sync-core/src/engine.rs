@@ -28,6 +28,20 @@ struct IncomingBlob {
     seen: std::collections::HashSet<u64>,
 }
 
+/// EN2: bound reassembly memory. A legitimate serving peer emits chunks at
+/// offsets that are exact multiples of [`BLOB_CHUNK_SIZE`] (see the send loop),
+/// so the number of DISTINCT offsets per blob is at most
+/// `total_len / BLOB_CHUNK_SIZE`. Rejecting any other offset stops an attacker
+/// from streaming many tiny distinct-offset chunks to inflate the per-blob
+/// `seen` set (an unbounded-memory DoS). A zero-byte blob is served as one
+/// `(offset 0, total_len 0)` chunk, which is the only admissible offset there.
+fn chunk_offset_is_admissible(offset: u64, total_len: u64) -> bool {
+    if total_len == 0 {
+        return offset == 0;
+    }
+    offset < total_len && offset % BLOB_CHUNK_SIZE as u64 == 0
+}
+
 /// Drives sync for one device over a [`Transport`]. Owns the [`Store`]; local
 /// edits go through the engine so it can live-push.
 pub struct Engine<T: Transport> {
@@ -65,7 +79,9 @@ pub struct Engine<T: Transport> {
     // Read by the adopt path (`Frame::SnapshotData`) to derive the vault
     // subkeys + build a Keychain that decrypts a received snapshot's sealed body;
     // held here so `Engine::new` carries the key material from construction.
-    vault_key: [u8; 32],
+    // Wrapped in `Zeroizing` so this process-lifetime secret is wiped when the
+    // engine drops rather than left in freed memory.
+    vault_key: zeroize::Zeroizing<[u8; 32]>,
     /// Per-hash received-byte count for in-flight chunked blob transfers. The
     /// bytes live in `BlobStore`'s `incoming/<hash>.part`; this only tracks
     /// progress so we know when a transfer is complete. Cleared on finalize.
@@ -104,7 +120,7 @@ impl<T: Transport + 'static> Engine<T> {
             connected: Arc::new(Mutex::new(HashSet::new())),
             changed: Arc::new(tokio::sync::Notify::new()),
             local_flush: Arc::new(tokio::sync::Notify::new()),
-            vault_key,
+            vault_key: zeroize::Zeroizing::new(vault_key),
             incoming_blobs: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
@@ -652,7 +668,12 @@ impl<T: Transport + 'static> Engine<T> {
                     // the receiver would never complete. Send one empty chunk.
                     self.send(
                         peer,
-                        Frame::BlobChunk { hash: hash.clone(), offset: 0, total_len: 0, bytes: vec![] },
+                        Frame::BlobChunk {
+                            hash: hash.clone(),
+                            offset: 0,
+                            total_len: 0,
+                            bytes: vec![],
+                        },
                     )
                     .await;
                     return Ok(());
@@ -670,7 +691,12 @@ impl<T: Transport + 'static> Engine<T> {
                     let read = chunk.len() as u64;
                     self.send(
                         peer,
-                        Frame::BlobChunk { hash: hash.clone(), offset, total_len, bytes: chunk },
+                        Frame::BlobChunk {
+                            hash: hash.clone(),
+                            offset,
+                            total_len,
+                            bytes: chunk,
+                        },
                     )
                     .await;
                     offset += read;
@@ -702,9 +728,21 @@ impl<T: Transport + 'static> Engine<T> {
                     self.changed.notify_waiters();
                 }
             }
-            Frame::BlobChunk { hash, offset, total_len, bytes } => {
+            Frame::BlobChunk {
+                hash,
+                offset,
+                total_len,
+                bytes,
+            } => {
                 // DoS guard: reject an absurd advertised size before any disk I/O.
                 if total_len > MAX_INCOMING_BLOB_BYTES {
+                    return Ok(());
+                }
+                // EN2 DoS guard: only accept chunk offsets a legitimate sender
+                // could emit (multiples of BLOB_CHUNK_SIZE, in range). This caps
+                // the distinct-offset `seen` set at total_len / BLOB_CHUNK_SIZE,
+                // so an attacker cannot exhaust memory with tiny misaligned chunks.
+                if !chunk_offset_is_admissible(offset, total_len) {
                     return Ok(());
                 }
                 // Anti-spam + idempotency: only accept chunks for a hash a Live
@@ -1091,11 +1129,33 @@ impl<T: Transport + 'static> Engine<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::Engine;
+    use super::{chunk_offset_is_admissible, Engine, BLOB_CHUNK_SIZE};
     use crate::memory::MemorySwitchboard;
     use roam_storage::{Identity, Store, VaultId};
     use std::sync::Arc;
     use tempfile::tempdir;
+
+    #[test]
+    fn a_misaligned_or_out_of_range_chunk_offset_is_inadmissible() {
+        let total = 8 * 1024 * 1024;
+        // Legitimate: offsets are exact multiples of BLOB_CHUNK_SIZE, in range.
+        assert!(chunk_offset_is_admissible(0, total));
+        assert!(chunk_offset_is_admissible(BLOB_CHUNK_SIZE as u64, total));
+        // EN2: a non-multiple-of-CHUNK offset (an attacker tiling many tiny
+        // distinct offsets to blow up the reassembly `seen` set — a memory DoS)
+        // is rejected. Distinct admissible offsets per blob are therefore capped
+        // at total_len / BLOB_CHUNK_SIZE.
+        assert!(!chunk_offset_is_admissible(1, total));
+        assert!(!chunk_offset_is_admissible(
+            BLOB_CHUNK_SIZE as u64 + 1,
+            total
+        ));
+        // At/over total_len is out of range.
+        assert!(!chunk_offset_is_admissible(total, total));
+        // Zero-byte blob: only the single (offset 0, total_len 0) chunk is valid.
+        assert!(chunk_offset_is_admissible(0, 0));
+        assert!(!chunk_offset_is_admissible(BLOB_CHUNK_SIZE as u64, 0));
+    }
 
     #[tokio::test]
     async fn connected_peers_starts_empty_and_is_exposed() {

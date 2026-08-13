@@ -59,7 +59,9 @@ fn payload(len: usize, seed: u64, text: bool) -> Vec<u8> {
     let mut out = Vec::with_capacity(len);
     for _ in 0..len {
         // Numerical Recipes LCG constants.
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let byte = (state >> 33) as u8;
         if text {
             // Map into printable ASCII [33, 126] — always valid UTF-8.
@@ -256,7 +258,12 @@ async fn run_once(scenario: &Scenario) -> anyhow::Result<RunResult> {
 
     // Best-effort cleanup — a failed remove must not fail the bench.
     for d in [
-        &store_a_dir, &store_b_dir, &vault_a, &vault_b, &meta_a, &meta_b,
+        &store_a_dir,
+        &store_b_dir,
+        &vault_a,
+        &vault_b,
+        &meta_a,
+        &meta_b,
     ] {
         let _ = std::fs::remove_dir_all(d);
     }

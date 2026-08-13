@@ -135,6 +135,90 @@ fn forward_secrecy_a_revoked_peer_cannot_open_the_new_epoch() {
 }
 
 #[test]
+fn a_non_admins_rotate_is_not_folded_into_the_keychain() {
+    // N5: epoch rotation is Admin-only. A Reader/Writer can author a Rotate+Wrap
+    // in its own key-log, but when a peer imports that log the fold MUST ignore it
+    // because the author's roster role is not Admin — otherwise a non-admin
+    // installs epoch keys / steers the write head (KC1's reachability).
+    let da = tempdir().unwrap();
+    let db = tempdir().unwrap();
+    let ia = Identity::generate();
+    let ib = Identity::generate();
+    let mut a = Store::open(da.path(), ia.clone()).unwrap();
+    let mut b = Store::open(db.path(), ib.clone()).unwrap();
+
+    a.declare_founder(Role::Admin).unwrap();
+    b.declare_founder(Role::Admin).unwrap();
+    // A vouches for B as a READER (B is only ever a reader in A's roster).
+    a.add_peer(ib.peer_id(), ib.verifying_key().to_bytes(), Role::Reader)
+        .unwrap();
+
+    // B (founder-admin of ITS OWN vault) mints an epoch in its own key-log.
+    let epoch = b.rotate_epoch(&ID_KEY, &EPOCH0, None).unwrap();
+
+    // A imports only B's key-log (B stays a Reader in A's view).
+    a.import_keylog(
+        ib.peer_id(),
+        &ib.verifying_key(),
+        b.export_own_keylog().unwrap(),
+    )
+    .unwrap();
+
+    let kc_a = a.keychain(&ID_KEY, &EPOCH0).unwrap();
+    assert!(
+        !kc_a.epochs.contains_key(&epoch),
+        "a Reader-authored epoch must not fold into the keychain"
+    );
+    assert!(
+        kc_a.epoch_key(&epoch).is_none(),
+        "a Reader-authored epoch key must never be installed"
+    );
+}
+
+#[test]
+fn a_revoked_admin_can_no_longer_author_admin_ops() {
+    // N1: `require_admin` must also require Active status. Role and status are
+    // independent fields; a device revoked by another admin still materializes
+    // role==Admin, and must NOT keep signing roster/keylog ops locally.
+    let da = tempdir().unwrap();
+    let db = tempdir().unwrap();
+    let ia = Identity::generate();
+    let ib = Identity::generate();
+    let mut a = Store::open(da.path(), ia.clone()).unwrap();
+    let mut b = Store::open(db.path(), ib.clone()).unwrap();
+
+    a.declare_founder(Role::Admin).unwrap();
+    b.declare_founder(Role::Admin).unwrap();
+    a.add_peer(ib.peer_id(), ib.verifying_key().to_bytes(), Role::Admin)
+        .unwrap();
+    b.add_peer(ia.peer_id(), ia.verifying_key().to_bytes(), Role::Admin)
+        .unwrap();
+    full_sync(&mut a, &ia, &mut b, &ib);
+
+    // B revokes A; A folds B's revocation into its own view.
+    b.revoke_peer(ia.peer_id(), ia.verifying_key().to_bytes())
+        .unwrap();
+    a.import_roster(
+        ib.peer_id(),
+        &ib.verifying_key(),
+        b.export_own_roster().unwrap(),
+    )
+    .unwrap();
+
+    // A is now revoked. It must not be able to author further admin ops.
+    let c = Identity::generate();
+    assert!(
+        a.add_peer(c.peer_id(), c.verifying_key().to_bytes(), Role::Reader)
+            .is_err(),
+        "a revoked admin must not author roster ops"
+    );
+    assert!(
+        a.rotate_epoch(&ID_KEY, &EPOCH0, None).is_err(),
+        "a revoked admin must not author epoch rotations"
+    );
+}
+
+#[test]
 fn backcompat_a_vault_with_no_keylog_is_epoch0_only() {
     let dir = tempdir().unwrap();
     let store = Store::open(dir.path(), Identity::generate()).unwrap();

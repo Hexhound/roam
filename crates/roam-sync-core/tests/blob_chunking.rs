@@ -29,7 +29,9 @@ fn blob_payload(len: usize, seed: u64) -> Vec<u8> {
     let mut out = vec![0u8; len];
     let mut s = seed | 1;
     for b in out.iter_mut() {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         *b = (s >> 33) as u8;
     }
     if len >= 2 {

@@ -32,7 +32,7 @@ defmodule Sync.Backend.SnapshotCycleTest do
     <<byte_size(json)::little-32>> <> json <> "sealed-ciphertext"
   end
 
-  test "upload → threshold → snapshot → sweep prunes subsumed + orphans, keeps referenced", %{
+  test "upload → threshold → snapshot → sweep prunes subsumed entries, keeps all blobs (BE2)", %{
     conn: conn
   } do
     esub = id("subsumed-entry")
@@ -53,15 +53,18 @@ defmodule Sync.Backend.SnapshotCycleTest do
     frame = snapshot_frame([esub], [bkeep])
     assert put(raw(build_conn()), "/b/#{@bucket}/snapshots/#{sid}", frame).status == 201
 
-    # Sweep with grace 0: subsumed entry + orphan blob purged; snapshot + bkeep stay.
+    # Sweep with grace 0: the subsumed entry is purged. No snapshot is DROPPED
+    # (only one exists, keep 3), so no blob is dropped-but-not-retained — BE2: an
+    # unmanifested blob (indistinguishable from a live post-snapshot entry's ref)
+    # is NOT reaped. bkeep + borphan both survive.
     result = Sweeper.sweep_all(keep: 3, grace_ms: 0, now_ms: 9_000_000_000_000)
 
     assert result[@bucket].entries == [esub]
-    assert result[@bucket].blobs == [borphan]
+    assert result[@bucket].blobs == []
 
     assert Sync.Backend.Store.list(@bucket, "snapshots") == [sid]
     assert Sync.Backend.Store.list(@bucket, "entries") == []
-    assert Sync.Backend.Store.list(@bucket, "blobs") == [bkeep]
+    assert MapSet.new(Sync.Backend.Store.list(@bucket, "blobs")) == MapSet.new([bkeep, borphan])
 
     # After pruning the tail, the threshold is no longer crossed.
     manifest2 = json_response(get(build_conn(), "/b/#{@bucket}/manifest"), 200)

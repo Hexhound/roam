@@ -18,6 +18,10 @@ pub const EPOCH0_ID: [u8; 32] = [0u8; 32];
 pub struct EpochNode {
     pub parents: Vec<[u8; 32]>,
     pub minted_by: u64,
+    /// The `Rotate` nonce for this epoch — retained so the unwrap path can
+    /// recompute `compute_epoch_id(parents, minted_by, nonce, key)` and verify
+    /// the delivered key is the one this id commits to (M8).
+    pub nonce: [u8; 32],
     /// `Some` if this device can decrypt under this epoch; `None` = known to
     /// exist (a `Rotate` seen) but not yet unwrappable → `WaitingKey` fuel.
     pub key: Option<[u8; 32]>,
@@ -58,14 +62,29 @@ pub struct ReadPlan {
     pub body_offset: usize,
 }
 
-/// `epoch_id = blake3(parent_ids.. ‖ minted_by ‖ nonce)`.
-pub fn compute_epoch_id(parents: &[[u8; 32]], minted_by: u64, nonce: &[u8; 32]) -> [u8; 32] {
+/// `epoch_id = blake3(parent_ids.. ‖ minted_by ‖ nonce ‖ key)`.
+///
+/// M8: the epoch `key` is committed INTO the id. A recipient that unwraps a key
+/// under some announced `epoch_id` recomputes this hash and rejects the key
+/// unless it reproduces that id — so a malicious admin cannot deliver DIFFERENT
+/// keys to different members under one epoch id (which would silently split the
+/// vault into mutually-unreadable groups). The key is a mint-time secret, so
+/// this does not weaken the id's role as a public DAG handle: honest members all
+/// receive the same key and derive the same id; a divergent key derives a
+/// different id and fails the unwrap-time check.
+pub fn compute_epoch_id(
+    parents: &[[u8; 32]],
+    minted_by: u64,
+    nonce: &[u8; 32],
+    key: &[u8; 32],
+) -> [u8; 32] {
     let mut input = Vec::new();
     for p in parents {
         input.extend_from_slice(p);
     }
     input.extend_from_slice(&minted_by.to_le_bytes());
     input.extend_from_slice(nonce);
+    input.extend_from_slice(key);
     *blake3::hash(&input).as_bytes()
 }
 
@@ -86,6 +105,7 @@ impl Keychain {
             EpochNode {
                 parents: vec![],
                 minted_by: 0,
+                nonce: [0u8; 32],
                 key: Some(epoch0_key),
                 wrapped_to: BTreeSet::new(),
                 wrapped_paper: false,
@@ -94,10 +114,15 @@ impl Keychain {
 
         // First pass: Rotate announces nodes.
         for e in entries {
-            if let KeyBody::Rotate { parent_epochs, .. } = &e.body {
+            if let KeyBody::Rotate {
+                parent_epochs,
+                nonce,
+            } = &e.body
+            {
                 epochs.entry(e.epoch_id).or_insert(EpochNode {
                     parents: parent_epochs.clone(),
                     minted_by: e.author,
+                    nonce: *nonce,
                     key: None,
                     wrapped_to: BTreeSet::new(),
                     wrapped_paper: false,
@@ -107,19 +132,28 @@ impl Keychain {
         // Second pass: Wrap records recipients + unwraps ours.
         for e in entries {
             if let KeyBody::Wrap { recipient, blob } = &e.body {
-                let node = epochs.entry(e.epoch_id).or_insert(EpochNode {
-                    parents: vec![],
-                    minted_by: e.author,
-                    key: None,
-                    wrapped_to: BTreeSet::new(),
-                    wrapped_paper: false,
-                });
+                // KC1: a Wrap may only attach to an epoch a Rotate ALREADY
+                // announced (or the epoch-0 genesis). Never `or_insert` — a Wrap
+                // for an unannounced epoch would synthesize a phantom node with an
+                // attacker-chosen id and (once unwrapped) install an
+                // attacker-known write key that `select_head` could steer to.
+                let Some(node) = epochs.get_mut(&e.epoch_id) else {
+                    continue;
+                };
                 match recipient {
                     Recipient::Device(p) => {
                         node.wrapped_to.insert(*p);
                         if *p == self_peer && node.key.is_none() {
                             if let Ok(k) = keywrap::unwrap(x25519_secret, blob) {
-                                node.key = Some(k);
+                                // M8: the epoch_id commits to the key. Install it
+                                // only if it reproduces the announced id — a
+                                // divergent key delivered under this id derives a
+                                // different id and is rejected (fail closed).
+                                if compute_epoch_id(&node.parents, node.minted_by, &node.nonce, &k)
+                                    == e.epoch_id
+                                {
+                                    node.key = Some(k);
+                                }
                             }
                         }
                     }
@@ -159,9 +193,18 @@ impl Keychain {
     }
 
     /// The AEAD key to seal new writes under (the head epoch's key), plus its id.
-    /// `None` if the head key is somehow unavailable (caller falls back to epoch0).
+    /// `None` when the head epoch's key isn't held yet (a `Rotate` was seen but its
+    /// `Wrap` for us hasn't landed). Callers MUST NOT fall back to epoch 0 in that
+    /// case unless [`Self::head`] is epoch 0 — see H1 in the security review.
     pub fn head_write_key(&self) -> Option<([u8; 32], [u8; 32])> {
         self.epoch_key(&self.head).map(|k| (self.head, k))
+    }
+
+    /// The current write-head epoch id. Epoch 0 means the vault never rotated (a
+    /// legacy `VaultKey::seal` is the correct write); any other id means a rotation
+    /// is in effect and epoch-0 writes would be readable by rotated-out members.
+    pub fn head(&self) -> [u8; 32] {
+        self.head
     }
 
     /// Classify a stored ciphertext: epoch-tagged iff its first 32 bytes equal a
@@ -298,11 +341,62 @@ mod tests {
     }
 
     #[test]
+    fn a_wrap_whose_key_does_not_match_the_epoch_id_is_rejected() {
+        // M8: the epoch_id commits to the epoch key. A Wrap that delivers a
+        // DIFFERENT key under the same announced epoch_id (a malicious admin
+        // handing divergent keys to different members, splitting the vault into
+        // mutually-unreadable groups) must be rejected: the key is NOT installed,
+        // so the device fails closed (WaitingKey) instead of sealing writes under
+        // a key the rest of the vault can't read.
+        let me = Identity::generate();
+        let k_real = [42u8; 32];
+        let k_evil = [7u8; 32];
+        let nonce = [3u8; 32];
+        // The honest id commits to k_real...
+        let epoch = compute_epoch_id(&[EPOCH0_ID], me.peer_id(), &nonce, &k_real);
+        // ...but the Wrap delivers k_evil sealed to us under that same id.
+        let blob = keywrap::wrap(&me.x25519_public(), &k_evil);
+
+        let entries = vec![
+            KeyLogEntry {
+                seq: 1,
+                author: me.peer_id(),
+                epoch_id: epoch,
+                body: KeyBody::Rotate {
+                    parent_epochs: vec![EPOCH0_ID],
+                    nonce,
+                },
+            },
+            KeyLogEntry {
+                seq: 2,
+                author: me.peer_id(),
+                epoch_id: epoch,
+                body: KeyBody::Wrap {
+                    recipient: Recipient::Device(me.peer_id()),
+                    blob,
+                },
+            },
+        ];
+        let kc = Keychain::build(
+            [1u8; 32],
+            [2u8; 32],
+            me.peer_id(),
+            &me.x25519_secret(),
+            &entries,
+        );
+        assert_eq!(
+            kc.epoch_key(&epoch),
+            None,
+            "a delivered key that does not reproduce the epoch_id must be rejected"
+        );
+    }
+
+    #[test]
     fn a_wrap_to_us_unlocks_the_epoch_and_moves_the_head() {
         let me = Identity::generate();
         let k_new = [42u8; 32];
         let nonce = [3u8; 32];
-        let epoch = compute_epoch_id(&[EPOCH0_ID], me.peer_id(), &nonce);
+        let epoch = compute_epoch_id(&[EPOCH0_ID], me.peer_id(), &nonce, &k_new);
         let blob = keywrap::wrap(&me.x25519_public(), &k_new);
 
         let entries = vec![
@@ -337,10 +431,53 @@ mod tests {
     }
 
     #[test]
+    fn a_wrap_for_an_unannounced_epoch_is_ignored() {
+        // KC1: a `Wrap` naming an `epoch_id` that NO `Rotate` announced must not
+        // synthesize a phantom epoch node. Otherwise a member can install an
+        // arbitrary (attacker-known) write key under a chosen id and steer the
+        // write-head to it — a confidentiality break.
+        let me = Identity::generate();
+        let attacker_key = [42u8; 32];
+        let mut phantom = [0u8; 32];
+        phantom[31] = 1; // smallest non-zero id; would win `select_head` if installed
+        let blob = keywrap::wrap(&me.x25519_public(), &attacker_key);
+
+        let entries = vec![KeyLogEntry {
+            seq: 1,
+            author: me.peer_id(),
+            epoch_id: phantom,
+            body: KeyBody::Wrap {
+                recipient: Recipient::Device(me.peer_id()),
+                blob,
+            },
+        }];
+        let kc = Keychain::build(
+            [1u8; 32],
+            [2u8; 32],
+            me.peer_id(),
+            &me.x25519_secret(),
+            &entries,
+        );
+
+        assert!(
+            !kc.epochs.contains_key(&phantom),
+            "a Wrap with no announcing Rotate must not create an epoch node"
+        );
+        assert!(
+            kc.epoch_key(&phantom).is_none(),
+            "phantom epoch key must never be installed"
+        );
+        assert_eq!(
+            kc.head, EPOCH0_ID,
+            "head must not move to a phantom (unannounced) epoch"
+        );
+    }
+
+    #[test]
     fn classify_tags_known_epochs_and_falls_through_to_epoch0() {
         let me = Identity::generate();
         let nonce = [3u8; 32];
-        let epoch = compute_epoch_id(&[EPOCH0_ID], me.peer_id(), &nonce);
+        let epoch = compute_epoch_id(&[EPOCH0_ID], me.peer_id(), &nonce, &[9u8; 32]);
         let blob = keywrap::wrap(&me.x25519_public(), &[9u8; 32]);
         let entries = vec![
             KeyLogEntry {
@@ -388,7 +525,7 @@ mod tests {
     #[test]
     fn diagnose_reports_waiting_orphaned_and_redundancy_low() {
         let nonce = [3u8; 32];
-        let epoch = compute_epoch_id(&[EPOCH0_ID], 7, &nonce);
+        let epoch = compute_epoch_id(&[EPOCH0_ID], 7, &nonce, &[1u8; 32]);
         let holder = keywrap::wrap(&Identity::generate().x25519_public(), &[1u8; 32]); // not to us
         let entries = vec![
             KeyLogEntry {
@@ -436,7 +573,7 @@ mod tests {
         let me = Identity::generate();
         let k_new = [42u8; 32];
         let nonce = [3u8; 32];
-        let epoch = compute_epoch_id(&[EPOCH0_ID], me.peer_id(), &nonce);
+        let epoch = compute_epoch_id(&[EPOCH0_ID], me.peer_id(), &nonce, &k_new);
         let blob = keywrap::wrap(&me.x25519_public(), &k_new);
         let entries = vec![
             KeyLogEntry {

@@ -179,11 +179,10 @@ pub async fn reconcile_once<B: Backend>(
     let mut uploaded_entries = 0usize;
     for (id, line) in &local_entries_vec {
         if have_entry_ids.contains(id) {
-            let ct = match kc.head_write_key() {
-                Some((epoch_id, epoch_key)) if epoch_id != EPOCH0_ID => {
-                    crate::crypto::seal_epoch(&epoch_key, &epoch_id, line)
-                }
-                _ => key.seal(line),
+            // H1: skip uploading if the head rotated past epoch 0 and we don't yet
+            // hold its key — an epoch-0 write would be readable by revoked members.
+            let Some(ct) = seal_under_head(&kc, key, line) else {
+                continue;
             };
             backend.put_entry(&bucket, id, ct).await?;
             uploaded_entries += 1;
@@ -206,21 +205,37 @@ pub async fn reconcile_once<B: Backend>(
             let Some(bytes) = bytes else {
                 continue;
             };
-            let ct = match kc.head_write_key() {
-                Some((epoch_id, epoch_key)) if epoch_id != EPOCH0_ID => {
-                    crate::crypto::seal_epoch(&epoch_key, &epoch_id, &bytes)
-                }
-                _ => key.seal(&bytes),
+            // H1: same guard as entries — don't seal under epoch 0 mid-rotation.
+            let Some(ct) = seal_under_head(&kc, key, &bytes) else {
+                continue;
             };
             backend.put_blob(&bucket, id, ct).await?;
         }
     }
 
+    // Ids a prior pass proved poisoned (content didn't bind to the id). BE1: the
+    // backend can't overwrite a squatted id, so never re-fetch it — the correct
+    // content arrives peer-to-peer, verified there independently.
+    let poisoned = {
+        let guard = store.lock().await;
+        guard.poisoned_ids()?
+    };
+
     // Fetch blobs we lack, decrypt, store.
-    for id in &need_blob_ids {
+    for id in need_blob_ids.difference(&poisoned) {
         if let Some(ct) = backend.get_blob(&bucket, id).await? {
             match open_classified(&kc, &ct)? {
                 Some(plaintext) => {
+                    // BE1: a content-addressed blob id MUST re-derive from its
+                    // decrypted bytes. A mismatch means the id was squatted with
+                    // the wrong content — reject it, don't store garbage.
+                    let content_hash = blake3::hash(&plaintext).to_hex().to_string();
+                    if key.blob_id(&content_hash) != *id {
+                        let guard = store.lock().await;
+                        guard.mark_poisoned(id)?;
+                        eprintln!("[be-sync] rejected poisoned blob id (content mismatch): {id}");
+                        continue;
+                    }
                     let guard = store.lock().await;
                     guard.blobs().put(&plaintext)?;
                 }
@@ -246,6 +261,8 @@ pub async fn reconcile_once<B: Backend>(
             self_peer,
             debug,
             &kc,
+            key,
+            &poisoned,
             &mut report,
         )
         .await?;
@@ -330,14 +347,21 @@ async fn import_needed_snapshots<B: Backend>(
     Ok(())
 }
 
-/// Seal `plaintext` under the head epoch — the same rule the entry/blob upload
-/// paths use (tagged epoch seal above epoch 0, legacy `VaultKey::seal` at 0).
-fn seal_under_head(kc: &Keychain, key: &VaultKey, plaintext: &[u8]) -> Vec<u8> {
+/// Seal `plaintext` under the head epoch. Returns `None` when the vault has
+/// rotated past epoch 0 but this device hasn't received the head epoch key yet:
+/// sealing under epoch 0 then would be readable by rotated-out members (H1). The
+/// caller skips the write; it self-heals once the key-log delivers the epoch.
+fn seal_under_head(kc: &Keychain, key: &VaultKey, plaintext: &[u8]) -> Option<Vec<u8>> {
     match kc.head_write_key() {
         Some((epoch_id, epoch_key)) if epoch_id != EPOCH0_ID => {
-            crate::crypto::seal_epoch(&epoch_key, &epoch_id, plaintext)
+            Some(crate::crypto::seal_epoch(&epoch_key, &epoch_id, plaintext))
         }
-        _ => key.seal(plaintext),
+        // Head key held and head is epoch 0 -> legacy seal is the correct write.
+        Some(_) => Some(key.seal(plaintext)),
+        // No head key. Only safe if the vault never rotated (head is epoch 0);
+        // otherwise block rather than leak an epoch-0 write to revoked members.
+        None if kc.head() == EPOCH0_ID => Some(key.seal(plaintext)),
+        None => None,
     }
 }
 
@@ -426,7 +450,13 @@ pub fn produce_held_snapshot(
         return Ok(None);
     };
 
-    let sealed = seal_under_head(&kc, key, &snap.bytes);
+    // H1: never seal a snapshot under epoch 0 while a rotation is in effect but
+    // this device lacks the head key — that would hand full plaintext to a
+    // rotated-out member. Skip; another Admin (or this one, once the key lands)
+    // produces it next pass.
+    let Some(sealed) = seal_under_head(&kc, key, &snap.bytes) else {
+        return Ok(None);
+    };
     let snapshot_id = key.snapshot_id(&snap.frontier_digest);
     let subsumed_entry_ids: Vec<String> = snap
         .subsumed_lines
@@ -470,6 +500,8 @@ async fn import_needed_entries<B: Backend>(
     self_peer: u64,
     debug: bool,
     kc: &Keychain,
+    key: &VaultKey,
+    poisoned: &std::collections::BTreeSet<String>,
     report: &mut DecryptReport,
 ) -> anyhow::Result<()> {
     // Active roster peers (peer_id -> VerifyingKey), excluding self — the trust
@@ -490,6 +522,9 @@ async fn import_needed_entries<B: Backend>(
 
     let mut imported = 0usize;
     for id in need_entry_ids {
+        if poisoned.contains(id) {
+            continue; // a prior pass proved this id squatted; real op flows P2P
+        }
         let Some(ct) = backend.get_entry(bucket, id).await? else {
             continue;
         };
@@ -501,6 +536,16 @@ async fn import_needed_entries<B: Backend>(
         let Some(author) = parse_entry_author(&line) else {
             continue; // malformed line; nothing sane to attribute it to
         };
+        // BE1: a content-addressed entry id MUST re-derive from (author, line).
+        // A mismatch means the id was squatted with a line that binds elsewhere —
+        // reject it so a validly-signed but mis-addressed op can't censor the real
+        // one. The genuinely-addressed line still arrives under its own id.
+        if key.entry_id_content(author, &line) != *id {
+            let guard = store.lock().await;
+            guard.mark_poisoned(id)?;
+            eprintln!("[be-sync] rejected poisoned entry id (content mismatch): {id}");
+            continue;
+        }
         let Some(vkey) = peers.get(&author) else {
             continue; // unknown/untrusted author -> drop
         };
@@ -929,6 +974,100 @@ mod tests {
         );
     }
 
+    /// BE1: the backend is first-writer-wins with no id↔content check, so any
+    /// member (or a future compromised backend) can pre-seed a blob id with a
+    /// ciphertext that decrypts to the WRONG bytes. The client must re-derive the
+    /// id from the decrypted content and refuse a mismatch — never store garbage
+    /// under a content-addressed id.
+    #[tokio::test]
+    async fn a_poisoned_blob_is_rejected_and_not_stored() {
+        let key = VaultKey([9u8; 32]);
+        let backend = Arc::new(MemoryBackend::default());
+        let dir = tempfile::tempdir().unwrap();
+        let b = store_at(dir.path()).await;
+
+        // The id CLAIMS to hold the bytes "real blob bytes", but the ciphertext
+        // stored under it decrypts to attacker-chosen garbage.
+        let real_hash = blake3::hash(b"real blob bytes").to_hex().to_string();
+        let poison_id = key.blob_id(&real_hash);
+        let poison_ct = key.seal(b"attacker garbage");
+        backend
+            .put_blob(&key.bucket_id(), &poison_id, poison_ct)
+            .await
+            .unwrap();
+
+        reconcile_once(&b, &backend, &key).await.unwrap();
+
+        assert!(
+            b.lock().await.blobs().list().unwrap().is_empty(),
+            "a blob whose content does not hash to its id must be rejected"
+        );
+        assert!(
+            b.lock().await.poisoned_ids().unwrap().contains(&poison_id),
+            "the forged id must be marked poisoned so we stop re-fetching it"
+        );
+    }
+
+    /// BE1 (entries): an attacker squats a victim's content-addressed entry id
+    /// with a validly-signed line whose content binds to a DIFFERENT id. Without
+    /// the id↔content check the client would treat that slot as satisfied and the
+    /// real op could be censored. The re-derivation must reject the squatter while
+    /// leaving the genuinely-addressed op untouched.
+    #[tokio::test]
+    async fn a_squatted_entry_id_is_rejected_and_marked_poisoned() {
+        let key = VaultKey([9u8; 32]);
+        let backend = Arc::new(MemoryBackend::default());
+        let a_dir = tempfile::tempdir().unwrap();
+        let b_dir = tempfile::tempdir().unwrap();
+        let a = store_at(a_dir.path()).await;
+        let b = store_at(b_dir.path()).await;
+
+        let (a_peer, a_key) = {
+            let g = a.lock().await;
+            (g.peer_id(), g.identity_verifying_bytes())
+        };
+        let (b_peer, b_key) = {
+            let g = b.lock().await;
+            (g.peer_id(), g.identity_verifying_bytes())
+        };
+        a.lock().await.add_peer(b_peer, b_key, Role::Admin).unwrap();
+        b.lock().await.add_peer(a_peer, a_key, Role::Admin).unwrap();
+
+        // A publishes a real op under its true, content-addressed id.
+        a.lock().await.set_entry("files", "note", "hi").unwrap();
+        reconcile_once(&a, &backend, &key).await.unwrap();
+
+        // Attacker copies A's valid line and re-uploads it under a DIFFERENT id
+        // (one that would address different content) — id↔content now disagrees.
+        let bucket = key.bucket_id();
+        let true_id = backend.manifest(&bucket).await.unwrap().entry_ids[0].clone();
+        let ct = backend.get_entry(&bucket, &true_id).await.unwrap().unwrap();
+        let wrong_id = key.entry_id_content(a_peer, b"unrelated content");
+        backend.put_entry(&bucket, &wrong_id, ct).await.unwrap();
+
+        reconcile_once(&b, &backend, &key).await.unwrap();
+
+        // The genuinely-addressed op imports fine.
+        assert_eq!(
+            b.lock().await.get_entry("files", "note"),
+            Some("hi".to_string())
+        );
+        // The squatter is rejected + marked poisoned.
+        assert!(
+            b.lock().await.poisoned_ids().unwrap().contains(&wrong_id),
+            "a line whose content does not bind to its id must be rejected"
+        );
+
+        // Second pass must NOT re-fetch the poisoned id (no churn).
+        let before = backend.entry_get_count(&wrong_id);
+        reconcile_once(&b, &backend, &key).await.unwrap();
+        assert_eq!(
+            backend.entry_get_count(&wrong_id),
+            before,
+            "a poisoned id must never be fetched again"
+        );
+    }
+
     #[tokio::test]
     async fn produce_held_snapshot_persists_and_records_when_admin() {
         std::env::set_var("ROAM_SNAPSHOT_LAG_DAYS", "0");
@@ -968,7 +1107,50 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // No declare_founder => self has no Admin role.
         let store = Store::open(dir.path(), Identity::generate()).unwrap();
-        assert!(produce_held_snapshot(&store, &key, i64::MAX).unwrap().is_none());
+        assert!(produce_held_snapshot(&store, &key, i64::MAX)
+            .unwrap()
+            .is_none());
+    }
+
+    /// H1: after a rotation, a device that has seen the `Rotate` but not yet
+    /// received the new epoch key (its `Wrap`) must NOT seal fresh writes under
+    /// epoch 0 — a rotated-out member still holds the epoch-0 key and would read
+    /// them. The write is blocked (skipped) until the key-log delivers the epoch.
+    #[test]
+    fn h1_write_is_blocked_when_head_rotated_but_key_missing() {
+        use roam_storage::{compute_epoch_id, KeyBody, KeyLogEntry, Keychain, EPOCH0_ID};
+        let vault = VaultKey([9u8; 32]);
+
+        // No rotation: the head is epoch 0, so the legacy seal is correct.
+        let kc0 = Keychain::build(vault.id_key(), vault.epoch0_key(), 1, &[0u8; 32], &[]);
+        assert_eq!(kc0.head(), EPOCH0_ID);
+        assert!(
+            seal_under_head(&kc0, &vault, b"x").is_some(),
+            "an un-rotated vault writes under epoch 0"
+        );
+
+        // A Rotate announces a new epoch (parent epoch 0) but no Wrap delivers its
+        // key to us — the head advances to it while we hold no key for it.
+        let nonce = [7u8; 32];
+        // No Wrap delivers this epoch's key to us, so the committed key is never
+        // learned here — a placeholder key is fine for the head-advance assertion.
+        let epoch = compute_epoch_id(&[EPOCH0_ID], 1, &nonce, &[0u8; 32]);
+        let rotate = KeyLogEntry {
+            seq: 0,
+            author: 1,
+            epoch_id: epoch,
+            body: KeyBody::Rotate {
+                parent_epochs: vec![EPOCH0_ID],
+                nonce,
+            },
+        };
+        let kc = Keychain::build(vault.id_key(), vault.epoch0_key(), 1, &[0u8; 32], &[rotate]);
+        assert_eq!(kc.head(), epoch, "head advances to the rotated epoch");
+        assert!(kc.head_write_key().is_none(), "we hold no key for the head");
+        assert!(
+            seal_under_head(&kc, &vault, b"secret").is_none(),
+            "H1: must not fall back to an epoch-0 write a revoked member can read"
+        );
     }
 
     #[test]

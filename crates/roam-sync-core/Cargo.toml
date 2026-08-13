@@ -16,6 +16,7 @@ postcard.workspace = true
 serde = { workspace = true, features = ["derive"] }
 thiserror.workspace = true
 anyhow.workspace = true
+zeroize = { workspace = true }
 
 [dev-dependencies]
 proptest.workspace = true
