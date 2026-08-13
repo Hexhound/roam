@@ -334,13 +334,16 @@ fn save_vault_key(vault: &Path, key: &[u8; 32]) -> Result<()> {
 }
 
 /// Reload the raw 32-byte vault key previously written by [`save_vault_key`].
-fn load_vault_key(vault: &Path) -> Result<[u8; 32]> {
+/// Handed back as [`zeroize::Zeroizing`] so the reloaded root secret self-wipes
+/// once it has been moved into its (also self-zeroizing) sink.
+fn load_vault_key(vault: &Path) -> Result<zeroize::Zeroizing<[u8; 32]>> {
     let bytes = std::fs::read(vault_key_path(vault))
         .context("read vault-key (run `roam init`, or re-pair to receive it)")?;
-    bytes
+    let raw: [u8; 32] = bytes
         .as_slice()
         .try_into()
-        .context("vault-key file is not 32 bytes")
+        .context("vault-key file is not 32 bytes")?;
+    Ok(zeroize::Zeroizing::new(raw))
 }
 
 async fn init(vault: &Path, identity_path: &Path, role: &str) -> Result<()> {
@@ -365,7 +368,7 @@ async fn init(vault: &Path, identity_path: &Path, role: &str) -> Result<()> {
     // key, not a vault id. Delivered to every paired device over the pairing
     // stream so all devices agree on it (retires the old blake3(vault_id)
     // placeholder that could not be shared across independently-init'd devices).
-    let vault_key = VaultId::generate().0;
+    let vault_key = zeroize::Zeroizing::new(VaultId::generate().0);
     save_vault_key(vault, &vault_key)?;
     println!("initialized vault at {}", vault.display());
     println!("peer_id: {}", identity.peer_id());
@@ -383,7 +386,7 @@ async fn pair_token(vault: &Path, identity_path: &Path, role: &str) -> Result<()
     let vault_key = load_vault_key(vault)?;
     let mut store = Store::open(vault, identity.clone()).context("open vault store")?;
 
-    let (token, host) = host_pairing(&identity, vault_id, vault_key, invitee_role, &mut store)
+    let (token, host) = host_pairing(&identity, vault_id, *vault_key, invitee_role, &mut store)
         .await
         .context("start pairing host")?;
     println!("pairing token (share out of band):\n{token}");
@@ -471,7 +474,7 @@ fn spawn_backend_sync(
     // blake3(vault_id) placeholder could not meet across separately-init'd
     // devices. A hard error here is correct: `--backend` was explicitly asked
     // for, so a missing key must not silently fall back to an unshared one.
-    let vault_key = VaultKey(load_vault_key(vault)?);
+    let vault_key = VaultKey(*load_vault_key(vault)?);
     let backend = Arc::new(HttpBackend::new(&backend_url));
     let store = engine.store();
     let flushed = engine.local_flushed();
@@ -543,7 +546,7 @@ async fn setup_engine(vault: &Path, identity_path: &Path) -> Result<Arc<Engine<I
         vault_id,
         store,
         Arc::new(transport),
-        vault_key,
+        *vault_key,
     ));
     tokio::spawn(engine.clone().run());
 
@@ -1059,7 +1062,7 @@ async fn status(vault: &Path, identity_path: Option<PathBuf>) -> Result<()> {
         }
         (true, Ok(raw)) => {
             use roam_backend_client::crypto::VaultKey;
-            let vault_key = VaultKey(raw);
+            let vault_key = VaultKey(*raw);
             let keychain = store
                 .keychain(&vault_key.id_key(), &vault_key.epoch0_key())
                 .context("build keychain")?;
@@ -1120,7 +1123,7 @@ async fn rotate(
     use roam_storage::PaperKey;
 
     let identity = Identity::load(identity_path).context("load identity")?;
-    let vault_key = VaultKey(load_vault_key(vault)?);
+    let vault_key = VaultKey(*load_vault_key(vault)?);
     let mut store = Store::open(vault, identity).context("open vault store")?;
 
     // Prefer generation: mint a high-entropy phrase the user prints once. Fall
@@ -1205,7 +1208,7 @@ async fn checkpoint(vault: &Path, identity_path: &Path, before: &str, dry_run: b
             Ok(raw) => {
                 use roam_backend_client::crypto::VaultKey;
                 use roam_backend_client::sync::produce_held_snapshot;
-                let key = VaultKey(raw);
+                let key = VaultKey(*raw);
                 produce_held_snapshot(&store, &key, cutoff).context("produce bootstrap snapshot")?
             }
             // No vault key on disk => vault was never wired for sync (purely

@@ -100,8 +100,8 @@ impl PaperKey {
     }
 
     /// The X25519 static secret (for unwrapping epoch keys during recovery).
-    pub fn secret(&self) -> [u8; 32] {
-        self.secret
+    pub fn secret(&self) -> zeroize::Zeroizing<[u8; 32]> {
+        zeroize::Zeroizing::new(self.secret)
     }
 
     /// The X25519 public (wrap epoch keys to this via `Recipient::Paper`).
@@ -137,7 +137,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(PaperKey::from_passphrase(passphrase).secret(), expected);
+        assert_eq!(*PaperKey::from_passphrase(passphrase).secret(), expected);
     }
 
     #[test]
@@ -182,11 +182,19 @@ mod tests {
     }
 
     #[test]
+    fn the_exported_recovery_secret_is_wiped_on_drop() {
+        // `secret()` hands out a COPY of the recovery X25519 secret; it must
+        // self-zeroize even though `PaperKey` itself is `ZeroizeOnDrop`.
+        let paper = PaperKey::from_passphrase("guard me later");
+        let _: zeroize::Zeroizing<[u8; 32]> = paper.secret();
+    }
+
+    #[test]
     fn same_passphrase_derives_the_same_keypair() {
         let a = PaperKey::from_passphrase("correct horse battery staple");
         let b = PaperKey::from_passphrase("correct horse battery staple");
         assert_eq!(a.public(), b.public());
-        assert_eq!(a.secret(), b.secret());
+        assert_eq!(*a.secret(), *b.secret());
     }
 
     #[test]
@@ -205,7 +213,7 @@ mod tests {
 
         let recovered = PaperKey::from_passphrase("recover me later");
         assert_eq!(
-            keywrap::unwrap(&recovered.secret(), &blob).unwrap(),
+            *keywrap::unwrap(&recovered.secret(), &blob).unwrap(),
             epoch_key
         );
     }

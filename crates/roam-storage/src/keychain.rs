@@ -197,7 +197,7 @@ impl Keychain {
                                 if compute_epoch_id(&node.parents, node.minted_by, &node.nonce, &k)
                                     == e.epoch_id
                                 {
-                                    node.key = Some(SecretKey::new(k));
+                                    node.key = Some(SecretKey::new(*k));
                                 }
                             }
                         }

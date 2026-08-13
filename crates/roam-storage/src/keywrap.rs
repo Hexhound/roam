@@ -45,7 +45,10 @@ pub fn wrap(recipient_pub: &[u8; 32], key: &[u8; 32]) -> Vec<u8> {
 }
 
 /// Open a blob produced by [`wrap`] using the recipient's X25519 static secret.
-pub fn unwrap(recipient_secret: &[u8; 32], blob: &[u8]) -> Result<[u8; 32], StorageError> {
+pub fn unwrap(
+    recipient_secret: &[u8; 32],
+    blob: &[u8],
+) -> Result<zeroize::Zeroizing<[u8; 32]>, StorageError> {
     if blob.len() < EPH_PUB_LEN + NONCE_LEN {
         return Err(StorageError::Keywrap);
     }
@@ -62,7 +65,8 @@ pub fn unwrap(recipient_secret: &[u8; 32], blob: &[u8]) -> Result<[u8; 32], Stor
     let pt = cipher
         .decrypt(XNonce::from_slice(nonce), ct)
         .map_err(|_| StorageError::Keywrap)?;
-    pt.try_into().map_err(|_| StorageError::Keywrap)
+    let key: [u8; 32] = pt.try_into().map_err(|_| StorageError::Keywrap)?;
+    Ok(zeroize::Zeroizing::new(key))
 }
 
 #[cfg(test)]
@@ -71,13 +75,23 @@ mod tests {
     use crate::identity::Identity;
 
     #[test]
+    fn the_unwrapped_epoch_key_is_wiped_on_drop() {
+        // `unwrap` returns a freshly-opened epoch key (a content secret). The
+        // returned copy must self-zeroize so it does not linger between here and
+        // the caller's `SecretKey::new`.
+        let target = Identity::generate();
+        let blob = wrap(&target.x25519_public(), &[0x5au8; 32]);
+        let _: zeroize::Zeroizing<[u8; 32]> = unwrap(&target.x25519_secret(), &blob).unwrap();
+    }
+
+    #[test]
     fn target_opens_non_target_fails() {
         let target = Identity::generate();
         let other = Identity::generate();
         let key = [0x5au8; 32];
 
         let blob = wrap(&target.x25519_public(), &key);
-        assert_eq!(unwrap(&target.x25519_secret(), &blob).unwrap(), key);
+        assert_eq!(*unwrap(&target.x25519_secret(), &blob).unwrap(), key);
         assert!(unwrap(&other.x25519_secret(), &blob).is_err());
     }
 

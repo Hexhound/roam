@@ -22,10 +22,12 @@ pub const VAULT_ID_LABEL: &str = "roam-backend-client id-derivation v1";
 pub const VAULT_AEAD_LABEL: &str = "roam-backend-client aead v1";
 
 /// Derive `(id_key, epoch0_key)` from a raw 32-byte vault key.
-pub fn vault_subkeys(vault_key: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
+pub fn vault_subkeys(
+    vault_key: &[u8; 32],
+) -> (zeroize::Zeroizing<[u8; 32]>, zeroize::Zeroizing<[u8; 32]>) {
     (
-        blake3::derive_key(VAULT_ID_LABEL, vault_key),
-        blake3::derive_key(VAULT_AEAD_LABEL, vault_key),
+        zeroize::Zeroizing::new(blake3::derive_key(VAULT_ID_LABEL, vault_key)),
+        zeroize::Zeroizing::new(blake3::derive_key(VAULT_AEAD_LABEL, vault_key)),
     )
 }
 
@@ -34,22 +36,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_derived_subkeys_are_wiped_on_drop() {
+        // Both subkeys are content-relevant derivations of the root vault key
+        // (the AEAD subkey seals/opens payloads; the id subkey keys the backend
+        // namespace). The copies returned here must not linger in freed memory.
+        fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<zeroize::Zeroizing<[u8; 32]>>();
+        let (id_key, epoch0_key) = vault_subkeys(&[3u8; 32]);
+        let _: zeroize::Zeroizing<[u8; 32]> = id_key;
+        let _: zeroize::Zeroizing<[u8; 32]> = epoch0_key;
+    }
+
+    #[test]
     fn subkeys_are_deterministic_distinct_and_stable() {
         let vk = [7u8; 32];
         let (id_a, aead_a) = vault_subkeys(&vk);
         let (id_b, aead_b) = vault_subkeys(&vk);
-        assert_eq!(id_a, id_b);
-        assert_eq!(aead_a, aead_b);
-        assert_ne!(id_a, aead_a, "the two subkeys must be independent");
+        assert_eq!(*id_a, *id_b);
+        assert_eq!(*aead_a, *aead_b);
+        assert_ne!(*id_a, *aead_a, "the two subkeys must be independent");
 
         // Freeze the exact byte values so an accidental label edit is caught here
         // (changing a label would orphan every existing vault).
         assert_eq!(
-            id_a,
+            *id_a,
             blake3::derive_key("roam-backend-client id-derivation v1", &vk)
         );
         assert_eq!(
-            aead_a,
+            *aead_a,
             blake3::derive_key("roam-backend-client aead v1", &vk)
         );
     }

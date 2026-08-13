@@ -1124,7 +1124,7 @@ mod tests {
         let vault = VaultKey([9u8; 32]);
 
         // No rotation: the head is epoch 0, so the legacy seal is correct.
-        let kc0 = Keychain::build(vault.id_key(), vault.epoch0_key(), 1, &[0u8; 32], &[]);
+        let kc0 = Keychain::build(*vault.id_key(), *vault.epoch0_key(), 1, &[0u8; 32], &[]);
         assert_eq!(kc0.head(), EPOCH0_ID);
         assert!(
             seal_under_head(&kc0, &vault, b"x").is_some(),
@@ -1146,7 +1146,13 @@ mod tests {
                 nonce,
             },
         };
-        let kc = Keychain::build(vault.id_key(), vault.epoch0_key(), 1, &[0u8; 32], &[rotate]);
+        let kc = Keychain::build(
+            *vault.id_key(),
+            *vault.epoch0_key(),
+            1,
+            &[0u8; 32],
+            &[rotate],
+        );
         assert_eq!(kc.head(), epoch, "head advances to the rotated epoch");
         assert!(kc.head_write_key().is_none(), "we hold no key for the head");
         assert!(
@@ -1159,7 +1165,7 @@ mod tests {
     fn undecryptable_report_counts_items_whose_epoch_key_is_missing() {
         use roam_storage::{Keychain, EPOCH0_ID};
         let vault = VaultKey([9u8; 32]);
-        let kc = Keychain::build(vault.id_key(), vault.epoch0_key(), 1, &[0u8; 32], &[]);
+        let kc = Keychain::build(*vault.id_key(), *vault.epoch0_key(), 1, &[0u8; 32], &[]);
 
         // Genuine epoch-0 (legacy) ciphertext opens.
         let legacy = vault.seal(b"ok");

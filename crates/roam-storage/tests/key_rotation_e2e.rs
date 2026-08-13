@@ -253,7 +253,7 @@ fn paper_recovery_reconstructs_a_rotated_epoch_key() {
     let recovered = PaperKey::from_passphrase("twelve word printed recovery phrase");
     let unwrapped = roam_storage::unwrap(&recovered.secret(), &paper_blob).unwrap();
     assert_eq!(
-        unwrapped,
+        *unwrapped,
         *epoch_key.expose(),
         "paper passphrase recovers the epoch key"
     );

@@ -78,16 +78,16 @@ impl Identity {
     /// handed only to an in-process transport that must bind the SAME key so
     /// the device's iroh `NodeId` equals its ed25519 verifying key. Never log
     /// or serialize the returned bytes.
-    pub fn secret_bytes(&self) -> [u8; 32] {
-        self.signing_key.to_bytes()
+    pub fn secret_bytes(&self) -> zeroize::Zeroizing<[u8; 32]> {
+        zeroize::Zeroizing::new(self.signing_key.to_bytes())
     }
 
     /// This device's X25519 static secret, derived from its ed25519 signing key
     /// (the clamped ed25519 scalar). Pairs with [`Identity::x25519_public`] and
     /// with any peer's [`VerifyingKey::to_x25519`] for sealed-box key wrapping.
     /// Never log or serialize the returned bytes.
-    pub fn x25519_secret(&self) -> [u8; 32] {
-        self.signing_key.to_scalar_bytes()
+    pub fn x25519_secret(&self) -> zeroize::Zeroizing<[u8; 32]> {
+        zeroize::Zeroizing::new(self.signing_key.to_scalar_bytes())
     }
 
     /// This device's X25519 public key, derived from its ed25519 verifying key.
@@ -223,6 +223,16 @@ mod tests {
     }
 
     #[test]
+    fn the_exported_secret_copies_are_wiped_on_drop() {
+        // `secret_bytes`/`x25519_secret` hand out COPIES of this device's private
+        // key material. The originals inside the dalek keys self-zeroize; the
+        // exported copies must too, or they linger on the stack after use.
+        let id = Identity::generate();
+        let _: zeroize::Zeroizing<[u8; 32]> = id.secret_bytes();
+        let _: zeroize::Zeroizing<[u8; 32]> = id.x25519_secret();
+    }
+
+    #[test]
     fn secret_bytes_reconstructs_the_same_key() {
         let id = Identity::generate();
         let rebuilt = SigningKey::from_bytes(&id.secret_bytes());
@@ -303,8 +313,8 @@ mod tests {
         let a = Identity::generate();
         let b = Identity::generate();
 
-        let a_sec = StaticSecret::from(a.x25519_secret());
-        let b_sec = StaticSecret::from(b.x25519_secret());
+        let a_sec = StaticSecret::from(*a.x25519_secret());
+        let b_sec = StaticSecret::from(*b.x25519_secret());
         let a_pub = PublicKey::from(a.x25519_public());
         let b_pub = PublicKey::from(b.x25519_public());
 

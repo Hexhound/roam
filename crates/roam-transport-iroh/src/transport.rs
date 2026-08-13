@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use futures::StreamExt;
-use iroh::endpoint::{Incoming, RecvStream, SendStream};
+use iroh::endpoint::{Connection, Incoming, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, EndpointId};
 use roam_storage::Identity;
 use roam_sync_core::frame::Frame;
@@ -42,6 +42,10 @@ type InboundTx = mpsc::UnboundedSender<(u64, Frame)>;
 /// The paired inbound receiver, taken once by [`IrohTransport::incoming`].
 type InboundRx = Arc<Mutex<Option<mpsc::UnboundedReceiver<(u64, Frame)>>>>;
 
+/// peer_id -> the peer's currently-open inbound connection. Kept so a revoke
+/// (`remove_route`) can force-close a formerly-roster peer's reader (T2).
+type InboundConns = Arc<Mutex<HashMap<u64, Connection>>>;
+
 /// iroh QUIC transport implementing [`Transport`].
 pub struct IrohTransport {
     endpoint: Endpoint,
@@ -56,6 +60,8 @@ pub struct IrohTransport {
     inbound_rx: InboundRx,
     /// Per-peer open send stream, so `send` reuses one dial.
     conns: Arc<AsyncMutex<HashMap<u64, PeerStream>>>,
+    /// Per-peer open INBOUND connection, so a revoke tears the reader down (T2).
+    inbound_conns: InboundConns,
     /// Per-peer dial lock, so concurrent dials to the same peer open exactly one
     /// connection (and spawn exactly one reader) instead of racing.
     dialing: Arc<Mutex<HashMap<u64, Arc<AsyncMutex<()>>>>>,
@@ -78,20 +84,23 @@ impl IrohTransport {
         );
 
         let routes = Arc::new(Mutex::new(routes));
+        let inbound_conns: InboundConns = Arc::new(Mutex::new(HashMap::new()));
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
 
         // Accept loop: one task per inbound connection.
         let accept_ep = endpoint.clone();
         let accept_routes = routes.clone();
         let accept_tx = inbound_tx.clone();
+        let accept_conns = inbound_conns.clone();
         let accept_task = tokio::spawn(async move {
             while let Some(incoming) = accept_ep.accept().await {
                 let routes = accept_routes.clone();
                 let tx = accept_tx.clone();
+                let inbound_conns = accept_conns.clone();
                 tokio::spawn(async move {
                     // A teardown error (peer disconnect, reset) is expected and
                     // only ends this one connection's reader.
-                    let _ = handle_conn(incoming, routes, tx).await;
+                    let _ = handle_conn(incoming, routes, tx, inbound_conns).await;
                 });
             }
         });
@@ -103,6 +112,7 @@ impl IrohTransport {
             inbound_tx,
             inbound_rx: Arc::new(Mutex::new(Some(inbound_rx))),
             conns: Arc::new(AsyncMutex::new(HashMap::new())),
+            inbound_conns,
             dialing: Arc::new(Mutex::new(HashMap::new())),
             accept_task,
         })
@@ -260,21 +270,34 @@ impl Transport for IrohTransport {
     async fn remove_route(&self, peer: u64) {
         // Drop the route and any seeded direct address so a later `dial` cannot
         // resolve the peer, and drop our cached send half so we stop pushing to
-        // it. This does NOT force-close the peer's inbound reader task (which
-        // holds its own `RecvStream` and lives until the peer disconnects):
-        // inbound frames from a revoked peer are refused at the app layer (the
-        // engine's read-side revoke gate drops Hello/Have/RosterHave, and the
-        // store refuses its Ops/RosterOps), not torn down at the transport. Full
-        // transport-level teardown is deferred (basic revoke).
+        // it.
         self.routes.lock().unwrap().remove(&peer);
         self.addrs.lock().unwrap().remove(&peer);
         self.conns.lock().await.remove(&peer);
+
+        // T2: force-close the revoked peer's still-open INBOUND connection so its
+        // reader task ends. Without this, a peer that was in the roster when it
+        // connected keeps its accepted connection alive and can keep flooding the
+        // unbounded inbound channel with frames — the app layer discards them,
+        // but the transport still decodes and enqueues each. Closing the
+        // connection makes its `read_loop` error out and stop; a later reconnect
+        // is refused at the accept-time roster gate (the route is gone). All
+        // peer->this frames arrive on this inbound connection (a dialed
+        // connection's reverse stream is unused), so this is the whole vector.
+        if let Some(conn) = self.inbound_conns.lock().unwrap().remove(&peer) {
+            conn.close(0u32.into(), b"revoked");
+        }
     }
 }
 
 /// Handle one inbound connection: resolve its peer id, accept the bi stream,
 /// and forward every frame it sends.
-async fn handle_conn(incoming: Incoming, routes: Routes, tx: InboundTx) -> Result<()> {
+async fn handle_conn(
+    incoming: Incoming,
+    routes: Routes,
+    tx: InboundTx,
+    inbound_conns: InboundConns,
+) -> Result<()> {
     let conn = incoming
         .accept()
         .context("accept inbound connection")?
@@ -298,9 +321,28 @@ async fn handle_conn(incoming: Incoming, routes: Routes, tx: InboundTx) -> Resul
 
     let peer = peer_id_for(&routes, &remote);
     crate::dlog!("accept: inbound connection from peer={peer} (node={remote})");
+
+    // Register this connection so `remove_route` (revoke) can force-close it and
+    // end this reader (T2). A reconnect from the same peer supersedes the prior
+    // connection, which we close so a peer can't hold two live readers.
+    if let Some(old) = inbound_conns.lock().unwrap().insert(peer, conn.clone()) {
+        if old.stable_id() != conn.stable_id() {
+            old.close(0u32.into(), b"superseded by reconnect");
+        }
+    }
+
     let (_send, recv) = conn.accept_bi().await.context("accept inbound bi stream")?;
     let result = read_loop(recv, peer, tx).await;
     crate::dlog!("accept: reader for peer={peer} ended ({result:?})");
+
+    // Deregister — but only if we are still the current connection for this peer
+    // (a reconnect or a revoke may have replaced/removed it already).
+    {
+        let mut map = inbound_conns.lock().unwrap();
+        if map.get(&peer).map(Connection::stable_id) == Some(conn.stable_id()) {
+            map.remove(&peer);
+        }
+    }
     result
 }
 
@@ -449,6 +491,56 @@ mod tests {
         assert!(
             got.is_err(),
             "a frame from a non-roster peer must not reach the inbound channel: {got:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn revoking_a_peer_tears_down_its_still_open_inbound_reader() {
+        // T2: `remove_route` must force-close a formerly-roster peer's inbound
+        // connection, ending its reader task. Otherwise a revoked peer keeps its
+        // accepted connection open and can keep flooding the unbounded inbound
+        // channel with frames — the app layer discards them, but the transport
+        // still pays to decode and enqueue each one (the same DoS the accept-time
+        // roster gate closes for strangers, but reachable by a peer that was in
+        // the roster when it connected).
+        let host = Identity::generate();
+        let peer = Identity::generate();
+
+        let mut routes_host = HashMap::new();
+        routes_host.insert(peer.peer_id(), peer.verifying_key().to_bytes());
+        let mut routes_peer = HashMap::new();
+        routes_peer.insert(host.peer_id(), host.verifying_key().to_bytes());
+
+        let host_t = IrohTransport::spawn(&host, routes_host).await.unwrap();
+        let peer_t = IrohTransport::spawn(&peer, routes_peer).await.unwrap();
+        peer_t
+            .add_addr(host.peer_id(), host_t.endpoint_addr())
+            .await;
+
+        let mut host_in = host_t.incoming();
+        // The peer (still in the roster) dials and pushes a frame; the host's
+        // inbound reader is now live and surfaces it.
+        peer_t.dial(host.peer_id()).await.unwrap();
+        peer_t.send(host.peer_id(), Frame::Ping).await.unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(10), host_in.next())
+            .await
+            .expect("the first frame from a roster peer must arrive")
+            .unwrap();
+        assert_eq!(first, (peer.peer_id(), Frame::Ping));
+
+        // Revoke the peer: this must tear the inbound connection down.
+        host_t.remove_route(peer.peer_id()).await;
+
+        // The peer keeps pushing on its cached stream, but the host's reader is
+        // gone (connection closed) and a fresh dial would be refused at accept —
+        // so nothing more reaches the inbound channel.
+        for _ in 0..5 {
+            let _ = peer_t.send(host.peer_id(), Frame::Ping).await;
+        }
+        let after = tokio::time::timeout(Duration::from_secs(2), host_in.next()).await;
+        assert!(
+            after.is_err(),
+            "a revoked peer's frames must not reach the inbound channel: {after:?}"
         );
     }
 

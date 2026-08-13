@@ -8,8 +8,9 @@ pub use roam_storage::epoch_crypto::{open_epoch, seal_epoch, CryptoError};
 /// the backend. Derives all opaque ids and seals/opens all payloads.
 ///
 /// The root secret is wiped on drop ([`ZeroizeOnDrop`]) so it does not linger in
-/// freed memory. (Derived subkeys copied out via [`VaultKey::id_key`] /
-/// [`VaultKey::epoch0_key`] are short-lived and not separately wrapped.)
+/// freed memory. Derived subkeys copied out via [`VaultKey::id_key`] /
+/// [`VaultKey::epoch0_key`] are handed back as [`zeroize::Zeroizing`] so those
+/// short-lived copies self-wipe too.
 #[derive(Clone, zeroize::ZeroizeOnDrop)]
 pub struct VaultKey(pub [u8; 32]);
 
@@ -17,13 +18,13 @@ impl VaultKey {
     /// Independent subkey for opaque id derivation (keyed BLAKE3). Derived via
     /// the shared [`roam_storage::vault_subkeys`] so the backend id namespace and
     /// pairing's epoch-0 derivation can never drift apart.
-    fn id_subkey(&self) -> [u8; 32] {
+    fn id_subkey(&self) -> zeroize::Zeroizing<[u8; 32]> {
         roam_storage::vault_subkeys(&self.0).0
     }
 
     /// Independent subkey for AEAD seal/open (XChaCha20-Poly1305). See
     /// [`Self::id_subkey`] — same shared-derivation rationale.
-    fn aead_subkey(&self) -> [u8; 32] {
+    fn aead_subkey(&self) -> zeroize::Zeroizing<[u8; 32]> {
         roam_storage::vault_subkeys(&self.0).1
     }
 
@@ -82,20 +83,20 @@ impl VaultKey {
 
     /// The STABLE id-derivation key (never rotates). All backend ids derive from
     /// this; a rotated-out member keeps it (can enumerate ids) but not content.
-    pub fn id_key(&self) -> [u8; 32] {
+    pub fn id_key(&self) -> zeroize::Zeroizing<[u8; 32]> {
         self.id_subkey()
     }
 
     /// The epoch-0 AEAD key (== today's scheme). Epoch 0 ciphertext is written
     /// UNTAGGED via [`VaultKey::seal`]; this exposes the key for the Keychain.
-    pub fn epoch0_key(&self) -> [u8; 32] {
+    pub fn epoch0_key(&self) -> zeroize::Zeroizing<[u8; 32]> {
         self.aead_subkey()
     }
 
     /// AEAD seal: returns `nonce(24) || ciphertext`.
     pub fn seal(&self, plaintext: &[u8]) -> Vec<u8> {
         let aead_key = self.aead_subkey();
-        let cipher = XChaCha20Poly1305::new((&aead_key).into());
+        let cipher = XChaCha20Poly1305::new((&*aead_key).into());
         let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
         let mut out = nonce.to_vec();
         let ct = cipher.encrypt(&nonce, plaintext).expect("aead encrypt");
@@ -110,7 +111,7 @@ impl VaultKey {
         }
         let (nonce_bytes, ct) = payload.split_at(24);
         let aead_key = self.aead_subkey();
-        let cipher = XChaCha20Poly1305::new((&aead_key).into());
+        let cipher = XChaCha20Poly1305::new((&*aead_key).into());
         let nonce = XNonce::from_slice(nonce_bytes);
         cipher.decrypt(nonce, ct).map_err(|_| CryptoError::Open)
     }
@@ -133,6 +134,16 @@ mod tests {
         // inspected).
         fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
         assert_zeroize_on_drop::<VaultKey>();
+    }
+
+    #[test]
+    fn the_derived_subkeys_handed_out_are_wiped_on_drop() {
+        // `id_key`/`epoch0_key` copy a subkey out of the root vault key. The AEAD
+        // (epoch-0) subkey opens content; both must self-zeroize after use rather
+        // than linger in freed stack/heap.
+        let k = key();
+        let _: zeroize::Zeroizing<[u8; 32]> = k.id_key();
+        let _: zeroize::Zeroizing<[u8; 32]> = k.epoch0_key();
     }
 
     #[test]
@@ -219,7 +230,7 @@ mod tests {
     #[test]
     fn id_key_is_stable_and_public() {
         let k = key();
-        assert_eq!(k.id_key(), k.id_key());
+        assert_eq!(*k.id_key(), *k.id_key());
     }
 
     #[test]
