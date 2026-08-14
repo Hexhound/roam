@@ -119,8 +119,15 @@ impl LanDiscovery {
                     Some(DiscoveryEvent::Expired { endpoint_id }) => {
                         seen.remove(&endpoint_id);
                     }
+                    // An event kind we do not model yet. Ignore it and keep
+                    // listening: treating it as end-of-stream (as this did) means
+                    // one new variant in a future iroh silently truncates every
+                    // browse, reporting a partial peer list as if it were
+                    // complete. `window` is the budget; only the stream actually
+                    // ending should cut it short.
+                    Some(_) => continue,
                     // The service stopped; nothing more will ever arrive.
-                    Some(_) | None => break,
+                    None => break,
                 },
             }
         }

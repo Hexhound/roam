@@ -336,3 +336,76 @@ async fn a_peer_that_connects_and_stalls_does_not_block_a_real_receiver() {
 
     serve.await.unwrap().expect("sender completed");
 }
+
+/// The companion to the stall test, and a hole it did not cover.
+///
+/// `serve_one`'s rule is that nothing a peer does may end the session — only our
+/// own failure to read a file does. Bounding the handshake reads enforced that
+/// for a peer that says *nothing*. A peer that says *rubbish* got through by a
+/// different door: the responder spent an attempt the moment a run started,
+/// before parsing, so three unparseable messages exhausted `MAX_ATTEMPTS` and
+/// `serve_one` bailed with "the share code is used up" — the session killed by a
+/// peer, with no guessing and no knowledge of the code.
+///
+/// The endpoint is announced over mDNS, so the attacker is any device on the
+/// network. The budget is now charged on a failed *confirmation*, so guessing is
+/// still bounded at three (`roam_pake::tests::the_attempt_budget_is_enforced`)
+/// while rubbish costs nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn junk_connections_cannot_retire_the_share_code() {
+    let source = tempfile::tempdir().unwrap();
+    let dest = tempfile::tempdir().unwrap();
+    let file = write(source.path(), "wanted.txt", b"the real transfer");
+
+    let (offer, sources) = offer_paths("alice-laptop", &[file]).unwrap();
+    let sender_endpoint = endpoint().await;
+    let receiver_endpoint = endpoint().await;
+    let sender_addr = addr_of(&sender_endpoint).await;
+
+    let (sender, code) = ShareSender::new(sender_endpoint, offer, sources);
+    let serve = tokio::spawn(sender.serve_one());
+
+    // More junk runs than the whole budget, each a complete, well-framed
+    // message that is simply not a SPAKE2 one.
+    for attempt in 0..roam_pake::MAX_ATTEMPTS + 2 {
+        let junk_endpoint = endpoint().await;
+        let conn = junk_endpoint
+            .connect(sender_addr.clone(), SHARE_ALPN)
+            .await
+            .unwrap_or_else(|e| panic!("junk connection {attempt} could not connect: {e}"));
+        let (mut send, _recv) = conn.open_bi().await.unwrap();
+        let garbage = b"not a spake2 message";
+        // The share wire is little-endian length-prefixed (see `wire.rs`).
+        send.write_all(&(garbage.len() as u32).to_le_bytes())
+            .await
+            .unwrap();
+        send.write_all(garbage).await.unwrap();
+        send.finish().unwrap();
+        // Let the sender consume this run before opening the next, so the
+        // attempts land one at a time rather than racing the accept loop.
+        conn.closed().await;
+    }
+
+    // The code must still be good.
+    let received = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        receive_share(
+            &receiver_endpoint,
+            sender_addr,
+            &code,
+            dest.path(),
+            |_| true,
+        ),
+    )
+    .await
+    .expect("the sender stopped listening after junk connections")
+    .expect("the share code was retired by peers that never guessed it");
+
+    assert_eq!(received.files.len(), 1);
+    assert_eq!(
+        std::fs::read(dest.path().join("wanted.txt")).unwrap(),
+        b"the real transfer"
+    );
+
+    serve.await.unwrap().expect("sender completed");
+}

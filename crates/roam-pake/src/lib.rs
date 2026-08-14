@@ -26,23 +26,40 @@
 //! consume its session on a failed attempt: its secret is 256 bits, so guessing
 //! is hopeless and the real risk is a hostile peer burning the user's session.
 //! Here the secret is 20 bits, so the risk is inverted and the budget is
-//! mandatory. An attacker on the LAN can therefore burn the budget and force the
-//! user to restart pairing. That is the correct trade for a low-entropy code,
-//! and it is a deliberate difference from the token flow rather than an
-//! oversight.
+//! mandatory. An attacker on the LAN who *guesses* three times can therefore
+//! burn the budget and force the user to restart pairing. That is the correct
+//! trade for a low-entropy code, and it is a deliberate difference from the
+//! token flow rather than an oversight.
 //!
-//! An attempt is spent when a run **starts**, not when it fails. Counting
-//! failures instead would let an attacker guess indefinitely by simply
-//! disconnecting after learning their guess was wrong.
+//! # What spends an attempt
+//!
+//! A **wrong confirmation**, and nothing else. Not starting a run, not sending
+//! an unparseable message, not disconnecting halfway.
+//!
+//! An earlier version charged when a run started, on the reasoning that
+//! counting only failures "would let an attacker guess indefinitely by simply
+//! disconnecting after learning their guess was wrong". An initiator cannot
+//! learn that: `Msg2` is not testable against a candidate code, and the
+//! responder's confirmation — the only oracle — is withheld until the initiator
+//! proves first. That is precisely what makes the guess online, and being unable
+//! to test one offline is the defining property of a PAKE.
+//!
+//! Charging at run start was also a denial of service. `respond` rejects
+//! unparseable input, so three connections sending rubbish spent the entire
+//! budget without guessing anything, retiring a pairing or share code on demand
+//! from any device that could reach the endpoint — and the endpoint is announced
+//! over mDNS. Guessing stays bounded either way, because a guess *is* a
+//! confirmation.
 //!
 //! # Protocol
 //!
 //! ```text
 //!   Initiator (types the code)              Responder (shows the code)
 //!   ---------------------------             --------------------------
-//!   start ────────── Msg1 ──────────────────▶  (spends one attempt)
-//!                  ◀────────── Msg2 ────────   respond
-//!   confirm ──────── Confirm ───────────────▶  verify; wrong ⇒ abort
+//!   start ────────── Msg1 ──────────────────▶  respond (costs nothing)
+//!                  ◀────────── Msg2 ────────   reveals nothing testable
+//!   confirm ──────── Confirm ───────────────▶  verify; wrong ⇒ spend an
+//!                                              attempt and abort
 //!                  ◀────────── Confirm ─────   only now does the responder
 //!                                              prove anything or send data
 //! ```
@@ -376,9 +393,21 @@ impl Responder {
 
     /// Handle an incoming run.
     ///
-    /// **Spends one attempt immediately**, before any verification. A peer that
-    /// starts a run and then vanishes has still used a guess; counting only
-    /// failures would leave the budget trivially bypassable.
+    /// **Spends no attempt.** The budget is charged by [`Responder::verify`],
+    /// when a peer actually guesses and gets it wrong.
+    ///
+    /// An earlier version charged here, before any verification, reasoning that
+    /// a peer which "starts a run and then vanishes has still used a guess". It
+    /// has not: `msg2` carries nothing an initiator can test a password against,
+    /// and the responder's own confirmation — the only oracle — is withheld
+    /// until the initiator proves first. Being unable to test a guess offline is
+    /// the defining property of a PAKE, so an abandoned run reveals nothing.
+    ///
+    /// Charging here was also exploitable. `start_b`'s `finish` rejects
+    /// unparseable input, so three connections sending rubbish spent the whole
+    /// budget without guessing anything — retiring a share code or pairing code
+    /// on demand, from any device that can reach the endpoint (which is
+    /// announced over mDNS). See the tests in `tests/handshake.rs`.
     pub fn respond(
         &mut self,
         initiator_id: [u8; 32],
@@ -387,7 +416,6 @@ impl Responder {
         if self.attempts_left == 0 {
             return Err(PakeError::NoAttemptsLeft);
         }
-        self.attempts_left -= 1;
 
         let (state, msg2) = Spake2::<Ed25519Group>::start_b(
             &Password::new(self.code.as_str().as_bytes()),
@@ -427,20 +455,33 @@ pub struct PendingResponder {
     key: SessionKey,
 }
 
-impl PendingResponder {
+impl Responder {
     /// Verify the initiator's confirmation and, only if it is right, hand back
     /// our own confirmation plus the session key.
     ///
+    /// **This is where an attempt is spent**, and only on a wrong one. Reaching
+    /// this point means the peer committed to a guess, so a failure here is the
+    /// one and only thing the budget is meant to count. The budget therefore
+    /// lives on `Responder` and verification is a method on it, rather than on
+    /// [`PendingResponder`] — that way there is no way to check a confirmation
+    /// without charging for it.
+    ///
     /// On failure nothing at all is returned: the responder must not reveal its
-    /// confirmation value to a peer that has not proved it knows the code.
+    /// confirmation value to a peer that has not proved it knows the code, or
+    /// that value becomes an oracle to test guesses against.
     pub fn verify(
-        self,
+        &mut self,
+        pending: PendingResponder,
         initiator_confirm: &[u8; 32],
     ) -> Result<(SessionKey, [u8; 32]), PakeError> {
-        if !macs_match(&self.expected, initiator_confirm) {
+        if self.attempts_left == 0 {
+            return Err(PakeError::NoAttemptsLeft);
+        }
+        if !macs_match(&pending.expected, initiator_confirm) {
+            self.attempts_left -= 1;
             return Err(PakeError::BadCode);
         }
-        Ok((self.key, self.ours))
+        Ok((pending.key, pending.ours))
     }
 }
 

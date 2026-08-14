@@ -310,7 +310,13 @@ impl LanPairingHost<'_> {
             .await?
             .try_into()
             .map_err(|_| anyhow::anyhow!("malformed confirmation"))?;
-        let (key, our_confirm) = pending.verify(&their_confirm).map_err(anyhow::Error::from)?;
+        // Charged here, not at `respond`: only a peer that committed to a guess
+        // and got it wrong spends the budget. Charging at `respond` let three
+        // connections sending rubbish retire the code without guessing at all.
+        let (key, our_confirm) = self
+            .responder
+            .verify(pending, &their_confirm)
+            .map_err(anyhow::Error::from)?;
         write_frame(&mut send, &our_confirm).await?;
         let (mut sealer, mut opener) = key.split(Side::Responder);
 

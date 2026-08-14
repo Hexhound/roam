@@ -16,7 +16,7 @@ fn run(
     let (initiator, msg1) = Initiator::start(initiator_code, initiator_id, responder_id);
     let (pending_responder, msg2) = responder.respond(initiator_id, &msg1)?;
     let (pending_initiator, initiator_confirm) = initiator.accept(&msg2)?;
-    let (responder_key, responder_confirm) = pending_responder.verify(&initiator_confirm)?;
+    let (responder_key, responder_confirm) = responder.verify(pending_responder, &initiator_confirm)?;
     let initiator_key = pending_initiator.verify(&responder_confirm)?;
     Ok((initiator_key, responder_key))
 }
@@ -64,7 +64,7 @@ fn a_run_bound_to_one_device_does_not_verify_against_another() {
     let (_, initiator_confirm) = initiator.accept(&msg2).unwrap();
 
     assert_eq!(
-        pending_responder.verify(&initiator_confirm).unwrap_err(),
+        impostor.verify(pending_responder, &initiator_confirm).unwrap_err(),
         PakeError::BadCode,
         "a key bound to one endpoint id verified against another — MITM is open"
     );
@@ -95,22 +95,59 @@ fn the_attempt_budget_is_enforced() {
     );
 }
 
-/// The subtle one. If an attempt were only spent when a guess *fails*, an
-/// attacker could start a run, learn from the responder's reply whether the
-/// guess was right, disconnect, and repeat forever.
+/// An attempt is spent by a GUESS, and a guess is a confirmation we reject —
+/// not the mere act of starting a run.
+///
+/// This reverses an earlier decision here, which charged at `respond` on the
+/// reasoning that otherwise an attacker could "start a run, learn from the
+/// responder's reply whether the guess was right, disconnect, and repeat".
+/// That reasoning does not hold: `msg2` carries no information an initiator can
+/// test a password against — withholding the responder's confirmation until the
+/// initiator proves first is exactly what makes the guess *online*, and being
+/// unable to test offline is the defining property of a PAKE. So an abandoned
+/// run reveals nothing and must cost nothing.
+///
+/// Charging at `respond` was not merely unnecessary, it was exploitable: see
+/// [`garbage_from_a_stranger_cannot_burn_the_guess_budget`].
 #[test]
-fn an_abandoned_run_still_spends_an_attempt() {
+fn an_abandoned_run_does_not_spend_an_attempt() {
     let code = PairingCode::generate();
     let mut responder = Responder::new(code.clone(), HOST_ID);
 
     let (_initiator, msg1) = Initiator::start(&code, JOINER_ID, HOST_ID);
     let _ = responder.respond(JOINER_ID, &msg1).unwrap();
-    // Walk away without ever confirming.
+    // Walk away without ever confirming: no guess was made.
 
     assert_eq!(
         responder.attempts_left(),
-        MAX_ATTEMPTS - 1,
-        "an abandoned run did not spend an attempt — the budget is bypassable"
+        MAX_ATTEMPTS,
+        "starting a run is not a guess and must not cost one"
+    );
+}
+
+/// The budget exists to bound *guessing*. If unparseable bytes spend it, then
+/// anyone who can reach the endpoint — no code, no guess — can retire the code
+/// by sending rubbish three times, killing a share or a pairing session
+/// outright. The endpoint is announced over mDNS, so "anyone" means any device
+/// on the network.
+#[test]
+fn garbage_from_a_stranger_cannot_burn_the_guess_budget() {
+    let code = PairingCode::generate();
+    let mut responder = Responder::new(code, HOST_ID);
+
+    for _ in 0..MAX_ATTEMPTS + 5 {
+        assert_eq!(
+            responder
+                .respond(JOINER_ID, b"not a spake2 message")
+                .unwrap_err(),
+            PakeError::MalformedMessage
+        );
+    }
+
+    assert_eq!(
+        responder.attempts_left(),
+        MAX_ATTEMPTS,
+        "rubbish is not a guess; a stranger must not be able to retire the code"
     );
 }
 
@@ -126,7 +163,7 @@ fn a_failed_initiator_learns_nothing_from_the_responder() {
     // `verify` returns Result<(SessionKey, confirm)> — an error yields NEITHER,
     // so there is no path that leaks the confirmation on failure. The type
     // signature is the guarantee; this asserts the error case is taken.
-    assert!(pending.verify(&[0u8; 32]).is_err());
+    assert!(responder.verify(pending, &[0u8; 32]).is_err());
 }
 
 #[test]
@@ -137,7 +174,7 @@ fn a_replayed_confirmation_from_the_wrong_role_is_refused() {
     let (initiator, msg1) = Initiator::start(&code, JOINER_ID, HOST_ID);
     let (pending_responder, msg2) = responder.respond(JOINER_ID, &msg1).unwrap();
     let (pending_initiator, initiator_confirm) = initiator.accept(&msg2).unwrap();
-    let (_key, _responder_confirm) = pending_responder.verify(&initiator_confirm).unwrap();
+    let (_key, _responder_confirm) = responder.verify(pending_responder, &initiator_confirm).unwrap();
 
     // Echo the initiator's own confirmation back at it instead of the
     // responder's. Role tagging must make these different values.

@@ -690,7 +690,7 @@ async fn receive(from: &str, code: &str, into: &Path) -> Result<()> {
     // Browse-only: receiving announces nothing about this device.
     let _mdns = LanDiscovery::attach(&endpoint, false).context("look for the sender")?;
 
-    let received = receive_share(
+    let result = receive_share(
         &endpoint,
         iroh::EndpointAddr::from(sender_id),
         &code,
@@ -701,14 +701,20 @@ async fn receive(from: &str, code: &str, into: &Path) -> Result<()> {
         |offer| confirm_offer(offer),
     )
     .await
-    .context("receive the share")?;
+    .context("receive the share");
 
     // `receive_share` closes the connection, but a CONNECTION_CLOSE is a
     // best-effort datagram: if this process just exits, it is never flushed and
     // the sender sits out a 30-second QUIC idle timeout waiting for a peer that
     // is already gone. Measured at a reliable 30s before this line existed —
     // `Endpoint::close` does the graceful shutdown that actually delivers it.
+    //
+    // Unconditional, and that is the point: this used to sit after a `?`, so it
+    // ran only when the transfer SUCCEEDED. Every failure — wrong code, a
+    // malformed frame, a rejected offer — went back to leaving the sender to
+    // time us out, which is the exact bug the line was added to fix.
     endpoint.close().await;
+    let received = result?;
 
     if received.files.is_empty() && received.texts.is_empty() {
         println!("declined; nothing written.");

@@ -4,7 +4,7 @@ use crate::wire::{read_frame, write_frame};
 use crate::CHUNK_BYTES;
 use anyhow::{bail, Context, Result};
 use iroh::Endpoint;
-use roam_pake::{PairingCode, PakeError, Responder, Side};
+use roam_pake::{PairingCode, Responder, Side};
 use roam_share::{FileMeta, Payload, RelPath, SafeName, ShareFrame, ShareOffer};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -243,7 +243,14 @@ impl ShareSender {
         let confirm: [u8; 32] = confirm
             .try_into()
             .map_err(|_| anyhow::anyhow!("malformed confirmation"))?;
-        let (key, our_confirm) = pending.verify(&confirm).map_err(anyhow::Error::from)?;
+        // Charged here, not at `respond`: this is the point the peer committed
+        // to a guess. Before, an unparseable msg1 spent an attempt, so three
+        // junk connections retired the code and ended the share — the exact
+        // "a peer must never end the session" rule this loop enforces.
+        let (key, our_confirm) = self
+            .responder
+            .verify(pending, &confirm)
+            .map_err(anyhow::Error::from)?;
         write_frame(&mut send, &our_confirm).await?;
 
         let (mut sealer, mut opener) = key.split(Side::Responder);

@@ -325,3 +325,85 @@ async fn a_peer_that_connects_and_stalls_does_not_block_a_real_joiner() {
     assert_eq!(*joined.vault_key, host_state.vault_key);
     drop(host_state.store_dir);
 }
+
+/// A peer that says *rubbish* must be as harmless as one that says nothing.
+///
+/// The attempt budget is the one thing that can end a pairing session from the
+/// outside, so what spends it decides who can kill a pairing. It used to be
+/// spent when a run started, before the message was parsed — so three junk
+/// connections retired the code with no guessing and no knowledge of it, from
+/// any device that could reach the host. The host advertises over mDNS, so that
+/// is any device on the network.
+///
+/// The budget is now charged on a failed confirmation. Guessing is still capped
+/// at [`MAX_ATTEMPTS`] — see `the_code_dies_after_the_attempt_budget_is_spent`,
+/// which must keep passing alongside this.
+#[tokio::test(flavor = "multi_thread")]
+async fn junk_connections_cannot_retire_the_pairing_code() {
+    use roam_transport_iroh::PAIRING_LAN_ALPN;
+
+    let (host_state, mut store_a) = found();
+    let joiner_identity = Identity::generate();
+    let joiner_dir = tempdir().unwrap();
+
+    let (code, host) = host_lan_pairing(
+        &host_state.identity,
+        host_state.vault,
+        host_state.vault_key,
+        Role::Writer,
+        &mut store_a,
+    )
+    .await
+    .expect("arm the LAN pairing host");
+    let host = host.with_handshake_timeout(Duration::from_millis(300));
+    let host_addr = host.addr();
+
+    let clients = async {
+        // More junk runs than the whole budget. Each is a complete, correctly
+        // framed message that simply is not a SPAKE2 one.
+        for attempt in 0..MAX_ATTEMPTS + 2 {
+            let junk = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+                .bind()
+                .await
+                .unwrap();
+            let conn = junk
+                .connect(host_addr.clone(), PAIRING_LAN_ALPN)
+                .await
+                .unwrap_or_else(|e| panic!("junk connection {attempt} could not connect: {e}"));
+            let (mut send, _recv) = conn.open_bi().await.unwrap();
+            let garbage = b"not a spake2 message";
+            // The pairing wire is big-endian length-prefixed (see `pairing_lan.rs`),
+            // the opposite of the share wire — worth stating, since copying this
+            // block across crates silently produces a length nobody can read.
+            send.write_all(&(garbage.len() as u32).to_be_bytes())
+                .await
+                .unwrap();
+            send.write_all(garbage).await.unwrap();
+            send.finish().unwrap();
+            // One at a time, so the runs land in order rather than racing the
+            // host's sequential accept loop.
+            conn.closed().await;
+        }
+
+        join_lan_pairing(
+            joiner_identity.clone(),
+            joiner_dir.path().to_path_buf(),
+            host_addr,
+            code,
+        )
+        .await
+    };
+
+    let (added, joined) = tokio::time::timeout(
+        PAIR_TIMEOUT,
+        futures::future::join(host.accept_for(Duration::from_secs(20)), clients),
+    )
+    .await
+    .expect("host did not hang");
+
+    let added = added.expect("junk connections retired a code they never guessed");
+    assert_eq!(added, joiner_identity.peer_id());
+    let joined = joined.expect("the real joiner still got through");
+    assert_eq!(*joined.vault_key, host_state.vault_key);
+    drop(host_state.store_dir);
+}
