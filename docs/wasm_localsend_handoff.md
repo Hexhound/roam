@@ -288,13 +288,54 @@ LocalSend is a **share** app, not sync — needs NONE of the vault / roster / CR
 - (c) Full LAN pairing-INTO-a-vault is the SEPARATE F2-pairing concern for the
   sync apps — see security note below. NOT needed for LocalSend share.
 
-**SECURITY (do not skip, needs review before impl):** any 6-digit-code path is
-~20 bits. Current `sign(code)` scheme (pairing.rs:401,504) is UNSAFE — host's
-non-consuming retry loop (pairing.rs:323) = unbounded guessing oracle + no
-NodeId binding = same-LAN MITM. FIX = code-keyed PAKE (CPace/SPAKE2) + a
-NodeId-bound key-confirmation MAC + bounded per-session attempt budget. Do NOT
-ship `sign(6_digits)`. For LocalSend's ephemeral one-shot send, the code
-authenticates a single transfer; still use PAKE, not bare sign.
+**SECURITY — REVIEWED 2026-08-14. The review changed the conclusion; read this
+before acting on the older text.**
+
+The previous note claimed the current `sign(code)` scheme was UNSAFE because a
+6-digit code is ~20 bits. **That premise is wrong: there is no 6-digit code
+anywhere in roam.** `pairing.rs` mints its secret with `VaultId::generate()`,
+which is 32 bytes straight from `OsRng` — 256 bits, not 20. Grepping the whole
+workspace finds no short-code path at all. The cited lines (401/504) are the
+sign/verify of that 256-bit secret.
+
+Consequences for the three specific claims:
+
+- **"Unbounded guessing oracle" (the non-consuming retry loop, now ~line 330).**
+  The loop is real, but against a 256-bit secret it is not an oracle worth the
+  name. It is also *deliberate* and documented as P2 anti-DoS: a hostile peer
+  connecting first with a garbage proof must not burn the single-use secret and
+  force the user to restart. Adding the recommended "bounded per-session attempt
+  budget" would **reintroduce that DoS**. Do not do it while the secret is
+  full-entropy.
+- **"No NodeId binding = same-LAN MITM".** MITM is already prevented by iroh:
+  the joiner dials `token.addr`, and QUIC/TLS authenticates the remote against
+  that `EndpointId`, so an interceptor cannot impersonate the host without its
+  private key.
+- **A real gap was found, and fixed.** A token made two *independent* identity
+  claims — `addr.id` (authenticated by QUIC) and `verifying_key` (trusted to
+  authenticate the host's key-log) — and nothing required them to be the same
+  device. `PairingToken::check_host_identity_is_consistent` now binds them,
+  checked before the joiner dials so a mismatched token never even receives its
+  proof-of-secret. This does not close the bearer model (whoever can swap the
+  whole token can mint a self-consistent one); it removes a confusion.
+
+**A PAKE was therefore NOT implemented.** Rewriting proven, security-critical
+pairing code and adding a crypto dependency to fix a misdiagnosed weakness would
+have been a net loss in safety.
+
+**Where a PAKE genuinely IS required — an open decision for F2(b).** The ~20-bit
+argument becomes correct the moment a *human-typed short code* exists. So the
+choice for LocalSend's ephemeral send is a product one:
+
+- **QR / copy-paste of a full-entropy secret** (what pairing does today): reuse
+  the existing, tested model. No PAKE, no new crypto dependency.
+- **A short typed code** (classic LocalSend UX): then the original advice
+  applies in full — CPace/SPAKE2 keyed by the code, a NodeId-bound
+  key-confirmation MAC, and a bounded attempt budget (safe here, because with a
+  low-entropy code the guessing risk outweighs the DoS risk).
+
+Pick the UX first; the crypto follows from it. Do not ship a short code with
+bare `sign(code)` — that part of the original warning stands.
 
 ## Feature 1 — Sub-vault granular permissions (LATER, for reference)
 

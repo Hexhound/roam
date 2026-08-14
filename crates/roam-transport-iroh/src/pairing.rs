@@ -146,6 +146,38 @@ impl PairingToken {
         B64.encode(serde_json::to_vec(self).expect("PairingToken serializes"))
     }
 
+    /// Refuse a token that names one device to TALK TO and another to TRUST.
+    ///
+    /// A token carries two independent identity claims about the host:
+    ///
+    /// * `addr.id` — the iroh `EndpointId` the joiner dials. QUIC/TLS
+    ///   authenticates this one: connecting proves the remote holds its secret
+    ///   key.
+    /// * `verifying_key` — the key the joiner later hands to `import_keylog` to
+    ///   authenticate the host's key-log.
+    ///
+    /// The host mints both from one identity (its `EndpointId` *is* its ed25519
+    /// verifying key), so honestly they are always equal. Nothing checked it,
+    /// which left the two claims free to diverge: authenticate device X on the
+    /// wire, then trust device Y's signatures. Binding them collapses that to a
+    /// single identity, fail-closed.
+    ///
+    /// This does not, and cannot, fix the bearer model — anyone who can swap
+    /// the whole token can mint a self-consistent one for a vault they control.
+    /// It removes a confusion, not the need for the token to arrive over a
+    /// trusted out-of-band channel.
+    pub fn check_host_identity_is_consistent(&self) -> Result<()> {
+        if self.addr.id.as_bytes() != &self.verifying_key {
+            bail!(
+                "pairing token names two different devices (dial target {} vs trusted key {}) \
+                 — refusing to pair",
+                self.addr.id,
+                B64.encode(self.verifying_key)
+            );
+        }
+        Ok(())
+    }
+
     /// Decode a token string (whitespace-trimmed) back into a [`PairingToken`].
     pub fn decode(s: &str) -> Result<Self> {
         let bytes = B64
@@ -492,6 +524,10 @@ async fn run_join(
         bail!("pairing token has expired — ask the other device for a fresh one");
     }
 
+    // Before dialing, so a token naming two different devices never gets our
+    // proof-of-secret either.
+    token.check_host_identity_is_consistent()?;
+
     let conn = endpoint
         .connect(token.addr.clone(), PAIRING_ALPN)
         .await
@@ -688,6 +724,54 @@ mod tests {
         assert_eq!(decoded.secret, token.secret);
         assert_eq!(decoded.addr.id, token.addr.id);
         assert_eq!(decoded.expires_at_unix_secs, token.expires_at_unix_secs);
+    }
+
+    /// A pairing token makes TWO independent identity claims about the host:
+    /// `addr.id`, which iroh's QUIC/TLS authenticates on connect, and
+    /// `verifying_key`, which the joiner later trusts to authenticate the
+    /// host's key-log. Nothing forced them to describe the same device, so a
+    /// token could name one device to talk to and a different one to trust.
+    /// They are bound now, and this asserts the mismatch is refused *before*
+    /// the joiner dials — so it never leaks its proof-of-secret either.
+    #[test]
+    fn a_token_naming_two_different_hosts_is_refused() {
+        let host = iroh::SecretKey::generate();
+        let other = Identity::generate();
+        let token = PairingToken {
+            // Talk to `host`...
+            addr: EndpointAddr::new(host.public()),
+            // ...but trust `other`'s key for the roster/key-log import.
+            verifying_key: other.verifying_key().to_bytes(),
+            peer_id: 42,
+            vault: [7u8; 32],
+            secret: [9u8; 32],
+            expires_at_unix_secs: u64::MAX,
+        };
+        let err = token
+            .check_host_identity_is_consistent()
+            .expect_err("a token naming two different hosts must be refused");
+        assert!(
+            err.to_string().contains("two different devices"),
+            "unhelpful error: {err}"
+        );
+    }
+
+    /// The honest case must still pass, or the check above would be satisfied
+    /// by refusing everything.
+    #[test]
+    fn a_token_naming_one_host_consistently_is_accepted() {
+        let host = iroh::SecretKey::generate();
+        let token = PairingToken {
+            addr: EndpointAddr::new(host.public()),
+            verifying_key: *host.public().as_bytes(),
+            peer_id: 42,
+            vault: [7u8; 32],
+            secret: [9u8; 32],
+            expires_at_unix_secs: u64::MAX,
+        };
+        token
+            .check_host_identity_is_consistent()
+            .expect("a consistent token must be accepted");
     }
 
     /// P1 (leaked-token bearer window): a pairing token carries a
