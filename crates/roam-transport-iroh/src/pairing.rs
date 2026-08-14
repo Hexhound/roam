@@ -726,6 +726,54 @@ mod tests {
         assert_eq!(decoded.expires_at_unix_secs, token.expires_at_unix_secs);
     }
 
+    /// The internet pairing flow shows this token as a QR code, so its size is
+    /// a real constraint and not just an aesthetic one: past a certain length a
+    /// QR needs so many modules that phone cameras stop reading it reliably.
+    ///
+    /// A realistic worst-case token — four direct addresses (v4 and v6) plus a
+    /// relay URL — measures ~740 bytes, which is a comfortable QR at error
+    /// correction level L. The bound below leaves headroom while still catching
+    /// a field added to `PairingToken` without thought, which would otherwise
+    /// degrade the QR silently and only show up as "scanning doesn't work".
+    #[test]
+    fn a_realistic_token_stays_small_enough_to_scan_as_a_qr_code() {
+        use iroh::TransportAddr;
+
+        /// Chosen for reliable phone scanning, not for the format's limit
+        /// (which is 2953 bytes in byte mode).
+        const QR_SAFE_MAX_BYTES: usize = 1200;
+
+        let secret = iroh::SecretKey::generate();
+        let mut addr = EndpointAddr::new(secret.public());
+        for a in [
+            "192.168.1.42:41234",
+            "10.0.0.5:41234",
+            "[fe80::1]:41234",
+            "[2001:db8::dead:beef]:41234",
+        ] {
+            addr.addrs
+                .insert(TransportAddr::Ip(a.parse::<std::net::SocketAddr>().unwrap()));
+        }
+        addr.addrs.insert(TransportAddr::Relay(
+            "https://euw1-1.relay.iroh.network./".parse().unwrap(),
+        ));
+
+        let token = PairingToken {
+            addr,
+            verifying_key: [3u8; 32],
+            peer_id: u64::MAX,
+            vault: [7u8; 32],
+            secret: [9u8; 32],
+            expires_at_unix_secs: 1_900_000_000,
+        };
+        let len = token.encode().len();
+        assert!(
+            len <= QR_SAFE_MAX_BYTES,
+            "a worst-case pairing token is {len} bytes, over the {QR_SAFE_MAX_BYTES}-byte \
+             budget for a reliably scannable QR code"
+        );
+    }
+
     /// A pairing token makes TWO independent identity claims about the host:
     /// `addr.id`, which iroh's QUIC/TLS authenticates on connect, and
     /// `verifying_key`, which the joiner later trusts to authenticate the

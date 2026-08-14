@@ -17,6 +17,7 @@ roam-transport-iroh = { path = "../roam-transport-iroh" }
 roam-files = { path = "../roam-files" }
 roam-backend-client = { path = "../roam-backend-client" }
 iroh.workspace = true
+qrcode = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "io-std", "signal"] }
 clap.workspace = true
 anyhow.workspace = true

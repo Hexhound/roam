@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/roam-crdt", "crates/roam-storage", "crates/roam-sync-core", "crates/roam-transport-iroh", "crates/roam-cli", "crates/roam-files", "crates/roam-backend-client", "crates/roam-rbsr", "crates/roam-wasm", "crates/roam-share"]
+members = ["crates/roam-crdt", "crates/roam-storage", "crates/roam-sync-core", "crates/roam-transport-iroh", "crates/roam-cli", "crates/roam-files", "crates/roam-backend-client", "crates/roam-rbsr", "crates/roam-wasm", "crates/roam-share", "crates/roam-pake"]
 
 [workspace.package]
 edition = "2021"
@@ -39,6 +39,13 @@ blake3 = "1"
 argon2 = "0.5"
 zeroize = { version = "1", features = ["derive"] }
 chacha20poly1305 = "0.10"
+# SPAKE2 for the LAN short-code pairing flow (a 6-digit code is ~20 bits, so it
+# is only safe inside a PAKE). RustCrypto/PAKEs; NOT independently audited —
+# see the roam-pake crate docs.
+spake2 = "0.4"
+# Terminal QR for the internet pairing flow. default-features off: the default
+# `image` feature drags in the whole image crate for a picture we never render.
+qrcode = { version = "0.14", default-features = false }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
 # WASM web client (F3). These are EXACT pins, not preferences: wasm-bindgen's

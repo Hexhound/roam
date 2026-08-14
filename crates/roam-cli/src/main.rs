@@ -409,6 +409,7 @@ async fn pair_token(vault: &Path, identity_path: &Path, role: &str) -> Result<()
         .await
         .context("start pairing host")?;
     println!("pairing token (share out of band):\n{token}");
+    print_pairing_qr(&token);
     print!("approve the next device that joins? [y/N] ");
     use std::io::Write;
     std::io::stdout().flush().ok();
@@ -1576,5 +1577,45 @@ mod tests {
         assert_eq!(append_position("a🌍b"), 3);
         // Empty text appends at the start.
         assert_eq!(append_position(""), 0);
+    }
+}
+
+/// Render the pairing token as a QR code for the remote/internet pairing flow —
+/// the joiner points a camera at it instead of copying 700-odd characters.
+///
+/// The token is a full-entropy bearer secret, so the QR is exactly as sensitive
+/// as the text: it must not be photographed by anyone else, and it expires with
+/// the token. (The LAN flow is the short typed code instead; see `roam-pake`.)
+///
+/// Best-effort: a token too large to encode just skips the QR rather than
+/// failing the pairing. `roam_transport_iroh::pairing` has a test keeping the
+/// token within scannable size, so this should not happen in practice.
+fn print_pairing_qr(token: &str) {
+    use qrcode::render::unicode;
+    // Error-correction L: the token is short-lived and rescannable, so maximise
+    // capacity (and keep the code physically smaller) rather than resilience.
+    match qrcode::QrCode::with_error_correction_level(token, qrcode::EcLevel::L) {
+        Ok(code) => {
+            // Dense1x2 packs two QR rows into one text row, so the result fits
+            // an ordinary terminal window.
+            let rendered = code
+                .render::<unicode::Dense1x2>()
+                .quiet_zone(true)
+                .build();
+            // A typical token renders ~85 columns wide, which WRAPS in an
+            // 80-column terminal and destroys the code — it still looks like a
+            // QR, it just will not scan. Say so rather than let the user blame
+            // their camera. Width is measured rather than assumed because it
+            // grows with the number of addresses in the token.
+            let width = rendered.lines().next().map_or(0, |l| l.chars().count());
+            println!("\nor scan:\n{rendered}");
+            println!(
+                "(needs a terminal at least {width} columns wide — if the code looks \
+                 broken it wrapped, so widen the window or use the token text above)"
+            );
+        }
+        Err(err) => {
+            eprintln!("(could not render a QR code for this token: {err})");
+        }
     }
 }

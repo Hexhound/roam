@@ -337,6 +337,51 @@ choice for LocalSend's ephemeral send is a product one:
 Pick the UX first; the crypto follows from it. Do not ship a short code with
 bare `sign(code)` — that part of the original warning stands.
 
+### DECIDED 2026-08-14: QR for internet pairing, short typed code for LAN
+
+Both are implemented.
+
+**Internet → QR of the existing full-entropy token.** No new crypto: the token
+was always a 256-bit bearer secret, and a QR is just a second way to carry the
+same base64. `roam pair-token` now prints one (`qrcode`, `default-features =
+false` — the default `image` feature pulls in the whole image crate).
+
+Two things that were measured rather than assumed:
+
+- A realistic worst-case token (4 direct addresses + a relay URL) is **~740
+  bytes**, a comfortable QR at EC level L. `pairing.rs` has a test holding it
+  under 1200 bytes, because a field added to `PairingToken` without thought
+  would otherwise degrade the QR silently — the failure mode is "scanning just
+  doesn't work", which nobody would trace back to a struct change.
+- That renders **85 columns wide**, which *wraps in an 80-column terminal* and
+  destroys the code while still looking like a QR. The CLI now prints the
+  required width alongside it.
+
+**LAN → 6-digit code over SPAKE2**, in the new `crates/roam-pake` (no roam
+dependencies, so it is unit-testable with no network and reusable by both LAN
+pairing and LocalSend share). All three legs of the original advice are there:
+SPAKE2 so a run leaks nothing about the code, both endpoint ids bound into the
+SPAKE2 identities (this is what closes same-LAN MITM), and a 3-attempt budget.
+
+The two non-obvious parts:
+
+- **An attempt is spent when a run STARTS, not when it fails.** Counting
+  failures would let an attacker guess forever by disconnecting as soon as they
+  learned the guess was wrong. There is a test for exactly this.
+- **This deliberately reverses the P2 anti-DoS trade** made for token pairing.
+  With a 256-bit secret, refusing to consume the session on failure is right;
+  with 20 bits it is not, and an attacker being able to burn the budget and
+  force a fresh code is the correct cost.
+
+Caveat recorded in the crate docs: `spake2` (RustCrypto/PAKEs) is **not
+independently audited**. It is the best-maintained Rust option and what
+magic-wormhole uses, but the composition was kept deliberately standard so
+nothing bespoke is doing security work.
+
+Still to wire: the PAKE handshake is not yet attached to an ALPN/stream, and
+`roam-share`'s frames are not yet exposed on a network. `roam-pake` is the auth
+seam both will use.
+
 ## Feature 1 — Sub-vault granular permissions (LATER, for reference)
 
 Scope primitive = path-prefix on the loro container-id string (container_id =
