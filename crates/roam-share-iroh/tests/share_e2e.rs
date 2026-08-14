@@ -7,7 +7,10 @@
 use iroh::{Endpoint, EndpointAddr};
 use roam_pake::PairingCode;
 use roam_share::{Payload, ShareOffer};
-use roam_share_iroh::{bind_share_endpoint, offer_paths, receive_share, ShareSender, SHARE_ALPN};
+use roam_share_iroh::{
+    bind_share_endpoint, offer_paths, receive_share, receive_share_with, ReceiveTimeouts,
+    ShareSender, SHARE_ALPN,
+};
 use std::path::PathBuf;
 
 async fn endpoint() -> Endpoint {
@@ -408,4 +411,61 @@ async fn junk_connections_cannot_retire_the_share_code() {
     );
 
     serve.await.unwrap().expect("sender completed");
+}
+
+/// The other half of the liveness sweep. `ShareSender` was bounded so a silent
+/// *receiver* could not park it; every read in `receive_share` stayed unbounded,
+/// so a silent *sender* parked the receiver indefinitely. The crate was only
+/// half swept, and the direction that was missed is the one an ordinary user
+/// hits: they type a code, dial, and the process sits there forever with no
+/// error and nothing to act on.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sender_that_goes_quiet_does_not_park_the_receiver_forever() {
+    let dest = tempfile::tempdir().unwrap();
+    let silent = endpoint().await;
+    let receiver_endpoint = endpoint().await;
+    let silent_addr = addr_of(&silent).await;
+
+    // A "sender" that completes the QUIC handshake, accepts the stream, and
+    // then never writes a byte. QUIC keeps the connection alive, so nothing
+    // below the application layer will ever end this.
+    tokio::spawn(async move {
+        while let Some(incoming) = silent.accept().await {
+            if let Ok(connecting) = incoming.accept() {
+                if let Ok(conn) = connecting.await {
+                    let _stream = conn.accept_bi().await;
+                    std::future::pending::<()>().await;
+                }
+            }
+        }
+    });
+
+    let code = PairingCode::generate();
+    let started = std::time::Instant::now();
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        receive_share_with(
+            &receiver_endpoint,
+            silent_addr,
+            &code,
+            dest.path(),
+            |_| true,
+            ReceiveTimeouts {
+                handshake: std::time::Duration::from_millis(300),
+                data: std::time::Duration::from_millis(300),
+            },
+        ),
+    )
+    .await
+    .expect("the receiver hung on a sender that never spoke");
+
+    assert!(
+        outcome.is_err(),
+        "a silent sender must be an error, not a successful empty transfer"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "took {:?} — that is an idle timeout, not our bound",
+        started.elapsed()
+    );
 }

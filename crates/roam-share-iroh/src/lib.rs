@@ -20,9 +20,10 @@
 //! ```text
 //!   Receiver                                Sender
 //!   --------                                ------
-//!   dial + open bi ──── PakeMsg1 ─────────▶  spends one attempt
+//!   dial + open bi ──── PakeMsg1 ─────────▶  costs nothing
 //!                  ◀─── PakeMsg2 ─────────
-//!   ─────────────────── Confirm ──────────▶  verify, else drop the connection
+//!   ─────────────────── Confirm ──────────▶  verify; a WRONG one spends an
+//!                                            attempt, else drop the connection
 //!                  ◀─── Confirm ──────────
 //!   ============ everything below is sealed under the PAKE key =============
 //!                  ◀─── Offer ────────────   what is on offer
@@ -45,7 +46,7 @@ mod send;
 mod wire;
 
 pub use endpoint::bind_share_endpoint;
-pub use receive::{receive_share, Received};
+pub use receive::{receive_share, receive_share_with, ReceiveTimeouts, Received};
 pub use send::{offer_paths, ShareSender, SourceMap};
 pub use wire::SHARE_ALPN;
 

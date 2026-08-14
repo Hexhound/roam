@@ -22,6 +22,43 @@ pub struct Received {
     pub texts: Vec<String>,
 }
 
+/// How long the receiver waits on any single read from the sender.
+///
+/// Every read here was unbounded, which made "the sender goes quiet" an
+/// indefinite park. The sender's side of this crate was bounded during the
+/// liveness audit; this half was missed, so the crate was only half swept.
+///
+/// Two values, because the two phases have genuinely different tolerances:
+/// `handshake` covers reads from a peer that has proved nothing yet, and
+/// matches the sender's own bound. `data` covers frames after the human
+/// accepted the offer, where a legitimately slow link should not be mistaken
+/// for a stall — it is per *frame*, not per transfer, so a large download is
+/// never cut off as long as it keeps moving.
+#[derive(Debug, Clone, Copy)]
+pub struct ReceiveTimeouts {
+    pub handshake: std::time::Duration,
+    pub data: std::time::Duration,
+}
+
+impl Default for ReceiveTimeouts {
+    fn default() -> Self {
+        Self {
+            handshake: std::time::Duration::from_secs(10),
+            data: std::time::Duration::from_secs(30),
+        }
+    }
+}
+
+/// [`read_frame`] under a bound, so a silent sender cannot park us forever.
+async fn bounded_read(
+    recv: &mut iroh::endpoint::RecvStream,
+    timeout: std::time::Duration,
+) -> Result<Vec<u8>> {
+    tokio::time::timeout(timeout, read_frame(recv))
+        .await
+        .context("sender went quiet")?
+}
+
 /// Dial a sender, prove the code, and accept everything on offer.
 ///
 /// `dest` must already exist. Every file lands inside it — the paths in an offer
@@ -36,6 +73,30 @@ pub async fn receive_share<F>(
     code: &PairingCode,
     dest: &Path,
     decide: F,
+) -> Result<Received>
+where
+    F: FnOnce(&ShareOffer) -> bool,
+{
+    receive_share_with(
+        endpoint,
+        sender,
+        code,
+        dest,
+        decide,
+        ReceiveTimeouts::default(),
+    )
+    .await
+}
+
+/// [`receive_share`] with explicit bounds. A test seam, so proving a silent
+/// sender is survivable does not mean sitting out the production timeout.
+pub async fn receive_share_with<F>(
+    endpoint: &Endpoint,
+    sender: EndpointAddr,
+    code: &PairingCode,
+    dest: &Path,
+    decide: F,
+    timeouts: ReceiveTimeouts,
 ) -> Result<Received>
 where
     F: FnOnce(&ShareOffer) -> bool,
@@ -55,11 +116,11 @@ where
     );
     write_frame(&mut send, &msg1).await?;
 
-    let msg2 = read_frame(&mut recv).await?;
+    let msg2 = bounded_read(&mut recv, timeouts.handshake).await?;
     let (pending, our_confirm) = initiator.accept(&msg2).map_err(anyhow::Error::from)?;
     write_frame(&mut send, &our_confirm).await?;
 
-    let their_confirm = read_frame(&mut recv).await?;
+    let their_confirm = bounded_read(&mut recv, timeouts.handshake).await?;
     let their_confirm: [u8; 32] = their_confirm
         .try_into()
         .map_err(|_| anyhow::anyhow!("malformed confirmation"))?;
@@ -67,7 +128,7 @@ where
     let (mut sealer, mut opener) = key.split(Side::Initiator);
 
     // --- authenticated; the offer is now trustworthy-ish -----------------
-    let offer = match ShareFrame::decode(&opener.open(&read_frame(&mut recv).await?)?)
+    let offer = match ShareFrame::decode(&opener.open(&bounded_read(&mut recv, timeouts.handshake).await?)?)
         .context("decode the offer")?
     {
         ShareFrame::Offer(offer) => offer,
@@ -87,7 +148,7 @@ where
         // and the sender would see a bare "connection lost" instead. Wait for
         // the sender's Done, which acknowledges the Decline arrived, then close
         // — the same direction as the success path.
-        let ack = ShareFrame::decode(&opener.open(&read_frame(&mut recv).await?)?)
+        let ack = ShareFrame::decode(&opener.open(&bounded_read(&mut recv, timeouts.handshake).await?)?)
             .context("decode the sender's acknowledgement")?;
         if !matches!(ack, ShareFrame::Done) {
             bail!("expected Done after declining, got {}", ack.kind());
@@ -109,7 +170,7 @@ where
     // complete. Bounded by the size check above.
     let mut buffers: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
     loop {
-        let frame = ShareFrame::decode(&opener.open(&read_frame(&mut recv).await?)?)
+        let frame = ShareFrame::decode(&opener.open(&bounded_read(&mut recv, timeouts.data).await?)?)
             .context("decode a share frame")?;
         match frame {
             ShareFrame::Chunk {
