@@ -44,7 +44,8 @@ async fn put_bytes(client: &reqwest::Client, url: &str, ct: Vec<u8>) -> anyhow::
     }
 }
 
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl Backend for HttpBackend {
     async fn manifest(&self, bucket: &str) -> anyhow::Result<Manifest> {
         let url = format!("{}/b/{bucket}/manifest", self.base);

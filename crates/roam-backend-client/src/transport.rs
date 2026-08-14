@@ -27,10 +27,35 @@ pub enum PutOutcome {
     Exists,
 }
 
+/// `Send + Sync` natively, no bound at all on wasm32.
+///
+/// A browser backend drives `fetch`, so it holds JS values and its futures are
+/// unavoidably `!Send` — there is no thread to send them to. Rather than weaken
+/// [`Backend`] everywhere, the bound is cfg'd: native builds keep the full
+/// guarantee (`tokio::spawn` still accepts a backend, unchanged), and only the
+/// wasm build relaxes it.
+///
+/// This works because `Backend` is only ever used through a generic parameter
+/// (`B: Backend`), never as `dyn Backend`. Supertrait bounds elaborate for type
+/// parameters, so `B: Backend` still proves `B: Send` natively. It would NOT
+/// work for a trait object: auto traits do not leak through a named supertrait
+/// onto `dyn Backend`. If a `dyn Backend` ever appears, spell the bound out
+/// there (`dyn Backend + Send + Sync`) rather than removing this.
+#[cfg(not(target_arch = "wasm32"))]
+pub trait MaybeSendSync: Send + Sync {}
+#[cfg(not(target_arch = "wasm32"))]
+impl<T: Send + Sync> MaybeSendSync for T {}
+
+#[cfg(target_arch = "wasm32")]
+pub trait MaybeSendSync {}
+#[cfg(target_arch = "wasm32")]
+impl<T> MaybeSendSync for T {}
+
 /// The backend as seen by the sync loop. Bytes are already-encrypted payloads;
 /// this layer never encrypts or decrypts.
-#[async_trait]
-pub trait Backend: Send + Sync {
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+pub trait Backend: MaybeSendSync {
     async fn manifest(&self, bucket: &str) -> anyhow::Result<Manifest>;
     async fn get_entry(&self, bucket: &str, id: &str) -> anyhow::Result<Option<Vec<u8>>>;
     async fn put_entry(&self, bucket: &str, id: &str, ct: Vec<u8>) -> anyhow::Result<PutOutcome>;
@@ -130,7 +155,8 @@ fn get(
         .and_then(|b| b.get(id).cloned())
 }
 
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl Backend for MemoryBackend {
     async fn manifest(&self, bucket: &str) -> anyhow::Result<Manifest> {
         let entry_ids = self

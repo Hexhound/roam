@@ -19,7 +19,12 @@ base64 = "0.22"
 thiserror = "1"
 proptest = "1"
 tempfile = "3"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+# NO `rt-multi-thread` here: tokio hard-errors at compile time on wasm32
+# ("Only features sync,macros,io-util,rt,time are supported on wasm"), and a
+# workspace default leaks into every crate. The browser client's dependency
+# graph must stay wasm-clean, so crates that genuinely need a multi-threaded
+# runtime (roam-cli, and dev-deps for #[tokio::test]) opt in themselves.
+tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
 async-trait = "0.1"
 futures = "0.3"
 postcard = { version = "1", default-features = false, features = ["use-std"] }
@@ -42,3 +47,6 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 wasm-bindgen = "=0.2.126"
 wasm-bindgen-test = "=0.3.76"
 js-sys = "=0.3.103"
+# Pulled in by the generated glue for every `async fn` binding. Pinned with the
+# rest: it depends on wasm-bindgen exactly.
+wasm-bindgen-futures = "=0.4.76"
