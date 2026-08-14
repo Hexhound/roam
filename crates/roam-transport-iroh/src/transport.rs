@@ -143,6 +143,26 @@ impl IrohTransport {
     fn node_key(&self, peer: u64) -> Option<[u8; 32]> {
         self.routes.lock().unwrap().get(&peer).copied()
     }
+
+    /// Tell every connected peer we are going away, then stop.
+    ///
+    /// Without this, shutdown is silent: QUIC gives a peer no "the other end is
+    /// gone" signal except a CONNECTION_CLOSE frame or a ~30-second idle
+    /// timeout, and `Drop` cannot send the former because it cannot await. Every
+    /// peer of a `roam sync` that exited would sit on a dead connection — still
+    /// listed as connected, still being written to — until the timeout expired.
+    ///
+    /// `Endpoint::close` performs the graceful shutdown that actually delivers
+    /// the close frames, so it must be awaited before the process exits. This is
+    /// the third instance of this bug in this codebase (the other two were in
+    /// the share protocol's decline and success paths); `tests/shutdown.rs`
+    /// exists to keep it from being a fourth.
+    pub async fn shutdown(&self) {
+        // Stop accepting first: a connection accepted while we are closing would
+        // be born dead and its peer would have to time it out.
+        self.accept_task.abort();
+        self.endpoint.close().await;
+    }
 }
 
 impl Drop for IrohTransport {

@@ -502,6 +502,58 @@ bounded. Left unfixed deliberately — the obvious bound on `conn.closed()` cann
 be tested without a flaky crash simulation, and untested hardening is how the
 first two shutdown bugs got in.
 
+### The audit: every "blocked on a peer that isn't coming" site
+
+Three of these in one feature meant the pattern, not the instance, was the
+problem. A sweep of every `close`/`closed`/`finish`/`accept_bi`/`read_*` call in
+`roam-transport-iroh` and `roam-share-iroh` found **four more**, in two families.
+
+**Family 1 — we went away without saying so.** QUIC's only "the other end is
+gone" signals are a CONNECTION_CLOSE frame or a ~30s idle timeout, and `Drop`
+cannot send the former because it cannot await.
+
+* `roam sync` shutdown (**the big one**). `IrohTransport` had no graceful
+  shutdown at all: `Drop` aborted the accept loop and dropped the endpoint, and
+  the CLI's Ctrl-C handler called `std::process::exit(0)`, which runs no
+  destructors anyway. **Every peer of every `roam sync` that ever exited kept a
+  dead connection — still listed as connected, still being written to — until an
+  idle timeout expired.** Fixed with `IrohTransport::shutdown()`, awaited (with a
+  5s bound) from the Ctrl-C handler. `tests/shutdown.rs` proves it: the peer's
+  `conn.closed()` must resolve within 10s. Mutating `shutdown` back to
+  abort-only fails it at exactly the bound.
+
+**Family 2 — we waited on a peer with no bound.** These are the mirror image,
+and they are *reachable by a hostile device on the LAN*, not just clumsy
+shutdown.
+
+* `roam-share-iroh` had **no timeout anywhere**, while pairing had one. Its
+  `serve_one` also treated every non-`BadCode` error as fatal — so a peer that
+  connected and said nothing didn't merely stall the sender, it **terminated the
+  share outright**. Both halves are now fixed and independently mutation-tested:
+  a `HANDSHAKE_TIMEOUT` (10s, with a test seam), and an error policy where only
+  a `LocalFailure` — a file *we* cannot read — ends the session, while anything a
+  peer can cause drops one connection and keeps listening.
+* `conn.accept_bi()` was unbounded in **both** pairing flows. `open_bi` is lazy
+  in QUIC, so a peer that connects and never writes leaves it pending forever;
+  since these accept loops are sequential, one staller blocked every real joiner
+  for the whole accept window. This is the bug the LAN stall test actually
+  caught — it was written expecting to prove the *timeout*, and failed for a
+  different reason.
+* `pairing_lan`'s handshake timeout was 30s, which is QUIC's own idle timeout and
+  therefore no bound in practice. Now 10s.
+
+Checked and deliberately left alone: `transport.rs`'s `handle_conn` reads are
+unbounded, but each runs in its own spawned task rather than a sequential loop,
+so a staller costs one task until the idle timeout reaps it rather than blocking
+anyone. Revocation's `conn.close()` flushes because the sync endpoint outlives
+it.
+
+Residual worth knowing: both accept loops are still **sequential**, so a peer
+that stalls *repeatedly* degrades service (~10s per attempt) even though it can
+never end a session or spend a guess. Fixing that properly means concurrent
+handshakes over a shared attempt budget, which is a real design change and not
+one to make without a test that can drive it.
+
 Still open: F1 (below), and the share-link half of M3, which depends on it.
 
 ## Feature 1 — Sub-vault granular permissions (LATER, for reference)

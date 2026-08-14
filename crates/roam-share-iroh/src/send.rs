@@ -8,6 +8,7 @@ use roam_pake::{PairingCode, PakeError, Responder, Side};
 use roam_share::{FileMeta, Payload, RelPath, SafeName, ShareFrame, ShareOffer};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// Where the bytes for each offered stream actually live on this machine.
 ///
@@ -106,12 +107,39 @@ fn collect_dir(
     Ok(())
 }
 
+/// A failure that is OUR fault rather than the peer's.
+///
+/// The distinction is load-bearing in [`ShareSender::serve_one`]: a peer-caused
+/// failure drops one connection and we keep listening, but retrying cannot fix
+/// a file we cannot read, so that ends the session and is reported to the user.
+#[derive(Debug)]
+struct LocalFailure(String);
+
+impl std::fmt::Display for LocalFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for LocalFailure {}
+
+/// How long one handshake read may take before the connection is abandoned.
+///
+/// `serve_one` handles connections ONE AT A TIME, so a peer that connects and
+/// then says nothing would block every legitimate receiver. Before this bound
+/// existed there was no timeout in this crate at all, and the only thing ending
+/// such a connection was QUIC's ~30s idle timeout — repeat that in a loop and
+/// no share ever completes. Generous for a human on a slow link, far below the
+/// idle timeout.
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// An armed sender: a code is showing and one receiver may claim it.
 pub struct ShareSender {
     endpoint: Endpoint,
     offer: ShareOffer,
     sources: SourceMap,
     responder: Responder,
+    handshake_timeout: Duration,
 }
 
 impl ShareSender {
@@ -125,9 +153,28 @@ impl ShareSender {
                 offer,
                 sources,
                 responder,
+                handshake_timeout: HANDSHAKE_TIMEOUT,
             },
             code,
         )
+    }
+
+    /// Override [`HANDSHAKE_TIMEOUT`]. A test seam: production callers want the
+    /// default, and tests should not sit out a ten-second stall to prove a
+    /// stall is survivable.
+    pub fn with_handshake_timeout(mut self, timeout: Duration) -> Self {
+        self.handshake_timeout = timeout;
+        self
+    }
+
+    /// Run `future` under [`Self::with_handshake_timeout`].
+    ///
+    /// Every read from an unproven peer goes through here. The outer `Result`
+    /// is the timeout, the inner one is whatever the read itself returned.
+    async fn bounded<T>(&self, future: impl std::future::Future<Output = T>) -> Result<T> {
+        tokio::time::timeout(self.handshake_timeout, future)
+            .await
+            .context("peer stalled during the share handshake")
     }
 
     /// Serve until one transfer completes or the attempt budget runs out.
@@ -158,12 +205,17 @@ impl ShareSender {
                 }
                 Err(err) => {
                     conn.close(0u32.into(), b"share rejected");
-                    // A wrong code is expected and recoverable; keep listening
-                    // while the budget lasts.
-                    if err.downcast_ref::<PakeError>() == Some(&PakeError::BadCode) {
-                        continue;
+                    // Only OUR OWN failures end the session. Everything a peer
+                    // can cause — a wrong code, a stall, a malformed frame — must
+                    // drop that one connection and leave us listening, or any
+                    // device on the network could kill a share just by
+                    // connecting and misbehaving. Previously only `BadCode` was
+                    // treated as recoverable, so a peer that connected and said
+                    // nothing terminated the sender outright.
+                    if err.downcast_ref::<LocalFailure>().is_some() {
+                        return Err(err);
                     }
-                    return Err(err);
+                    continue;
                 }
             }
         }
@@ -174,17 +226,20 @@ impl ShareSender {
         // so this is the peer's real public key, not a self-claim. Binding it
         // into the PAKE is what stops a relayed handshake.
         let receiver_id = conn.remote_id();
-        let (mut send, mut recv) = conn.accept_bi().await.context("accept share stream")?;
+        // Bounded from the very first read: a peer that connects and never opens
+        // a stream is just as effective a blocker as one that opens a stream and
+        // never writes.
+        let (mut send, mut recv) = self.bounded(conn.accept_bi()).await??;
 
         // --- authenticate before anything is revealed --------------------
-        let msg1 = read_frame(&mut recv).await?;
+        let msg1 = self.bounded(read_frame(&mut recv)).await??;
         let (pending, msg2) = self
             .responder
             .respond(*receiver_id.as_bytes(), &msg1)
             .map_err(anyhow::Error::from)?;
         write_frame(&mut send, &msg2).await?;
 
-        let confirm = read_frame(&mut recv).await?;
+        let confirm = self.bounded(read_frame(&mut recv)).await??;
         let confirm: [u8; 32] = confirm
             .try_into()
             .map_err(|_| anyhow::anyhow!("malformed confirmation"))?;
@@ -197,7 +252,7 @@ impl ShareSender {
         let offer_frame = ShareFrame::Offer(self.offer.clone());
         write_frame(&mut send, &sealer.seal(&offer_frame.encode())).await?;
 
-        let reply = ShareFrame::decode(&opener.open(&read_frame(&mut recv).await?)?)
+        let reply = ShareFrame::decode(&opener.open(&self.bounded(read_frame(&mut recv)).await??)?)
             .context("decode the receiver's reply")?;
         let accepted = match reply {
             ShareFrame::Accept { streams } => streams,
@@ -221,12 +276,15 @@ impl ShareSender {
             let stream = streams
                 .get(index as usize)
                 .with_context(|| format!("receiver accepted unknown stream {index}"))?;
-            let source = self
-                .sources
-                .get(&stream.path)
-                .with_context(|| format!("no local file backs {}", stream.path))?;
+            // These two are ours, not the peer's: the offer we built names a
+            // file we cannot produce. Another receiver would hit exactly the
+            // same wall, so `serve_one` must stop and say so rather than
+            // silently wait for someone else to connect.
+            let source = self.sources.get(&stream.path).ok_or_else(|| {
+                LocalFailure(format!("no local file backs {}", stream.path))
+            })?;
             let bytes = std::fs::read(source)
-                .with_context(|| format!("read {}", source.display()))?;
+                .map_err(|e| LocalFailure(format!("read {}: {e}", source.display())))?;
             for (chunk_index, chunk) in bytes.chunks(CHUNK_BYTES).enumerate() {
                 let frame = ShareFrame::Chunk {
                     stream: index,

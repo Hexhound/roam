@@ -273,3 +273,66 @@ async fn read_len_prefixed(recv: &mut iroh::endpoint::RecvStream) -> Option<Vec<
     recv.read_exact(&mut body).await.ok()?;
     Some(body)
 }
+
+/// A peer that connects and then says nothing must not be able to park the
+/// sender.
+///
+/// `serve_one` handles connections one at a time, and until this test there was
+/// no timeout anywhere in this crate — so a hostile device on the LAN could open
+/// a connection, send nothing, and block every legitimate receiver until QUIC's
+/// ~30s idle timeout fired. Repeat that in a loop and no share ever completes.
+/// The pairing protocol already bounded its handshake reads; this one did not.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_that_connects_and_stalls_does_not_block_a_real_receiver() {
+    let source = tempfile::tempdir().unwrap();
+    let dest = tempfile::tempdir().unwrap();
+    let file = write(source.path(), "wanted.txt", b"the real transfer");
+
+    let (offer, sources) = offer_paths("alice-laptop", &[file]).unwrap();
+    let sender_endpoint = endpoint().await;
+    let stall_endpoint = endpoint().await;
+    let receiver_endpoint = endpoint().await;
+    let sender_addr = addr_of(&sender_endpoint).await;
+
+    let (sender, code) = ShareSender::new(sender_endpoint, offer, sources);
+    // A short budget so the test does not have to sit out the production one.
+    // The bug is "no bound at all"; the exact value is policy.
+    let sender = sender.with_handshake_timeout(std::time::Duration::from_millis(300));
+    let serve = tokio::spawn(sender.serve_one());
+
+    // The staller: connect, open a stream, then go quiet forever.
+    let stall_conn = stall_endpoint
+        .connect(sender_addr.clone(), SHARE_ALPN)
+        .await
+        .expect("staller connects");
+    let _stall_stream = stall_conn.open_bi().await.unwrap();
+
+    // The real receiver must still get through, and quickly.
+    let started = std::time::Instant::now();
+    let received = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        receive_share(
+            &receiver_endpoint,
+            sender_addr,
+            &code,
+            dest.path(),
+            |_| true,
+        ),
+    )
+    .await
+    .expect("a stalled peer blocked the sender past any reasonable bound")
+    .expect("receive the share");
+
+    assert_eq!(received.files.len(), 1);
+    assert_eq!(
+        std::fs::read(dest.path().join("wanted.txt")).unwrap(),
+        b"the real transfer"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "took {:?} — the staller was still costing us an idle timeout",
+        started.elapsed()
+    );
+
+    serve.await.unwrap().expect("sender completed");
+}

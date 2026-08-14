@@ -412,7 +412,14 @@ impl PairingHost<'_> {
     /// The host half of the handshake over an accepted connection: read the
     /// join request, verify the proof, add the peer, write the accept.
     async fn handshake(&mut self, conn: &iroh::endpoint::Connection) -> Result<u64> {
-        let (mut send, mut recv) = conn.accept_bi().await.context("accept pairing bi stream")?;
+        // Bounded: `open_bi` is lazy in QUIC, so a peer that connects and never
+        // writes would leave this pending until the idle timeout, and `accept_for`
+        // serves connections one at a time — one staller would block every real
+        // joiner for the rest of the accept window.
+        let (mut send, mut recv) = tokio::time::timeout(HANDSHAKE_TIMEOUT, conn.accept_bi())
+            .await
+            .context("peer connected but never opened a pairing stream")?
+            .context("accept pairing bi stream")?;
 
         // The joiner opened the stream, so it speaks first: read its request.
         let req: JoinRequest = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_msg(&mut recv))

@@ -761,10 +761,12 @@ async fn sync(
     folder: Option<PathBuf>,
     backend: Option<String>,
 ) -> Result<()> {
+    let (engine, transport) = setup_engine(vault, identity_path).await?;
     // Honor Ctrl-C from a dedicated task so the signal interrupts even a
-    // long-running dial/scan inside the select loop (see `spawn_ctrl_c_exit`).
-    spawn_ctrl_c_exit();
-    let engine = setup_engine(vault, identity_path).await?;
+    // long-running dial/scan inside the select loop. Registered AFTER the
+    // transport exists, because a shutdown that cannot reach the transport is
+    // the silent-exit bug this is here to avoid.
+    spawn_ctrl_c_exit(transport);
     spawn_backend_sync(&engine, backend, vault)?;
     match folder {
         Some(folder) => sync_folder(engine, vault, folder).await,
@@ -838,7 +840,10 @@ fn spawn_backend_sync(
 
 /// Build the transport + engine, spawn its receive loop, and connect to every
 /// active roster peer. Shared by both the REPL and the folder-sync paths.
-async fn setup_engine(vault: &Path, identity_path: &Path) -> Result<Arc<Engine<IrohTransport>>> {
+async fn setup_engine(
+    vault: &Path,
+    identity_path: &Path,
+) -> Result<(Arc<Engine<IrohTransport>>, Arc<IrohTransport>)> {
     let identity = Identity::load(identity_path).context("load identity")?;
     let vault_id = load_vault_id(vault)?;
     let store = Store::open(vault, identity.clone()).context("open vault store")?;
@@ -863,11 +868,14 @@ async fn setup_engine(vault: &Path, identity_path: &Path) -> Result<Arc<Engine<I
     // objects served over P2P. Same key every device holds (minted at `init`,
     // received in `pair`); a missing one is a hard error — the vault can't sync.
     let vault_key = load_vault_key(vault)?;
+    // Kept as an Arc rather than moved straight into the engine so the Ctrl-C
+    // handler can call `shutdown()` on it — see `spawn_ctrl_c_exit`.
+    let transport = Arc::new(transport);
     let engine = Arc::new(Engine::new(
         identity,
         vault_id,
         store,
-        Arc::new(transport),
+        transport.clone(),
         *vault_key,
     ));
     tokio::spawn(engine.clone().run());
@@ -892,7 +900,7 @@ async fn setup_engine(vault: &Path, identity_path: &Path) -> Result<Arc<Engine<I
             }
         });
     }
-    Ok(engine)
+    Ok((engine, transport))
 }
 
 /// Reconcile the whole vault folder against the store on a blocking thread.
@@ -1255,10 +1263,16 @@ fn is_benign_scan_error(err: &FilesError) -> bool {
 /// not all wind down on drop, so `Runtime::drop` blocks and the daemon would
 /// hang after "stopping." The store is committed+persisted on every scan/apply,
 /// so a hard exit loses no state.
-fn spawn_ctrl_c_exit() {
-    tokio::spawn(async {
+fn spawn_ctrl_c_exit(transport: Arc<IrohTransport>) {
+    tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
             println!("\nstopping.");
+            // Tell the peers before going. `process::exit` runs no destructors
+            // and QUIC has no other "the other end is gone" signal, so without
+            // this every connected peer keeps a dead connection — still listed
+            // as connected, still being written to — until a ~30s idle timeout
+            // expires. Bounded so a wedged network cannot hold Ctrl-C hostage.
+            let _ = tokio::time::timeout(Duration::from_secs(5), transport.shutdown()).await;
             std::process::exit(0);
         }
     });

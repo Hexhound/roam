@@ -259,3 +259,69 @@ async fn a_joiner_cannot_enrol_a_key_that_is_not_its_own() {
     );
     drop(host_state.store_dir);
 }
+
+/// The pairing equivalent of `roam-share-iroh`'s stalled-peer test.
+///
+/// `accept_for` serves connections one at a time, so a device that connects and
+/// then says nothing occupies the host for a whole handshake timeout. That must
+/// cost time and nothing else: the code must survive, the session must survive,
+/// and a real joiner behind the staller must still get through.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_that_connects_and_stalls_does_not_block_a_real_joiner() {
+    use roam_transport_iroh::PAIRING_LAN_ALPN;
+
+    let (host_state, mut store_a) = found();
+    let joiner_identity = Identity::generate();
+    let joiner_dir = tempdir().unwrap();
+
+    let (code, host) = host_lan_pairing(
+        &host_state.identity,
+        host_state.vault,
+        host_state.vault_key,
+        Role::Writer,
+        &mut store_a,
+    )
+    .await
+    .expect("arm the LAN pairing host");
+    // Short, so the test does not sit out the production bound. The bug this
+    // guards is "a staller ends the session"; the duration is policy.
+    let host = host.with_handshake_timeout(Duration::from_millis(300));
+    let host_addr = host.addr();
+
+    // `accept_for` borrows the store, so it cannot be spawned — run the host and
+    // the two clients concurrently on this task. The host must already be
+    // accepting before anyone dials.
+    let clients = async {
+        // A device that connects, opens a stream, and then goes quiet forever.
+        let staller = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .bind()
+            .await
+            .unwrap();
+        let stall_conn = staller
+            .connect(host_addr.clone(), PAIRING_LAN_ALPN)
+            .await
+            .expect("staller connects");
+        let _stall_stream = stall_conn.open_bi().await.unwrap();
+
+        join_lan_pairing(
+            joiner_identity.clone(),
+            joiner_dir.path().to_path_buf(),
+            host_addr,
+            code,
+        )
+        .await
+    };
+
+    let (added, joined) = tokio::time::timeout(
+        PAIR_TIMEOUT,
+        futures::future::join(host.accept_for(Duration::from_secs(20)), clients),
+    )
+    .await
+    .expect("host did not hang");
+
+    let added = added.expect("a stalled peer ended the pairing session");
+    assert_eq!(added, joiner_identity.peer_id());
+    let joined = joined.expect("the real joiner still got through");
+    assert_eq!(*joined.vault_key, host_state.vault_key);
+    drop(host_state.store_dir);
+}

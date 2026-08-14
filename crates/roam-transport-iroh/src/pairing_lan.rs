@@ -77,9 +77,15 @@ use crate::pairing::JoinAccept;
 /// reverse — the two have different authentication and different guarantees.
 pub const PAIRING_LAN_ALPN: &[u8] = b"roam/pair-lan/1";
 
-/// How long one handshake half may take before we abandon it. A peer that
-/// connects and stalls must not park the host holding a live code.
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long one handshake read may take before we abandon that connection.
+///
+/// `accept_for` serves connections ONE AT A TIME, so this is also how long a
+/// peer that connects and then says nothing can block a legitimate joiner. It
+/// was 30s, which is QUIC's own idle timeout and therefore no bound at all in
+/// practice; 10s still covers a human on a slow link while cutting what a
+/// staller can waste. `accept_for` already keeps listening after a failed
+/// connection, so a staller costs time, never the session.
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Bounded wait for a direct address before publishing one for discovery.
 const ADDR_READY_TIMEOUT: Duration = Duration::from_secs(8);
@@ -129,6 +135,7 @@ pub struct LanPairingHost<'a> {
     /// Held, not used: the mDNS browser stops announcing the moment it drops, so
     /// the host must own it for as long as the code is showing.
     mdns: Option<crate::discovery::LanDiscovery>,
+    handshake_timeout: Duration,
 }
 
 impl Drop for LanPairingHost<'_> {
@@ -172,6 +179,7 @@ pub async fn host_lan_pairing<'a>(
             role,
             store,
             mdns: None,
+            handshake_timeout: HANDSHAKE_TIMEOUT,
         },
     ))
 }
@@ -201,6 +209,13 @@ impl LanPairingHost<'_> {
         crate::discovery::advertise_name(&self.endpoint, name)?;
         self.mdns = Some(mdns);
         Ok(())
+    }
+
+    /// Override [`HANDSHAKE_TIMEOUT`]. A test seam, so proving that a stalled
+    /// peer is survivable does not require sitting out the production bound.
+    pub fn with_handshake_timeout(mut self, timeout: Duration) -> Self {
+        self.handshake_timeout = timeout;
+        self
     }
 
     /// The code's remaining guess budget. Reaches zero and the code is dead.
@@ -274,20 +289,24 @@ impl LanPairingHost<'_> {
         // iroh authenticated this during the QUIC handshake: it is the peer's
         // real public key, not a self-claim.
         let joiner_id = conn.remote_id();
-        let (mut send, mut recv) = conn
-            .accept_bi()
+        // Bounded like every other read here: `open_bi` is lazy in QUIC, so a peer
+        // that connects and never writes leaves this pending forever. Unbounded,
+        // it parked the host on the FIRST stalled connection and no later joiner
+        // was ever accepted.
+        let (mut send, mut recv) = tokio::time::timeout(self.handshake_timeout, conn.accept_bi())
             .await
+            .context("peer connected but never opened a pairing stream")?
             .context("accept LAN pairing bi stream")?;
 
         // --- prove the code before anything is revealed ------------------
-        let msg1 = timeout_read(&mut recv).await?;
+        let msg1 = timeout_read(&mut recv, self.handshake_timeout).await?;
         let (pending, msg2) = self
             .responder
             .respond(*joiner_id.as_bytes(), &msg1)
             .map_err(anyhow::Error::from)?;
         write_frame(&mut send, &msg2).await?;
 
-        let their_confirm: [u8; 32] = timeout_read(&mut recv)
+        let their_confirm: [u8; 32] = timeout_read(&mut recv, self.handshake_timeout)
             .await?
             .try_into()
             .map_err(|_| anyhow::anyhow!("malformed confirmation"))?;
@@ -297,7 +316,7 @@ impl LanPairingHost<'_> {
 
         // --- authenticated; the joiner may now name itself ---------------
         let request: LanJoinRequest =
-            serde_json::from_slice(&opener.open(&timeout_read(&mut recv).await?)?)
+            serde_json::from_slice(&opener.open(&timeout_read(&mut recv, self.handshake_timeout).await?)?)
                 .context("decode the joiner's request")?;
 
         // IDENTITY BINDING: the code proves this connection knows six digits,
@@ -475,11 +494,11 @@ async fn run_lan_join(
     );
     write_frame(&mut send, &msg1).await?;
 
-    let msg2 = timeout_read(&mut recv).await?;
+    let msg2 = timeout_read(&mut recv, HANDSHAKE_TIMEOUT).await?;
     let (pending, our_confirm) = initiator.accept(&msg2).map_err(anyhow::Error::from)?;
     write_frame(&mut send, &our_confirm).await?;
 
-    let their_confirm: [u8; 32] = timeout_read(&mut recv)
+    let their_confirm: [u8; 32] = timeout_read(&mut recv, HANDSHAKE_TIMEOUT)
         .await?
         .try_into()
         .map_err(|_| anyhow::anyhow!("malformed confirmation"))?;
@@ -498,7 +517,7 @@ async fn run_lan_join(
     write_frame(&mut send, &sealer.seal(&request)).await?;
 
     let mut accept: JoinAccept =
-        serde_json::from_slice(&opener.open(&timeout_read(&mut recv).await?)?)
+        serde_json::from_slice(&opener.open(&timeout_read(&mut recv, HANDSHAKE_TIMEOUT).await?)?)
             .context("decode the host's accept")?;
 
     // Same import order as the token flow: pin the founder first so the roster
@@ -582,8 +601,11 @@ async fn read_frame(recv: &mut iroh::endpoint::RecvStream) -> Result<Vec<u8>> {
 
 /// [`read_frame`] under [`HANDSHAKE_TIMEOUT`], so a peer that connects and then
 /// goes quiet cannot pin either side open.
-async fn timeout_read(recv: &mut iroh::endpoint::RecvStream) -> Result<Vec<u8>> {
-    tokio::time::timeout(HANDSHAKE_TIMEOUT, read_frame(recv))
+async fn timeout_read(
+    recv: &mut iroh::endpoint::RecvStream,
+    timeout: Duration,
+) -> Result<Vec<u8>> {
+    tokio::time::timeout(timeout, read_frame(recv))
         .await
         .context("timed out reading a pairing frame")?
 }
