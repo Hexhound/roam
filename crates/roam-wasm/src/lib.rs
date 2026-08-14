@@ -9,8 +9,14 @@
 //!   interesting can only be tested through a browser.
 
 mod doc;
+mod vault;
 
 pub use doc::Doc;
+pub use vault::Vault;
 
 #[cfg(target_arch = "wasm32")]
 mod bindings;
+
+// Test double for the node acceptance harness; never in a shipped build.
+#[cfg(all(target_arch = "wasm32", feature = "test-relay"))]
+mod relay;

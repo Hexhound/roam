@@ -16,6 +16,12 @@ mkdir -p "$TMPDIR"
 
 # --target nodejs: CommonJS glue that `node` can require directly, no bundler.
 # --dev: skip wasm-opt; this is a correctness harness, not a size benchmark.
-wasm-pack build "$crate_dir" --target nodejs --dev --out-dir "$crate_dir/pkg"
+# --features test-relay: exports the MemoryBackend-backed relay that sync.mjs
+#   serves over HTTP. Off in a shipped build (see Cargo.toml).
+#
+# NOTE --out-dir is resolved relative to the crate dir by wasm-pack, so it must
+# be a bare name here, not an absolute path.
+wasm-pack build "$crate_dir" --target nodejs --dev --out-dir pkg --features test-relay
 
 node "$crate_dir/tests/js/interop.mjs"
+node "$crate_dir/tests/js/sync.mjs"

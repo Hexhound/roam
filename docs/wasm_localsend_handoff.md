@@ -118,7 +118,8 @@ founder / snapshot / roster + `truncate_leading_lines` (store.rs:1841).
 Pure refactor → write characterization / golden-byte tests FIRST (all ~150
 storage tests must stay green), one module per commit.
 
-**M3.** Browser transport via the backend relay (the `Backend` trait is already
+**M3 — DONE for transport; see the "M3 status" section below.** Original plan:
+Browser transport via the backend relay (the `Backend` trait is already
 the seam, `roam-backend-client/src/transport.rs:33`; drop rustls-tls, use
 `fetch`) + `roam-sync-core` drop `tokio` `rt-multi-thread`. SECURITY: keys are
 XSS-exposed in a browser — OPFS + session-derive, never persist the root secret.
@@ -210,6 +211,65 @@ key.
 So the vault core is done; what remains is a product question (does the web
 client mirror a folder?) rather than a mechanical one.
 
+## M3 status — browser transport (TRANSPORT DONE, share-link deliberately NOT)
+
+A wasm vault syncs end-to-end through the relay over `fetch`, proven in a JS
+runtime. `crates/roam-wasm` now exposes `Vault` (storage on `VaultFs`, sync via
+`Backend`) alongside the M1 `Doc`.
+
+**Four findings worth not rediscovering:**
+
+1. **`SystemTime::now()` TRAPS on wasm32** — `RuntimeError: unreachable`, not a
+   wrong value. Confirmed empirically. `cargo check` cannot see it, and neither
+   could the first version of the JS harness, because the only call sites are in
+   `Store::write_snapshot` (history marker) and snapshot production. All
+   wall-clock reads now go through `roam_storage::wallclock::now_ms`
+   (`Date.now()` on wasm32). The harness gained a `writeSnapshot` check
+   *specifically* to cover this — verified by reintroducing the trap and
+   watching it fail. Do not delete that check.
+2. **`reqwest` needs no replacement.** On wasm32 reqwest 0.12.28 compiles to a
+   `fetch` client with no TLS stack, and its fallback path is a bare global
+   `fetch(request)` — so it works in a Window, in a **Web Worker** (which is
+   where M2 requires roam to run), and in node. `HttpBackend` is unchanged and
+   is now the browser's backend too: ONE implementation, not two.
+3. **`tokio`'s `rt-multi-thread` cannot be a workspace default.** tokio
+   hard-errors on wasm32 for any feature outside `sync,macros,io-util,rt,time`,
+   and a workspace default leaks into every crate. Workspace tokio is now
+   `["rt","macros","sync","time"]`; roam-cli and dev-deps opt in themselves.
+4. **`Backend`'s `Send` bound is cfg'd, not removed.** A fetch backend holds JS
+   values, so its futures are irreducibly `!Send`. Native builds keep the full
+   `Send + Sync` guarantee via the `MaybeSendSync` supertrait; only wasm relaxes
+   it. This is sound ONLY because `Backend` is always used as `B: Backend`
+   (supertrait bounds elaborate for type parameters) and never as `dyn Backend`
+   (auto traits do NOT leak onto a trait object through a named supertrait). If
+   a `dyn Backend` ever appears, spell out `dyn Backend + Send + Sync` there.
+
+**Tests.** `crates/roam-wasm/tests/vault_sync.rs` (3 native, against
+`MemoryBackend`) holds the logic; `tests/js/sync.mjs` (6 checks, run by
+`tests/js/run.sh`) proves real HTTP in a real JS runtime. Every assertion in both
+was mutation-checked. The JS relay is `TestRelay`, a `#[wasm_bindgen]` wrapper
+over the already-tested `MemoryBackend`, behind the `test-relay` cargo feature so
+the shipped artifact cannot contain it — writing a JS negentropy server would
+have meant debugging the harness instead of the client. The real Elixir backend
+stays covered by `roam-backend-client/tests/e2e_backend.rs`; the two are
+complementary.
+
+### What M3 deliberately does NOT include
+
+- **No share link, and no key persistence.** The URL-fragment share flow still
+  depends on **F1 read-scoping**: without a reader-scoped key there is nothing to
+  put in a fragment except the vault key, and a leaked link would be a
+  whole-vault compromise. `Vault` therefore exposes no link helper, and the
+  binding's doc comment says why. Unchanged from the original plan — this was
+  always gated on F1.
+- **Storage is `MemFs`, so a browser vault dies with the tab.** Durability needs
+  an OPFS `VaultFs`. Note one thing M2 did not have to face: `VaultFs: Send +
+  Sync`, and OPFS sync access handles are JS values. Either wrap them (sound on
+  wasm32 — no threads) or cfg the bound as `Backend` now does. `Vault::open`
+  already takes the backend as an argument so the swap is one line.
+- **No `roam-files`**, so no folder mirroring in the browser (18 fs sites,
+  still a product question — see "What M2 does NOT cover").
+
 ## Feature 2 — LocalSend share (share, NOT sync)
 
 LocalSend is a **share** app, not sync — needs NONE of the vault / roster / CRDT
@@ -282,9 +342,11 @@ content as path-keyed loro containers.
 2. ~~Run the loro-wasm32 probe; record pass/fail.~~ **DONE — GREEN** (see STATUS).
 3. ~~Scaffold `crates/roam-wasm`, TDD native fixture then JS interop.~~
    **DONE — M1 COMPLETE** (see STATUS).
-4. **M2 IN PROGRESS** — `VaultFs` extraction. Safety net + trait + 4 of 10
-   modules done; see "M2 status" below.
-5. Then F2 LocalSend parts (a)+(b), PAKE-first for the code auth.
+4. ~~M2 — `VaultFs` extraction.~~ **DONE** (see "M2 status").
+5. ~~M3 — browser transport.~~ **DONE for transport** (see "M3 status"); the
+   share-link half remains gated on F1 read-scoping, as originally planned.
+6. Next: F2 LocalSend parts (a)+(b), PAKE-first for the code auth. The other
+   open threads are an OPFS `VaultFs` (durability in the browser) and F1.
 
 Note on M3 (browser transport), confirmed by reading
 `roam-backend-client/src/transport.rs`: the `Backend` trait is a clean
