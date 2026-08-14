@@ -4,19 +4,30 @@
 //! `presets::Minimal` throughout — no relay, no pkarr, no DNS. Everything here
 //! happens over loopback, which is what a LAN share has to work on.
 
-use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr};
 use roam_pake::PairingCode;
 use roam_share::{Payload, ShareOffer};
-use roam_share_iroh::{offer_paths, receive_share, ShareSender, SHARE_ALPN};
+use roam_share_iroh::{bind_share_endpoint, offer_paths, receive_share, ShareSender, SHARE_ALPN};
 use std::path::PathBuf;
 
 async fn endpoint() -> Endpoint {
-    Endpoint::builder(presets::Minimal)
-        .alpns(vec![SHARE_ALPN.to_vec()])
-        .bind()
-        .await
-        .expect("bind share endpoint")
+    // Deliberately the real production binder, so every test below also covers
+    // that it binds the right ALPN and preset.
+    bind_share_endpoint().await.expect("bind share endpoint")
+}
+
+/// A share is announced to everyone on the LAN. If it ran under the device's
+/// long-term key, the endpoint id — which *is* that key — would be a stable
+/// identifier broadcast on every network the device ever shares from.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_share_gets_a_fresh_identity() {
+    let first = endpoint().await;
+    let second = endpoint().await;
+    assert_ne!(
+        first.id(),
+        second.id(),
+        "two shares reused one identity — that is a device fingerprint"
+    );
 }
 
 /// Loopback address for a bound endpoint. Discovery is out of scope here; on a

@@ -99,6 +99,23 @@ struct LanJoinRequest {
     peer_id: u64,
 }
 
+/// What a joiner walks away with.
+///
+/// A struct rather than a tuple because the caller has to persist most of it
+/// (`<vault>/vault-id`, `<vault>/vault-key`) and a four-tuple of two 32-byte
+/// blobs and a u64 is exactly the shape that gets silently mis-ordered.
+pub struct LanJoined {
+    /// The joiner's store, with the host's roster and key-log already imported.
+    pub store: Store,
+    /// The vault just joined. Learned from the accept — the code named no vault,
+    /// so a caller that knows which vault it *meant* to join should check this.
+    pub vault: VaultId,
+    /// The shared backend decryption secret, wiped when this drops.
+    pub vault_key: zeroize::Zeroizing<[u8; 32]>,
+    /// The pinned founder's peer id (already written to the store).
+    pub founder: u64,
+}
+
 /// The armed host: a code is showing and one device may claim it.
 pub struct LanPairingHost<'a> {
     endpoint: Endpoint,
@@ -338,7 +355,7 @@ pub async fn join_lan_pairing(
     vault_root: PathBuf,
     host: EndpointAddr,
     code: PairingCode,
-) -> Result<(Store, zeroize::Zeroizing<[u8; 32]>, u64)> {
+) -> Result<LanJoined> {
     join_lan_pairing_inner(identity, vault_root, host, code, false, None).await
 }
 
@@ -352,7 +369,7 @@ pub async fn join_lan_pairing_by_id(
     vault_root: PathBuf,
     host_id: iroh::EndpointId,
     code: PairingCode,
-) -> Result<(Store, zeroize::Zeroizing<[u8; 32]>, u64)> {
+) -> Result<LanJoined> {
     join_lan_pairing_inner(
         identity,
         vault_root,
@@ -381,7 +398,7 @@ pub mod testing {
         code: PairingCode,
         claimed_key: [u8; 32],
         claimed_peer_id: u64,
-    ) -> Result<(Store, zeroize::Zeroizing<[u8; 32]>, u64)> {
+    ) -> Result<LanJoined> {
         join_lan_pairing_inner(
             identity,
             vault_root,
@@ -401,7 +418,7 @@ async fn join_lan_pairing_inner(
     code: PairingCode,
     resolve_over_mdns: bool,
     claim_instead: Option<([u8; 32], u64)>,
-) -> Result<(Store, zeroize::Zeroizing<[u8; 32]>, u64)> {
+) -> Result<LanJoined> {
     let mut store =
         Store::open(&vault_root, identity.clone()).context("open joiner store for LAN pairing")?;
     let endpoint = bind_lan_endpoint(&identity)
@@ -416,8 +433,13 @@ async fn join_lan_pairing_inner(
     };
     let result = run_lan_join(&endpoint, &identity, host, &code, claim_instead, &mut store).await;
     endpoint.close().await;
-    let (vault_key, founder) = result?;
-    Ok((store, vault_key, founder))
+    let (vault, vault_key, founder) = result?;
+    Ok(LanJoined {
+        store,
+        vault,
+        vault_key,
+        founder,
+    })
 }
 
 async fn run_lan_join(
@@ -427,7 +449,7 @@ async fn run_lan_join(
     code: &PairingCode,
     claim_instead: Option<([u8; 32], u64)>,
     store: &mut Store,
-) -> Result<(zeroize::Zeroizing<[u8; 32]>, u64)> {
+) -> Result<(VaultId, zeroize::Zeroizing<[u8; 32]>, u64)> {
     // The host's long-term key IS the endpoint id we are about to dial, and QUIC
     // authenticates that id. So unlike the token flow — where two independent
     // fields could name two different devices — there is nothing here to
@@ -498,7 +520,11 @@ async fn run_lan_join(
     }
 
     conn.close(0u32.into(), b"paired");
-    Ok((zeroize::Zeroizing::new(accept.vault_key), accept.founder))
+    Ok((
+        VaultId(accept.vault),
+        zeroize::Zeroizing::new(accept.vault_key),
+        accept.founder,
+    ))
 }
 
 /// A one-shot endpoint for LAN pairing.

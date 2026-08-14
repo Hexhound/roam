@@ -77,15 +77,20 @@ async fn typing_the_right_code_joins_the_vault_with_key_role_and_founder() {
         .expect("host accepted the join");
     assert_eq!(added, joiner_identity.peer_id());
 
-    let (store_b, vault_key_b, founder) = tokio::time::timeout(PAIR_TIMEOUT, join)
+    let joined = tokio::time::timeout(PAIR_TIMEOUT, join)
         .await
         .expect("joiner did not time out")
         .expect("join task did not panic")
         .expect("join succeeded");
+    let store_b = joined.store;
 
     // Everything the token flow delivers, delivered here over the PAKE channel.
-    assert_eq!(*vault_key_b, host_state.vault_key);
-    assert_eq!(founder, host_state.identity.peer_id());
+    assert_eq!(*joined.vault_key, host_state.vault_key);
+    assert_eq!(joined.founder, host_state.identity.peer_id());
+    assert_eq!(
+        joined.vault, host_state.vault,
+        "joiner learned which vault it joined"
+    );
     assert_eq!(
         store_a.role_of(joiner_identity.peer_id()),
         Some(Role::Writer),

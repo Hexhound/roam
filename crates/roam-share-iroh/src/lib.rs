@@ -39,10 +39,12 @@
 //! `roam-storage` or `roam-sync-core`. A share is a one-shot transfer between
 //! devices that may never meet again, and it must not be able to touch a vault.
 
+mod endpoint;
 mod receive;
 mod send;
 mod wire;
 
+pub use endpoint::bind_share_endpoint;
 pub use receive::{receive_share, Received};
 pub use send::{offer_paths, ShareSender, SourceMap};
 pub use wire::SHARE_ALPN;

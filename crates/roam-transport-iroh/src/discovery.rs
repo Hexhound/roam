@@ -131,6 +131,25 @@ impl LanDiscovery {
     }
 }
 
+/// Look at who is on the network, without joining it in any sense.
+///
+/// Binds a throwaway endpoint under a **fresh random key**, browses for
+/// `window`, and closes. Nothing about this device is published — not its
+/// long-term identity, not a name, not even a stable id across two calls — so
+/// "who is nearby?" costs the asker no privacy.
+pub async fn browse_lan(window: Duration) -> Result<Vec<LanPeer>> {
+    let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+        .secret_key(iroh::SecretKey::generate())
+        .bind()
+        .await
+        .context("bind a throwaway endpoint to browse the LAN")?;
+    let discovery = LanDiscovery::attach(&endpoint, false)?;
+    let peers = discovery.peers(window).await;
+    drop(discovery);
+    endpoint.close().await;
+    Ok(peers)
+}
+
 /// Publish a display name alongside this device's mDNS announcements.
 ///
 /// Broadcast in cleartext to everyone on the network, so it must not contain

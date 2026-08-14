@@ -120,3 +120,58 @@ async fn devices_on_irohs_default_service_are_not_seen_as_roam_peers() {
          (roam advertises under `{ROAM_MDNS_SERVICE}`)"
     );
 }
+
+/// F2(c) over the real network: the joiner is given nothing but the host's
+/// endpoint id — no address — and has to find it by multicast.
+///
+/// The unit-level LAN pairing tests in `lan_pairing.rs` hand the joiner a
+/// loopback `EndpointAddr`, which sidesteps discovery entirely. This is the only
+/// test that covers `join_lan_pairing_by_id` resolving an id to an address, and
+/// it needs real multicast, hence `#[ignore]`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs real multicast on the local network; run with --ignored"]
+async fn a_device_pairs_over_the_lan_knowing_only_the_host_id() {
+    use roam_storage::{Identity, Role, Store, VaultId};
+    use roam_transport_iroh::pairing_lan::{host_lan_pairing, join_lan_pairing_by_id};
+
+    let host_identity = Identity::generate();
+    let joiner_identity = Identity::generate();
+    let host_dir = tempfile::tempdir().unwrap();
+    let joiner_dir = tempfile::tempdir().unwrap();
+    let vault = VaultId::generate();
+    let vault_key = [0x5au8; 32];
+
+    let mut host_store = Store::open(host_dir.path(), host_identity.clone()).unwrap();
+    host_store.declare_founder(Role::Admin).unwrap();
+
+    let (code, mut host) = host_lan_pairing(
+        &host_identity,
+        vault,
+        vault_key,
+        Role::Writer,
+        &mut host_store,
+    )
+    .await
+    .expect("arm the host");
+    host.advertise_on_lan(Some("host-laptop"))
+        .expect("announce on the LAN");
+    let host_id = host.endpoint_id();
+
+    let join = tokio::spawn(join_lan_pairing_by_id(
+        joiner_identity.clone(),
+        joiner_dir.path().to_path_buf(),
+        host_id,
+        code,
+    ));
+
+    let added = tokio::time::timeout(Duration::from_secs(30), host.accept_auto())
+        .await
+        .expect("host did not hang")
+        .expect("host accepted the join");
+    assert_eq!(added, joiner_identity.peer_id());
+
+    let joined = join.await.unwrap().expect("joiner paired over mDNS alone");
+    assert_eq!(*joined.vault_key, vault_key);
+    assert_eq!(joined.vault, vault);
+}
+

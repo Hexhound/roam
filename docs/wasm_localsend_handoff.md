@@ -416,9 +416,60 @@ reordering and reflection all fail to open. Sending symlinks is refused rather
 than followed — otherwise "share this folder" could exfiltrate anything the
 sender can read.
 
-Still open: nothing wires the share into the CLI yet, and LAN pairing *into a
-vault* (F2c) still uses the token flow rather than the short code — `roam-pake`
-is ready for it.
+### F2(c) COMPLETE — LAN pairing into a vault with a typed code
+
+`crates/roam-transport-iroh/src/pairing_lan.rs`, ALPN `roam/pair-lan/1`. The host
+shows six digits; the joiner types them; the vault key, transitive roster,
+key-log and founder pin travel over the SPAKE2 session key. Everything the token
+flow delivers, with the bearer proof replaced by a PAKE.
+
+Three things bind the exchange to the right devices:
+
+1. the human reading the code off the intended screen,
+2. the endpoint ids, bound into the SPAKE2 run as its identity strings,
+3. **a check that the key a joiner claims equals the endpoint id iroh already
+   authenticated.** Proving the code proves only that *this connection* knows six
+   digits, not which long-term identity is behind it. Without (3), a joiner shown
+   a legitimate code could enrol a third party's key into the host's roster. That
+   is `a_joiner_cannot_enrol_a_key_that_is_not_its_own`, mutation-verified.
+
+Deliberately unlike the token flow, the accept loop is **bounded in attempts**.
+The token flow's loop is unbounded on purpose (P2: a hostile first connection
+must not burn a 256-bit single-use secret). An unbounded loop around six digits
+would be a brute-force oracle instead. Same code shape, opposite correct answer,
+because the secret's entropy differs by 236 bits.
+
+**No vault cross-check, and this is a real difference.** The token names the
+vault out of band, so the joiner can catch a host that answers with a different
+one. A code names nothing — the joiner learns the vault *from* the accept.
+`LanJoined` therefore returns the vault id so a caller that knows which vault it
+meant to join can check; this layer has nothing to check against.
+
+### F2 CLI — `roam share` / `roam receive`, `roam pair-lan` / `roam join-lan`
+
+`roam share <paths>` prints a device id and six digits and waits;
+`roam receive --from <id> --code <digits> --into <dir>` shows the offer, asks,
+and writes. `roam lan-peers` lists who is announcing. Covered end-to-end by
+`crates/roam-cli/tests/share_cli_e2e.rs`, which runs two real processes and
+passes nothing between them but those two printed lines.
+
+Two privacy decisions live in the CLI layer:
+
+* A share binds a **fresh random key** per run (`bind_share_endpoint`), so
+  announcing it on mDNS does not broadcast a stable device identifier. Pairing
+  cannot do this — it must use the device identity — so `pair-lan` advertises
+  only while the code is up, and stops when the host drops.
+* `browse_lan` (behind `roam lan-peers`) binds a throwaway endpoint and
+  publishes nothing. Asking who is nearby costs the asker no privacy.
+
+`pair-lan` deliberately has **no y/N prompt**, unlike `pair-token`: typing the
+code is the approval, and a second confirmation would only train the user to
+accept a dialog they did not read.
+
+The LAN-facing tests (`lan_discovery.rs`, `share_cli_e2e.rs`) are `#[ignore]`d
+because they need real multicast; they pass here with `--ignored`.
+
+Still open: F1 (below), and the share-link half of M3, which depends on it.
 
 ## Feature 1 — Sub-vault granular permissions (LATER, for reference)
 

@@ -17,6 +17,10 @@ use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use roam_files::{FilesError, FolderBridge, GcContext, SyncOutcome};
 use roam_storage::{Identity, PeerStatus, Role, Store, VaultId};
 use roam_sync_core::engine::Engine;
+use roam_pake::PairingCode;
+use roam_share_iroh::{bind_share_endpoint, offer_paths, receive_share, ShareSender};
+use roam_transport_iroh::discovery::{browse_lan, LanDiscovery};
+use roam_transport_iroh::pairing_lan::{host_lan_pairing, join_lan_pairing_by_id};
 use roam_transport_iroh::{host_pairing, join_pairing, IrohTransport, PairingToken};
 use tokio::io::{AsyncBufReadExt, BufReader, Lines, Stdin};
 use tokio::sync::mpsc;
@@ -59,6 +63,72 @@ enum Command {
         /// Role to grant the invitee (chosen by the host): reader|writer|admin.
         #[arg(long, default_value = "admin")]
         role: String,
+    },
+    /// Host a LAN pairing: show a six-digit code and wait for one nearby device
+    /// to type it.
+    ///
+    /// Unlike `pair-token`, nothing has to travel out of band except the six
+    /// digits the other person reads off this screen. A wrong code costs one of
+    /// three attempts and then the code is dead — show a fresh one.
+    PairLan {
+        #[arg(long)]
+        vault: PathBuf,
+        #[arg(long)]
+        identity: PathBuf,
+        /// Role to grant the invitee: reader|writer|admin.
+        #[arg(long, default_value = "admin")]
+        role: String,
+        /// Name shown to nearby devices while the code is up. Broadcast in
+        /// cleartext to everyone on the network, so keep it unremarkable.
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Join a vault over the LAN by typing the code shown on the other device.
+    JoinLan {
+        #[arg(long)]
+        vault: PathBuf,
+        #[arg(long)]
+        identity: PathBuf,
+        /// The host's device id, as printed by `roam pair-lan` (or `lan-peers`).
+        #[arg(long)]
+        host: String,
+        /// The six digits shown on the host.
+        #[arg(long)]
+        code: String,
+    },
+    /// List roam devices announcing themselves on this network.
+    ///
+    /// Browses passively: this device publishes nothing while listening.
+    LanPeers {
+        /// How long to listen. mDNS is announcement-driven, so this always waits
+        /// the full window rather than returning at the first answer.
+        #[arg(long, default_value = "5")]
+        seconds: u64,
+    },
+    /// Send files or folders to a nearby device. Does NOT touch a vault.
+    ///
+    /// The transfer runs under a throwaway identity and is authenticated only by
+    /// the six-digit code printed here. Nothing about the files — not even their
+    /// names — goes on the wire before the receiver proves that code.
+    Share {
+        /// Files and/or folders to send.
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+        /// Name the receiver sees as the sender.
+        #[arg(long, default_value = "roam")]
+        from: String,
+    },
+    /// Receive a share from a nearby device.
+    Receive {
+        /// The sender's share id, as printed by `roam share`.
+        #[arg(long)]
+        from: String,
+        /// The six digits shown on the sender.
+        #[arg(long)]
+        code: String,
+        /// Existing directory to write into.
+        #[arg(long)]
+        into: PathBuf,
     },
     /// Join another vault using a pairing token.
     Pair {
@@ -231,6 +301,21 @@ async fn main() -> Result<()> {
             identity,
             role,
         } => pair_token(&vault, &identity, &role).await,
+        Command::PairLan {
+            vault,
+            identity,
+            role,
+            name,
+        } => pair_lan(&vault, &identity, &role, name.as_deref()).await,
+        Command::JoinLan {
+            vault,
+            identity,
+            host,
+            code,
+        } => join_lan(&vault, &identity, &host, &code).await,
+        Command::LanPeers { seconds } => lan_peers(seconds).await,
+        Command::Share { paths, from } => share(&paths, &from).await,
+        Command::Receive { from, code, into } => receive(&from, &code, &into).await,
         Command::Pair {
             vault,
             identity,
@@ -448,6 +533,188 @@ async fn pair(vault: &Path, identity_path: &Path, token: String) -> Result<()> {
     save_vault_key(vault, &vault_key)?;
     println!("paired with host peer: {host_peer}");
     Ok(())
+}
+
+async fn pair_lan(
+    vault: &Path,
+    identity_path: &Path,
+    role: &str,
+    name: Option<&str>,
+) -> Result<()> {
+    let invitee_role = parse_role(role)?;
+    let identity = Identity::load(identity_path).context("load identity")?;
+    let vault_id = load_vault_id(vault)?;
+    let vault_key = load_vault_key(vault)?;
+    let mut store = Store::open(vault, identity.clone()).context("open vault store")?;
+
+    let (code, mut host) = host_lan_pairing(
+        &identity,
+        vault_id,
+        *vault_key,
+        invitee_role,
+        &mut store,
+    )
+    .await
+    .context("arm LAN pairing host")?;
+    host.advertise_on_lan(name)
+        .context("announce this device on the local network")?;
+
+    let host_id = host.endpoint_id();
+    println!("device id:    {host_id}");
+    println!("pairing code: {}", code.as_str());
+    println!();
+    println!("on the other device, run:");
+    println!(
+        "  roam join-lan --vault <dir> --identity <file> --host {host_id} --code {}",
+        code.as_str()
+    );
+    println!();
+    println!(
+        "waiting for a device to type the code ({} attempts, then the code is dead)…",
+        host.attempts_left()
+    );
+
+    // No y/N prompt here, unlike `pair-token`: typing the code IS the approval.
+    // A second confirmation would only train the user to hit "y" on a dialog
+    // they did not read.
+    let peer = host.accept_auto().await.context("accept LAN join")?;
+    println!("paired peer: {peer}");
+    Ok(())
+}
+
+async fn join_lan(vault: &Path, identity_path: &Path, host: &str, code: &str) -> Result<()> {
+    let identity = Identity::load(identity_path).context("load identity")?;
+    let host_id = parse_endpoint_id(host)?;
+    let code = parse_code(code)?;
+
+    let joined = join_lan_pairing_by_id(identity, vault.to_path_buf(), host_id, code)
+        .await
+        .context("join over the LAN")?;
+    // The code named no vault, so unlike the token flow there was nothing to
+    // cross-check against — persist what the host actually delivered.
+    save_vault_id(vault, &joined.vault)?;
+    save_vault_key(vault, &joined.vault_key)?;
+    println!("joined vault; founder peer: {}", joined.founder);
+    Ok(())
+}
+
+async fn lan_peers(seconds: u64) -> Result<()> {
+    let peers = browse_lan(Duration::from_secs(seconds))
+        .await
+        .context("browse the local network")?;
+    if peers.is_empty() {
+        println!("no roam devices announced themselves in {seconds}s");
+        return Ok(());
+    }
+    for peer in peers {
+        // The name is self-declared and unauthenticated — any device on the
+        // network can claim any name. Marked as such so nobody keys a decision
+        // on it.
+        match peer.name {
+            Some(name) => println!("{}  {name:?} (name is unverified)", peer.endpoint_id),
+            None => println!("{}", peer.endpoint_id),
+        }
+    }
+    Ok(())
+}
+
+async fn share(paths: &[PathBuf], from: &str) -> Result<()> {
+    let (offer, sources) = offer_paths(from, paths).context("build the share offer")?;
+    let file_count = offer.streams().len();
+    let total = offer.total_len();
+
+    let endpoint = bind_share_endpoint().await?;
+    // Announced so the receiver can find us with the id alone. This is not the
+    // privacy cost it would be for a vault: `bind_share_endpoint` uses a fresh
+    // random key per share, so the id announced here is not a stable device
+    // identifier and stops existing when this command exits.
+    let _mdns = LanDiscovery::attach(&endpoint, true).context("announce the share")?;
+    let share_id = endpoint.id();
+
+    let (sender, code) = ShareSender::new(endpoint, offer, sources);
+    println!("sharing {file_count} file(s), {total} bytes");
+    println!("share id: {share_id}");
+    println!("code:     {}", code.as_str());
+    println!();
+    println!("on the other device, run:");
+    println!(
+        "  roam receive --from {share_id} --code {} --into <dir>",
+        code.as_str()
+    );
+    println!();
+    println!("waiting for a receiver…");
+
+    sender.serve_one().await.context("serve the share")?;
+    println!("done.");
+    Ok(())
+}
+
+async fn receive(from: &str, code: &str, into: &Path) -> Result<()> {
+    let sender_id = parse_endpoint_id(from)?;
+    let code = parse_code(code)?;
+    anyhow::ensure!(
+        into.is_dir(),
+        "{} is not an existing directory",
+        into.display()
+    );
+
+    let endpoint = bind_share_endpoint().await?;
+    // Browse-only: receiving announces nothing about this device.
+    let _mdns = LanDiscovery::attach(&endpoint, false).context("look for the sender")?;
+
+    let received = receive_share(
+        &endpoint,
+        iroh::EndpointAddr::from(sender_id),
+        &code,
+        into,
+        // Blocking stdin inside an async callback. It parks this thread, which
+        // is fine here: the whole process is waiting on the human anyway, and
+        // the alternative (an async decision channel) buys nothing for a CLI.
+        |offer| confirm_offer(offer),
+    )
+    .await
+    .context("receive the share")?;
+
+    if received.files.is_empty() && received.texts.is_empty() {
+        println!("declined; nothing written.");
+        return Ok(());
+    }
+    for path in &received.files {
+        println!("wrote {}", path.display());
+    }
+    for text in &received.texts {
+        println!("--- text ---\n{text}");
+    }
+    Ok(())
+}
+
+/// Show what is on offer and ask. Everything printed here comes from the sender
+/// and is untrusted; the filenames are safe to *use* (they are validated
+/// `RelPath`s that cannot escape the destination) but are still attacker-chosen
+/// text, so they go through `{:?}` rather than straight at the terminal.
+fn confirm_offer(offer: &roam_share::ShareOffer) -> bool {
+    use std::io::Write;
+    println!("incoming share from {:?}:", offer.from);
+    for stream in offer.streams() {
+        println!("  {:?}  ({} bytes)", stream.path.to_string(), stream.len);
+    }
+    print!("accept? [y/N] ");
+    std::io::stdout().flush().ok();
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return false;
+    }
+    line.trim().eq_ignore_ascii_case("y")
+}
+
+fn parse_endpoint_id(raw: &str) -> Result<iroh::EndpointId> {
+    raw.trim()
+        .parse()
+        .with_context(|| format!("{raw:?} is not a device id"))
+}
+
+fn parse_code(raw: &str) -> Result<PairingCode> {
+    PairingCode::parse(raw.trim()).map_err(|err| anyhow::anyhow!("{err}"))
 }
 
 /// Dispatch `sync`: `--folder` runs the real-folder sync loop; without it the
