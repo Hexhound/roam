@@ -1129,6 +1129,14 @@ impl Store {
             let Ok(key) = keywrap::unwrap(&paper_secret, blob) else {
                 continue;
             };
+            // Mirror `build`'s KC1/M8 posture: re-wrap only a key that belongs to
+            // a real (Rotate-announced) epoch and reproduces its committed id. A
+            // malicious Admin can plant a phantom-epoch or wrong-key Paper wrap;
+            // `build` would reject it anyway, so consuming it here would only
+            // return a misleading count and bloat our replicated key-log.
+            if !kc.key_matches_epoch(&entry.epoch_id, &key) {
+                continue;
+            }
             let self_blob = keywrap::wrap(&self_pub, &key);
             log.append(
                 &self.identity,
@@ -3048,6 +3056,82 @@ mod tests {
         // Idempotent: a second run recovers nothing (R already holds the epoch).
         let again = r.recover_with_paper(&phrase, &id_key, &epoch0).unwrap();
         assert_eq!(again, 0, "already-held epoch is not recovered twice");
+    }
+
+    #[test]
+    fn paper_recovery_ignores_a_phantom_wrap_with_no_rotate() {
+        // Hardening: a malicious Active-Admin peer can append a `Recipient::Paper`
+        // wrap naming an epoch that NO `Rotate` announced (or carrying a key that
+        // does not reproduce the epoch id). `build` already refuses to install
+        // such keys (KC1/M8), but the recovery path must not be fooled into
+        // COUNTING them and appending a self-wrap that replicates out — that would
+        // return a misleading "recovered N" and bloat the key-log. Recovery must
+        // consume ONLY wraps for real, Rotate-announced epochs whose key matches.
+        let dir_a = tempdir().unwrap();
+        let dir_r = tempdir().unwrap();
+        let id_a = Identity::generate();
+        let id_r = Identity::generate();
+        let (id_key, epoch0) = keys();
+
+        // Admin A rotates ONE real epoch, sealing it to the paper key (legit).
+        let mut a = Store::open(dir_a.path(), id_a.clone()).unwrap();
+        a.declare_founder(Role::Admin).unwrap();
+        let (paper, phrase) = crate::paper::PaperKey::generate();
+        let real_epoch = a
+            .rotate_epoch(&id_key, &epoch0, Some(paper.public()))
+            .unwrap();
+
+        // A also plants a PHANTOM paper wrap: an epoch id with no `Rotate`, sealing
+        // an arbitrary attacker-chosen key to the same paper public key.
+        let phantom_epoch = [0xABu8; 32];
+        let phantom_blob = keywrap::wrap(&paper.public(), &[0x33u8; 32]);
+        KeyLog::new(&a.keylog_dir(), id_a.peer_id())
+            .append(
+                &id_a,
+                phantom_epoch,
+                KeyBody::Wrap {
+                    recipient: Recipient::Paper,
+                    blob: phantom_blob,
+                },
+            )
+            .unwrap();
+
+        // R trusts A and imports A's key-log (both the real and phantom wraps).
+        let mut r = Store::open(dir_r.path(), id_r.clone()).unwrap();
+        r.declare_founder(Role::Admin).unwrap();
+        r.add_peer(id_a.peer_id(), id_a.verifying_key().to_bytes(), Role::Admin)
+            .unwrap();
+        r.import_roster(
+            id_a.peer_id(),
+            &id_a.verifying_key(),
+            a.export_own_roster().unwrap(),
+        )
+        .unwrap();
+        r.import_keylog(
+            id_a.peer_id(),
+            &id_a.verifying_key(),
+            a.export_own_keylog().unwrap(),
+        )
+        .unwrap();
+
+        // Exactly ONE epoch is recoverable — the phantom must be ignored, not
+        // counted and not re-wrapped to R.
+        let recovered = r.recover_with_paper(&phrase, &id_key, &epoch0).unwrap();
+        assert_eq!(
+            recovered, 1,
+            "only the real Rotate-announced epoch recovers; the phantom wrap is ignored"
+        );
+
+        // R holds the real epoch and never synthesizes the phantom.
+        let kc = r.keychain(&id_key, &epoch0).unwrap();
+        assert!(
+            kc.epoch_key(&real_epoch).is_some(),
+            "the real epoch key recovered"
+        );
+        assert!(
+            kc.epoch_key(&phantom_epoch).is_none(),
+            "the phantom epoch key must never be installed"
+        );
     }
 
     #[test]

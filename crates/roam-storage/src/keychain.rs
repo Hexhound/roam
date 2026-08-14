@@ -239,6 +239,24 @@ impl Keychain {
             .unwrap_or(EPOCH0_ID)
     }
 
+    /// True iff `epoch` was announced by a `Rotate` (a real node exists) AND
+    /// `key` reproduces its committed id. Mirrors the KC1/M8 install check in
+    /// [`build`](Self::build) so callers outside the build pass (e.g. paper
+    /// recovery) never treat a phantom-epoch or key-substituted wrap as real.
+    /// Epoch 0 is the untagged genesis (no `compute_epoch_id` preimage) and
+    /// always returns `false` — callers hold it directly, never via this path.
+    pub(crate) fn key_matches_epoch(&self, epoch: &[u8; 32], key: &[u8; 32]) -> bool {
+        if *epoch == EPOCH0_ID {
+            return false;
+        }
+        match self.epochs.get(epoch) {
+            Some(node) => {
+                compute_epoch_id(&node.parents, node.minted_by, &node.nonce, key) == *epoch
+            }
+            None => false,
+        }
+    }
+
     pub fn epoch_key(&self, epoch: &[u8; 32]) -> Option<SecretKey> {
         self.epochs.get(epoch).and_then(|n| n.key.clone())
     }
