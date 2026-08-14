@@ -466,8 +466,18 @@ Two privacy decisions live in the CLI layer:
 code is the approval, and a second confirmation would only train the user to
 accept a dialog they did not read.
 
-The LAN-facing tests (`lan_discovery.rs`, `share_cli_e2e.rs`) are `#[ignore]`d
-because they need real multicast; they pass here with `--ignored`.
+`roam new-identity --out <file>` exists because writing the CLI e2e for
+`join-lan` surfaced a hole that also affected the pre-existing `pair`: a joiner
+needs a device identity but must NOT found a vault, and `init` was the only way
+to mint a key. It refuses to overwrite an existing keyfile — the key IS the
+device identity on every roster it has been added to, and a fresh one silently
+orphans it from all of them.
+
+The LAN-facing tests (`lan_discovery.rs`, `share_cli_e2e.rs`,
+`lan_pairing_cli_e2e.rs`) are `#[ignore]`d because they need real multicast;
+they pass here with `--ignored`. `share_cli_e2e` runs in ~1s alone but has been
+seen taking ~35s when the whole `--ignored` suite runs together — mDNS
+resolution under contention, not a hang, but worth watching if it ever fails.
 
 Still open: F1 (below), and the share-link half of M3, which depends on it.
 

@@ -64,6 +64,17 @@ enum Command {
         #[arg(long, default_value = "admin")]
         role: String,
     },
+    /// Create a device identity keyfile without founding a vault.
+    ///
+    /// What a device needs before it can JOIN someone else's vault. `init` also
+    /// founds a vault, which a joiner must not do — its vault arrives from the
+    /// host during pairing.
+    NewIdentity {
+        /// Where to write the keyfile. Refused if it already exists:
+        /// overwriting a device identity orphans it from every roster it is in.
+        #[arg(long)]
+        out: PathBuf,
+    },
     /// Host a LAN pairing: show a six-digit code and wait for one nearby device
     /// to type it.
     ///
@@ -301,6 +312,7 @@ async fn main() -> Result<()> {
             identity,
             role,
         } => pair_token(&vault, &identity, &role).await,
+        Command::NewIdentity { out } => new_identity(&out),
         Command::PairLan {
             vault,
             identity,
@@ -532,6 +544,22 @@ async fn pair(vault: &Path, identity_path: &Path, token: String) -> Result<()> {
     // stream, so this device can decrypt the backend store on `sync --backend`.
     save_vault_key(vault, &vault_key)?;
     println!("paired with host peer: {host_peer}");
+    Ok(())
+}
+
+fn new_identity(out: &Path) -> Result<()> {
+    // Refuse to overwrite, for the same reason `init` refuses to re-init: this
+    // key IS the device's identity on every roster it has been added to, and a
+    // fresh one silently orphans it from all of them.
+    anyhow::ensure!(
+        !out.exists(),
+        "{} already exists; refusing to overwrite a device identity",
+        out.display()
+    );
+    let identity = Identity::generate();
+    identity.save(out).context("save identity")?;
+    println!("wrote identity to {}", out.display());
+    println!("peer_id: {}", identity.peer_id());
     Ok(())
 }
 
