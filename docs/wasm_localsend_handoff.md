@@ -508,6 +508,30 @@ Three of these in one feature meant the pattern, not the instance, was the
 problem. A sweep of every `close`/`closed`/`finish`/`accept_bi`/`read_*` call in
 `roam-transport-iroh` and `roam-share-iroh` found **four more**, in two families.
 
+> **A second pass on 2026-08-14 found three more that this sweep missed.** All
+> three are worth reading as a lesson in how the sweep itself was scoped wrong:
+>
+> - **The attempt budget was a third way for a peer to end a session, and the
+>   sweep only looked at reads and closes.** `Responder::respond` spent an
+>   attempt *before* parsing, so three junk connections retired any share or
+>   pairing code — no guessing, no knowledge of the code, from any device that
+>   could reach the mDNS-announced endpoint. For shares this broke the very rule
+>   the sweep had just written into `serve_one` ("nothing a peer can cause may
+>   end the session"): bounding the reads closed one door while the budget stayed
+>   open. Fixed by charging on a failed *confirmation*; guessing stays capped.
+> - **`receive.rs` was never bounded at all.** The sweep's own finding was "no
+>   timeout anywhere in `roam-share-iroh`", and only `send.rs` got fixed — so a
+>   silent *sender* still parked the receiver forever. Sweeping a crate means
+>   both directions, not the one the bug report happened to name.
+> - **`roam-cli receive`'s `endpoint.close()` sat after a `?`**, so the fix ran
+>   only when the transfer succeeded and every failure path went back to leaving
+>   the sender to time us out. Adding a close is not enough; it has to be on
+>   *every* exit, which usually means splitting the `?` from the call.
+>
+> Generalised: ask **who can end this session, by any route** — not just "what
+> blocks on a read". A budget, a fatal-error classification and an unflushed
+> close are all the same bug wearing different clothes.
+
 **Family 1 — we went away without saying so.** QUIC's only "the other end is
 gone" signals are a CONNECTION_CLOSE frame or a ~30s idle timeout, and `Drop`
 cannot send the former because it cannot await.

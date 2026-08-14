@@ -30,8 +30,26 @@
   # a wasm32 cdylib fails with "linker `lld` not found". `cargo check` passes
   # without it — the gap only appears at link time — so leaving it out looks fine
   # right up until the first real wasm artifact.
+  # `cargo-sweep` is a disk-space necessity here, not a convenience. Cargo keeps
+  # target/ as a CACHE: artifact filenames are fingerprint-hashed (rustc version,
+  # features, profile, dep versions) and old generations are never collected, and
+  # stable cargo has no age-based GC for the target dir. This workspace links ~55
+  # separate test/bench binaries, each statically linking the whole iroh + loro +
+  # rustls tree at ~150-400 MB (77% of which is DWARF), so every rebuild that
+  # changes a fingerprint leaves another full set behind. Measured 2026-08-14:
+  # 244 executables, only 55 distinct targets — 33 GB of pure stale duplicates,
+  # which filled the disk and failed a link with ENOSPC.
+  #
+  #   cargo sweep --installed    # drop artifacts from toolchains no longer here
+  #   cargo sweep --time 7       # drop anything untouched for a week
+  #
+  # Pruning stale generations does NOT invalidate the live build (unlike
+  # `cargo clean`), so it is cheap to run often. The remaining ~7.5 GB floor is
+  # mostly debug info; `[profile.dev] debug = "line-tables-only"` would cut most
+  # of it at the cost of debugger variable inspection.
   packages = [
     pkgs.cargo-nextest
+    pkgs.cargo-sweep
     pkgs.wasm-bindgen-cli_0_2_126
     pkgs.wasm-pack
     pkgs.nodejs
