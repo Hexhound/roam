@@ -1,0 +1,17 @@
+[package]
+name = "roam-share"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Deliberately depends on NO roam crate. A share touches no vault, roster, CRDT
+# or epoch key, and keeping that true structurally is the point.
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+postcard.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde = { workspace = true, features = ["derive"] }
+postcard.workspace = true
