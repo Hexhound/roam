@@ -111,11 +111,11 @@
         "open-design": "open-design"
       },
       "locked": {
-        "lastModified": 1786320546,
-        "narHash": "sha256-lD8CtPFofXUhuzLpbmU+2q+HzcCTOvLnWmS73RV97Dw=",
+        "lastModified": 1786576074,
+        "narHash": "sha256-ay5zuzQAc+vXoIyZxsqh6hC+1R91jEQQtj4a7Qa5WQs=",
         "owner": "sezaru",
         "repo": "nix-devkit",
-        "rev": "bedb73bce241d0ff3448723bd5ab094440d0cc1f",
+        "rev": "1b004ae1e0776902985c57907cc7af4185b85fec",
         "type": "github"
       },
       "original": {
