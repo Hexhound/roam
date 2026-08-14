@@ -48,10 +48,10 @@
 //! ```
 //!
 //! The initiator proves first, so the responder never hands a confirmation
-//! value to an unauthenticated peer. Payloads are sealed under a key derived
-//! from the PAKE ([`SessionKey`]), so the code protects the payload's
-//! confidentiality too, not merely authorisation — the vault key stays safe even
-//! if the transport underneath is compromised.
+//! value to an unauthenticated peer. Everything after the handshake is sealed
+//! under keys derived from the PAKE ([`SessionKey::split`]), so the code
+//! protects confidentiality too, not merely authorisation — the payload stays
+//! safe even if the transport underneath is compromised.
 //!
 //! # Caveat worth stating plainly
 //!
@@ -78,7 +78,10 @@ pub const MAX_ATTEMPTS: u32 = 3;
 /// Domain separator; distinguishes these transcripts from every other signature
 /// or MAC in roam.
 const CONFIRM_CONTEXT: &str = "roam.pake.v1 key confirmation";
-const SEAL_CONTEXT: &str = "roam.pake.v1 payload seal";
+// Distinct contexts per direction: a message sealed by one side must not open
+// as if the other had sent it.
+const SEAL_I2R_CONTEXT: &str = "roam.pake.v1 payload seal initiator-to-responder";
+const SEAL_R2I_CONTEXT: &str = "roam.pake.v1 payload seal responder-to-initiator";
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum PakeError {
@@ -94,40 +97,123 @@ pub enum PakeError {
 
 /// Keys derived from a completed handshake.
 ///
-/// Unique per run, which is why [`SessionKey::seal`] can use a fixed nonce.
+/// A session carries a conversation, not one message, so this splits into a
+/// send channel and a receive channel with **separate keys per direction** and a
+/// per-message counter. Directions are separated so a message cannot be
+/// reflected back at its sender; counters exist because reusing a nonce under
+/// ChaCha20-Poly1305 loses confidentiality *and* authenticity outright, and a
+/// fixed nonce would do exactly that on the second message.
+///
+/// [`SessionKey::split`] consumes the key, so there is no way to hold both this
+/// and a channel and accidentally seal twice at counter zero.
 pub struct SessionKey {
-    seal_key: [u8; 32],
+    initiator_to_responder: [u8; 32],
+    responder_to_initiator: [u8; 32],
+}
+
+/// Which end of the session a party is, used to pick send/receive keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    Initiator,
+    Responder,
 }
 
 impl SessionKey {
-    /// Seal one payload.
-    ///
-    /// # Single use
-    ///
-    /// The nonce is fixed. That is safe **only** because the key is derived
-    /// fresh from one PAKE run and this protocol sends exactly one sealed
-    /// payload. Sending a second message under the same `SessionKey` would reuse
-    /// the nonce and break ChaCha20-Poly1305 catastrophically — add a counter to
-    /// the nonce and a direction tag to the key derivation first.
-    pub fn seal(&self, plaintext: &[u8]) -> Vec<u8> {
-        let cipher = ChaCha20Poly1305::new(&self.seal_key.into());
-        cipher
-            .encrypt(Nonce::from_slice(&[0u8; 12]), plaintext)
-            .expect("ChaCha20-Poly1305 encryption is infallible for in-memory input")
-    }
-
-    pub fn open(&self, ciphertext: &[u8]) -> Result<Vec<u8>, PakeError> {
-        let cipher = ChaCha20Poly1305::new(&self.seal_key.into());
-        cipher
-            .decrypt(Nonce::from_slice(&[0u8; 12]), ciphertext)
-            .map_err(|_| PakeError::Undecryptable)
+    /// Split into `(send, receive)` for one side.
+    pub fn split(self, side: Side) -> (Sealer, Opener) {
+        let (send, receive) = match side {
+            Side::Initiator => (self.initiator_to_responder, self.responder_to_initiator),
+            Side::Responder => (self.responder_to_initiator, self.initiator_to_responder),
+        };
+        (
+            Sealer {
+                key: send,
+                counter: 0,
+            },
+            Opener {
+                key: receive,
+                counter: 0,
+            },
+        )
     }
 }
 
 impl Drop for SessionKey {
     fn drop(&mut self) {
         use zeroize::Zeroize;
-        self.seal_key.zeroize();
+        self.initiator_to_responder.zeroize();
+        self.responder_to_initiator.zeroize();
+    }
+}
+
+/// Counter-based nonce. The counter occupies the low 8 bytes; the rest stay
+/// zero. Unique per (key, counter), and the key is unique per run and direction.
+fn nonce_for(counter: u64) -> [u8; 12] {
+    let mut nonce = [0u8; 12];
+    nonce[..8].copy_from_slice(&counter.to_le_bytes());
+    nonce
+}
+
+/// The outbound half of a session. Each call advances the nonce.
+pub struct Sealer {
+    key: [u8; 32],
+    counter: u64,
+}
+
+impl Sealer {
+    /// Seal the next message.
+    ///
+    /// Takes `&mut self` so the counter cannot be skipped, and the counter is
+    /// private so a caller cannot rewind it.
+    pub fn seal(&mut self, plaintext: &[u8]) -> Vec<u8> {
+        let cipher = ChaCha20Poly1305::new(&self.key.into());
+        let ciphertext = cipher
+            .encrypt(Nonce::from_slice(&nonce_for(self.counter)), plaintext)
+            .expect("ChaCha20-Poly1305 encryption is infallible for in-memory input");
+        // A session that reached 2^64 messages would wrap the nonce and destroy
+        // the cipher's guarantees. Unreachable in practice; aborting is still
+        // the only safe response if it ever happens.
+        self.counter = self
+            .counter
+            .checked_add(1)
+            .expect("PAKE session nonce counter overflowed");
+        ciphertext
+    }
+}
+
+impl Drop for Sealer {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.key.zeroize();
+    }
+}
+
+/// The inbound half of a session. Messages must arrive in the order they were
+/// sealed; a gap or a repeat fails to open rather than being tolerated, which is
+/// what makes replay and reordering non-issues at this layer.
+pub struct Opener {
+    key: [u8; 32],
+    counter: u64,
+}
+
+impl Opener {
+    pub fn open(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>, PakeError> {
+        let cipher = ChaCha20Poly1305::new(&self.key.into());
+        let plaintext = cipher
+            .decrypt(Nonce::from_slice(&nonce_for(self.counter)), ciphertext)
+            .map_err(|_| PakeError::Undecryptable)?;
+        self.counter = self
+            .counter
+            .checked_add(1)
+            .expect("PAKE session nonce counter overflowed");
+        Ok(plaintext)
+    }
+}
+
+impl Drop for Opener {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.key.zeroize();
     }
 }
 
@@ -168,7 +254,8 @@ fn confirm_mac(
 
 fn session_key(spake_key: &[u8]) -> SessionKey {
     SessionKey {
-        seal_key: blake3::derive_key(SEAL_CONTEXT, spake_key),
+        initiator_to_responder: blake3::derive_key(SEAL_I2R_CONTEXT, spake_key),
+        responder_to_initiator: blake3::derive_key(SEAL_R2I_CONTEXT, spake_key),
     }
 }
 
@@ -366,6 +453,18 @@ impl PendingResponder {
 impl std::fmt::Debug for SessionKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("SessionKey(<redacted>)")
+    }
+}
+
+impl std::fmt::Debug for Sealer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Sealer(<redacted>)")
+    }
+}
+
+impl std::fmt::Debug for Opener {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Opener(<redacted>)")
     }
 }
 

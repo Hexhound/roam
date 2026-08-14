@@ -1,7 +1,7 @@
 //! The properties that make a 6-digit code safe. If any of these stops holding,
 //! the code becomes a ~20-bit secret on the wire and the flow must not ship.
 
-use roam_pake::{Initiator, PairingCode, PakeError, Responder, SessionKey, MAX_ATTEMPTS};
+use roam_pake::{Initiator, PairingCode, PakeError, Responder, SessionKey, Side, MAX_ATTEMPTS};
 
 const HOST_ID: [u8; 32] = [1u8; 32];
 const JOINER_ID: [u8; 32] = [2u8; 32];
@@ -30,8 +30,10 @@ fn the_right_code_pairs_and_both_sides_agree_on_a_key() {
         run(&code, &mut responder, JOINER_ID, HOST_ID).expect("the correct code must pair");
 
     // Agreeing on "a key" is not enough — it has to be the SAME key.
-    let sealed = responder_key.seal(b"the vault key");
-    assert_eq!(initiator_key.open(&sealed).unwrap(), b"the vault key");
+    let (mut responder_send, _) = responder_key.split(Side::Responder);
+    let (_, mut initiator_recv) = initiator_key.split(Side::Initiator);
+    let sealed = responder_send.seal(b"the vault key");
+    assert_eq!(initiator_recv.open(&sealed).unwrap(), b"the vault key");
 }
 
 #[test]
@@ -168,11 +170,13 @@ fn a_tampered_sealed_payload_is_refused() {
     let mut responder = Responder::new(code.clone(), HOST_ID);
     let (initiator_key, responder_key) = run(&code, &mut responder, JOINER_ID, HOST_ID).unwrap();
 
-    let mut sealed = responder_key.seal(b"the vault key");
+    let (mut responder_send, _) = responder_key.split(Side::Responder);
+    let (_, mut initiator_recv) = initiator_key.split(Side::Initiator);
+    let mut sealed = responder_send.seal(b"the vault key");
     let last = sealed.len() - 1;
     sealed[last] ^= 0x01;
     assert_eq!(
-        initiator_key.open(&sealed).unwrap_err(),
+        initiator_recv.open(&sealed).unwrap_err(),
         PakeError::Undecryptable
     );
 }
@@ -206,4 +210,70 @@ fn debug_output_redacts_the_code() {
     let code = PairingCode::parse("424242").unwrap();
     let shown = format!("{code:?}");
     assert!(!shown.contains("424242"), "Debug leaked the code: {shown}");
+}
+
+/// The reason `SessionKey` is not a single fixed-nonce sealer any more. Two
+/// messages with identical plaintext must produce different ciphertext; if they
+/// did not, the nonce is being reused and ChaCha20-Poly1305 loses both
+/// confidentiality and authenticity.
+#[test]
+fn sealing_twice_does_not_reuse_the_nonce() {
+    let code = PairingCode::generate();
+    let mut responder = Responder::new(code.clone(), HOST_ID);
+    let (initiator_key, responder_key) = run(&code, &mut responder, JOINER_ID, HOST_ID).unwrap();
+    let (mut send, _) = responder_key.split(Side::Responder);
+    let (_, mut recv) = initiator_key.split(Side::Initiator);
+
+    let first = send.seal(b"same plaintext");
+    let second = send.seal(b"same plaintext");
+    assert_ne!(first, second, "identical plaintext sealed to identical bytes");
+
+    // ...and they still open, in order.
+    assert_eq!(recv.open(&first).unwrap(), b"same plaintext");
+    assert_eq!(recv.open(&second).unwrap(), b"same plaintext");
+}
+
+/// Messages must arrive in order. A repeat is a replay and a skip is a gap;
+/// both fail to open rather than being silently tolerated.
+#[test]
+fn a_replayed_or_reordered_message_does_not_open() {
+    let code = PairingCode::generate();
+    let mut responder = Responder::new(code.clone(), HOST_ID);
+    let (initiator_key, responder_key) = run(&code, &mut responder, JOINER_ID, HOST_ID).unwrap();
+    let (mut send, _) = responder_key.split(Side::Responder);
+    let (_, mut recv) = initiator_key.split(Side::Initiator);
+
+    let first = send.seal(b"one");
+    let second = send.seal(b"two");
+
+    // Out of order: the second message does not open in the first slot.
+    assert_eq!(recv.open(&second).unwrap_err(), PakeError::Undecryptable);
+    // Recover by taking them in order...
+    assert_eq!(recv.open(&first).unwrap(), b"one");
+    assert_eq!(recv.open(&second).unwrap(), b"two");
+    // ...and a replay of an already-consumed message is refused.
+    assert_eq!(recv.open(&first).unwrap_err(), PakeError::Undecryptable);
+}
+
+/// Directions use separate keys, so a message cannot be reflected back at the
+/// party that sent it.
+#[test]
+fn a_message_cannot_be_reflected_back_at_its_sender() {
+    let code = PairingCode::generate();
+    let mut responder = Responder::new(code.clone(), HOST_ID);
+    let (initiator_key, responder_key) = run(&code, &mut responder, JOINER_ID, HOST_ID).unwrap();
+    let (mut initiator_send, mut initiator_recv) = initiator_key.split(Side::Initiator);
+    let (_responder_send, mut responder_recv) = responder_key.split(Side::Responder);
+
+    let sealed = initiator_send.seal(b"from the initiator");
+    // The responder can read it, as intended.
+    assert_eq!(responder_recv.open(&sealed).unwrap(), b"from the initiator");
+
+    // Bounce the very same bytes back: the initiator must not accept its own
+    // message as though the responder had sent it.
+    assert_eq!(
+        initiator_recv.open(&sealed).unwrap_err(),
+        PakeError::Undecryptable,
+        "directions share a key; a message can be reflected"
+    );
 }

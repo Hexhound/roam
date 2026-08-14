@@ -1,0 +1,19 @@
+[package]
+name = "roam-share-iroh"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# NOT roam-storage / roam-sync-core: a share must not be able to touch a vault,
+# and keeping that out of the dependency graph makes it structural.
+[dependencies]
+roam-share = { path = "../roam-share" }
+roam-pake = { path = "../roam-pake" }
+iroh.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+tempfile.workspace = true

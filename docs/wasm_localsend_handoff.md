@@ -378,9 +378,47 @@ independently audited**. It is the best-maintained Rust option and what
 magic-wormhole uses, but the composition was kept deliberately standard so
 nothing bespoke is doing security work.
 
-Still to wire: the PAKE handshake is not yet attached to an ALPN/stream, and
-`roam-share`'s frames are not yet exposed on a network. `roam-pake` is the auth
-seam both will use.
+### F2(b) COMPLETE — the share is on the wire
+
+`crates/roam-share-iroh` puts `roam-share`'s frames on a QUIC stream under
+`roam/share/1`, authenticated by `roam-pake`. It depends on `roam-share`,
+`roam-pake` and `iroh` — **not** on `roam-storage` or `roam-sync-core`, so a
+share structurally cannot touch a vault.
+
+Roles map onto the PAKE exactly: the **sender** holds the files and shows the
+code (PAKE responder, owns the attempt budget), the **receiver** dials (PAKE
+initiator). The side displaying the secret is the side that must be able to say
+"too many guesses".
+
+Nothing is revealed before the code is proved — not even filenames. There are
+two tests for that, and the weaker one was not enough: asserting the receiver's
+*callback* never fired passes even if the sender puts the offer on the wire,
+because a hostile peer does not run our callback. The real test speaks the
+protocol by hand with a wrong code and asserts no emitted byte contains the
+filename. Verified by making the sender leak the offer early: the raw test
+fails, the callback test does not.
+
+**Two real bugs the tests caught**, both in shutdown rather than crypto:
+
+1. Declining dropped the connection with the `Decline` frame still unflushed, so
+   the sender saw "connection lost" instead of an answer.
+2. Fixing that naively made the receiver wait a **30-second idle timeout**:
+   `serve_one` consumes the sender, so its `Endpoint` is dropped the moment it
+   returns, often before a bare close is flushed — and with the endpoint gone
+   nothing retransmits. The sender now acknowledges a decline with `Done` and
+   the receiver closes in both paths, so shutdown no longer depends on drop
+   ordering. Suite went 35s → 0.15s.
+
+Also hardened along the way: `SessionKey` was single-use with a fixed nonce,
+which a real stream would have broken catastrophically on the second message. It
+now splits into per-direction keys with per-message counters, so replay,
+reordering and reflection all fail to open. Sending symlinks is refused rather
+than followed — otherwise "share this folder" could exfiltrate anything the
+sender can read.
+
+Still open: nothing wires the share into the CLI yet, and LAN pairing *into a
+vault* (F2c) still uses the token flow rather than the short code — `roam-pake`
+is ready for it.
 
 ## Feature 1 — Sub-vault granular permissions (LATER, for reference)
 
