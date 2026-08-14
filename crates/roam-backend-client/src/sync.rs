@@ -6,7 +6,9 @@ use roam_rbsr::{initiate, reconcile, ItemSet, SetKind};
 use roam_storage::{Keychain, PeerStatus, Role, Store, VerifyingKey, EPOCH0_ID};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+// Not `SystemTime::now()`: it traps on wasm32. One shared shim, so the browser
+// build cannot silently reacquire the bug.
+use roam_storage::wallclock::now_ms;
 use tokio::sync::Mutex;
 
 /// Client-side round cap: bounds a pathological/hostile server that never
@@ -367,12 +369,6 @@ fn seal_under_head(kc: &Keychain, key: &VaultKey, plaintext: &[u8]) -> Option<Ve
     }
 }
 
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
 
 /// Op-log tail (in ms) left replayable beyond the snapshot frontier. Peers only
 /// recently behind catch up by normal op-replay and never adopt a snapshot.

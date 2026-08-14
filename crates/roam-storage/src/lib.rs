@@ -22,6 +22,7 @@ mod store;
 mod text_history;
 mod vault_key;
 pub mod vfs;
+pub mod wallclock;
 
 pub use blob::BlobStore;
 pub use error::StorageError;

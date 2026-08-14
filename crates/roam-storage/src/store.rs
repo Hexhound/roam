@@ -475,12 +475,8 @@ impl Store {
                 .join(format!("ops-{}.jsonl", peer.peer_id));
             log_lens.insert(peer.peer_id, count_log_lines(&*self.fs, &path));
         }
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
         self.history.append(&Marker {
-            ts_ms: now_ms,
+            ts_ms: crate::wallclock::now_ms(),
             frontier: b64(&frontier.to_bytes()),
             log_lens,
         })?;
