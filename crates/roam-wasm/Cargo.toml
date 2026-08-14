@@ -1,0 +1,24 @@
+[package]
+name = "roam-wasm"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+
+# cdylib for the browser artifact, rlib so the native test target can link the
+# same code and generate the interop fixture.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+roam-crdt = { path = "../roam-crdt" }
+
+# wasm-bindgen is target-gated ON PURPOSE. Nothing in a native build — least of
+# all the CLI — may transitively pull wasm-bindgen in; gating it here makes that
+# structurally impossible rather than a convention we have to remember. It also
+# keeps `cargo test` on the host free of JsValue/JsError, so the core `Doc` type
+# stays plain Rust with plain `CrdtError`.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = { workspace = true }

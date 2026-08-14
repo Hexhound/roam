@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/roam-crdt", "crates/roam-storage", "crates/roam-sync-core", "crates/roam-transport-iroh", "crates/roam-cli", "crates/roam-files", "crates/roam-backend-client", "crates/roam-rbsr"]
+members = ["crates/roam-crdt", "crates/roam-storage", "crates/roam-sync-core", "crates/roam-transport-iroh", "crates/roam-cli", "crates/roam-files", "crates/roam-backend-client", "crates/roam-rbsr", "crates/roam-wasm"]
 
 [workspace.package]
 edition = "2021"
@@ -32,3 +32,13 @@ argon2 = "0.5"
 zeroize = { version = "1", features = ["derive"] }
 chacha20poly1305 = "0.10"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+
+# WASM web client (F3). These are EXACT pins, not preferences: wasm-bindgen's
+# generated glue is schema-versioned, so the crate version must equal the
+# wasm-bindgen-cli version provided by the devenv (see .nix/devenv.nix). nixpkgs
+# has no 0.2.127, hence 0.2.126 rather than latest. js-sys/web-sys pin
+# wasm-bindgen exactly in turn, so 0.2.126 forces js-sys 0.3.103. Bump all of
+# these together with the devenv package, never independently.
+wasm-bindgen = "=0.2.126"
+wasm-bindgen-test = "=0.3.76"
+js-sys = "=0.3.103"
