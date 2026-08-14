@@ -95,6 +95,17 @@ fn sharing_a_file_between_two_processes_needs_only_an_id_and_six_digits() {
         b"meet at the pier at six"
     );
 
+    // The transfer is done, so the sender has nothing left to do but exit. If it
+    // lingers here it is sitting out a QUIC idle timeout waiting for a close
+    // that will never arrive — the receiver process is already gone. Measured:
+    // this was a reliable 30s before the receiver learned to flush its close.
+    let waited = std::time::Instant::now();
     let sender_status = sender.wait().expect("sender finished");
+    let lingered = waited.elapsed();
     assert!(sender_status.success(), "sender exited unhappily");
+    assert!(
+        lingered < std::time::Duration::from_secs(10),
+        "sender took {lingered:?} to exit after the transfer completed — \
+         that is an idle timeout, not work"
+    );
 }

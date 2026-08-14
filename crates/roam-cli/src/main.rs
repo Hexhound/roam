@@ -703,6 +703,13 @@ async fn receive(from: &str, code: &str, into: &Path) -> Result<()> {
     .await
     .context("receive the share")?;
 
+    // `receive_share` closes the connection, but a CONNECTION_CLOSE is a
+    // best-effort datagram: if this process just exits, it is never flushed and
+    // the sender sits out a 30-second QUIC idle timeout waiting for a peer that
+    // is already gone. Measured at a reliable 30s before this line existed —
+    // `Endpoint::close` does the graceful shutdown that actually delivers it.
+    endpoint.close().await;
+
     if received.files.is_empty() && received.texts.is_empty() {
         println!("declined; nothing written.");
         return Ok(());

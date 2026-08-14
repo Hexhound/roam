@@ -475,9 +475,32 @@ orphans it from all of them.
 
 The LAN-facing tests (`lan_discovery.rs`, `share_cli_e2e.rs`,
 `lan_pairing_cli_e2e.rs`) are `#[ignore]`d because they need real multicast;
-they pass here with `--ignored`. `share_cli_e2e` runs in ~1s alone but has been
-seen taking ~35s when the whole `--ignored` suite runs together — mDNS
-resolution under contention, not a hang, but worth watching if it ever fails.
+they pass here with `--ignored`.
+
+**A third shutdown bug, found by measuring instead of guessing.** `share_cli_e2e`
+was taking ~30s. The first guess — mDNS resolution under contention — was wrong.
+Phase timing showed the transfer completing in 0.77s and the *sender* then taking
+exactly 30.0s to exit, 5 runs out of 5: a QUIC idle timeout, not work.
+
+Cause: `receive_share` closes the connection, but a CONNECTION_CLOSE is
+best-effort. When the receiver is a **separate process that then exits**, it is
+never flushed, and the sender waits out the idle timeout for a peer that is
+already gone. The library tests never saw it because there both sides live in one
+process that stays up. Fix: the CLI `receive` calls `endpoint.close().await`,
+which does the graceful shutdown that actually delivers it. 30.86s → 0.85s,
+stable over five runs.
+
+Both CLI e2e tests now assert the *timing* — the server side must exit within
+10s of the client finishing — so a refactor that drops the close is caught as a
+failure rather than as a slow suite. This is the third bug in this feature that
+lived in shutdown rather than crypto; the pattern is always "one side assumes a
+courtesy frame arrived".
+
+Known residual: a receiver that *crashes* mid-transfer still parks the sender for
+one idle timeout. `serve_one` returns afterwards, so it is self-healing and
+bounded. Left unfixed deliberately — the obvious bound on `conn.closed()` cannot
+be tested without a flaky crash simulation, and untested hardening is how the
+first two shutdown bugs got in.
 
 Still open: F1 (below), and the share-link half of M3, which depends on it.
 

@@ -110,8 +110,19 @@ fn a_second_device_joins_a_vault_over_the_lan_with_six_digits() {
         "join should report the pinned founder:\n{join_out}"
     );
 
+    // Same trap `share_cli_e2e` fell into: the joiner process is gone, so if its
+    // connection close was never flushed the host sits out a 30s QUIC idle
+    // timeout. `join_lan_pairing` closes its endpoint, which is what makes this
+    // fast — assert it, so a future refactor that drops the close is caught.
+    let waited = std::time::Instant::now();
     let host_status = host.wait().expect("pair-lan finished");
+    let lingered = waited.elapsed();
     assert!(host_status.success(), "pair-lan exited unhappily");
+    assert!(
+        lingered < std::time::Duration::from_secs(10),
+        "pair-lan took {lingered:?} to exit after pairing completed — \
+         that is an idle timeout, not work"
+    );
 
     // The joiner persisted what `sync` will need: without vault-id and
     // vault-key on disk, pairing succeeded and the device is still unusable.
