@@ -554,9 +554,22 @@ never end a session or spend a guess. Fixing that properly means concurrent
 handshakes over a shared attempt budget, which is a real design change and not
 one to make without a test that can drive it.
 
-Still open: F1 (below), and the share-link half of M3, which depends on it.
+Still open: F1 (below), and the share-link half of M3.
 
 ## Feature 1 — Sub-vault granular permissions (LATER, for reference)
+
+> **SUPERSEDED 2026-08-14 — read `docs/sharing_and_subvaults_design_notes.md`
+> first.** The section below is kept for its Phase A detail, which still holds.
+> Two of its premises do not:
+>
+> - **The share-link half of M3 is NOT blocked on F1 read-scoping.** That claim
+>   (also at lines 127, 260, 264, 607) assumed a sealed-URL-fragment share. The
+>   product requirement is a live, backend-hosted, two-way folder share, under
+>   which a share is a *vault* and the recipient is a *member* — so the dependency
+>   is on an invitation flow, not on partitioning the document.
+> - **Sharing and sub-vaults are separate features.** Sharing is satisfiable today
+>   with separate vaults; sub-vaults are an ergonomics improvement on top. No app
+>   in the six requires Phase B for correctness.
 
 Scope primitive = path-prefix on the loro container-id string (container_id =
 vault-relative NFC path, `roam-files/src/path.rs:41`), so `prescriptions/` is
