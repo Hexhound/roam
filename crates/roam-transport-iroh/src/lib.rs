@@ -11,6 +11,7 @@ macro_rules! dlog {
     };
 }
 
+pub mod discovery;
 pub mod endpoint;
 pub mod pairing;
 pub mod transport;

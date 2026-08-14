@@ -16,7 +16,16 @@ pub const PAIRING_ALPN: &[u8] = b"roam/pair/1";
 
 /// Build the ONE iroh endpoint for this device, bound to the SAME ed25519 key
 /// as `identity` (so the iroh `NodeId` equals the ed25519 verifying key), with
-/// iroh's default n0 discovery (mDNS + n0 DNS/pkarr + relay).
+/// iroh's default n0 discovery: pkarr publish + pkarr/DNS resolve + relay.
+///
+/// **NO mDNS, and therefore no LAN-only operation.** `presets::N0` contains no
+/// mDNS at all (checked against `iroh-1.0.3/src/endpoint/presets.rs`; iroh does
+/// not even depend on an mDNS crate), so every discovery path here needs the
+/// public internet. A previous version of this comment claimed otherwise.
+///
+/// LAN discovery is opt-in and lives in [`crate::discovery`] — deliberately not
+/// wired in here, because advertising broadcasts a stable device identifier to
+/// the whole network and that should follow a user's decision, not app startup.
 ///
 /// **Exactly one endpoint per identity.** iroh keeps a single
 /// `node_id -> endpoint` route at the relay, so a second endpoint bound to the

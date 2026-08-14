@@ -30,6 +30,9 @@ futures = "0.3"
 postcard = { version = "1", default-features = false, features = ["use-std"] }
 anyhow = "1"
 iroh = { version = "1.0.0", features = ["platform-verifier"] }
+# LAN discovery: iroh's presets::N0 has NO mDNS (pkarr/DNS/relay only), so
+# finding a device on the same Wi-Fi without internet needs this separately.
+iroh-mdns-address-lookup = "0.4"
 clap = { version = "4", features = ["derive"] }
 notify = "6"
 blake3 = "1"

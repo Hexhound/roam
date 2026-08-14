@@ -10,6 +10,7 @@ roam-sync-core = { path = "../roam-sync-core" }
 roam-storage = { path = "../roam-storage" }
 ed25519-dalek.workspace = true
 iroh.workspace = true
+iroh-mdns-address-lookup = { workspace = true }
 tokio.workspace = true
 async-trait.workspace = true
 futures.workspace = true
