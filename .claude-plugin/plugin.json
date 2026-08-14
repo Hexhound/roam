@@ -1,0 +1,9 @@
+{
+  "name": "roam-dev",
+  "description": "Build on roam-sync: end-to-end-encrypted, offline-first sync across a user's own devices (P2P + zero-knowledge relay), plus LAN device pairing and one-shot nearby sharing.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Eduardo Barreto Alexandre",
+    "email": "claude@sezdm.com"
+  }
+}
