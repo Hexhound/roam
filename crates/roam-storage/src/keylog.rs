@@ -5,12 +5,12 @@
 
 use crate::error::StorageError;
 use crate::identity::{Identity, VerifyingKey};
+use crate::vfs::{NativeFs, VaultFs};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use ed25519_dalek::Signature;
 use serde::{Deserialize, Serialize};
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Who an epoch key is wrapped to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,13 +113,20 @@ fn b64_32(s: &str) -> Result<[u8; 32], StorageError> {
 pub struct KeyLog {
     path: PathBuf,
     author: u64,
+    fs: Arc<dyn VaultFs>,
 }
 
 impl KeyLog {
     pub fn new(dir: &Path, author: u64) -> Self {
+        Self::new_with_fs(dir, author, Arc::new(NativeFs))
+    }
+
+    /// [`KeyLog::new`], but persisting through a caller-supplied backend.
+    pub fn new_with_fs(dir: &Path, author: u64, fs: Arc<dyn VaultFs>) -> Self {
         Self {
             path: dir.join(format!("keylog-{author}.jsonl")),
             author,
+            fs,
         }
     }
 
@@ -146,7 +153,7 @@ impl KeyLog {
             )));
         }
         if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
+            self.fs.create_dir_all(parent)?;
         }
         let seq = self.last_seq(&id.verifying_key())? + 1;
         let entry = KeyLogEntry {
@@ -180,26 +187,13 @@ impl KeyLog {
         let mut json = serde_json::to_vec(&line)?;
         json.push(b'\n');
 
-        let is_create = !self.path.exists();
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
-        file.write_all(&json)?;
-        file.sync_all()?;
-        #[cfg(unix)]
-        if is_create {
-            if let Some(dir) = self.path.parent() {
-                if let Ok(d) = std::fs::File::open(dir) {
-                    let _ = d.sync_all();
-                }
-            }
-        }
+        // Durable append: key material must not be lost to a power failure.
+        self.fs.append_sync(&self.path, &json)?;
         Ok(entry)
     }
 
     pub fn read_verified(&self, key: &VerifyingKey) -> Result<Vec<KeyLogEntry>, StorageError> {
-        let text = match std::fs::read_to_string(&self.path) {
+        let text = match self.fs.read_to_string(&self.path) {
             Ok(t) => t,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(e.into()),

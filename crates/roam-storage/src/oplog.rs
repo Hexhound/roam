@@ -1,11 +1,11 @@
 use crate::error::StorageError;
 use crate::identity::{Identity, VerifyingKey};
+use crate::vfs::{NativeFs, VaultFs};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use ed25519_dalek::Signature;
 use serde::{Deserialize, Serialize};
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Signature domain tag for op-log updates (M1: cross-protocol reuse guard).
 /// Distinct from the pairing-proof tag so an op signature can never be replayed
@@ -34,14 +34,22 @@ struct EntryLine {
 pub struct OpLog {
     path: PathBuf,
     peer_id: u64,
+    fs: Arc<dyn VaultFs>,
 }
 
 impl OpLog {
-    /// Open (do not create yet) the log for `peer_id` under `dir`.
+    /// Open (do not create yet) the log for `peer_id` under `dir`, backed by the
+    /// real filesystem.
     pub fn new(dir: &Path, peer_id: u64) -> Self {
+        Self::new_with_fs(dir, peer_id, Arc::new(NativeFs))
+    }
+
+    /// [`OpLog::new`], but persisting through a caller-supplied backend.
+    pub fn new_with_fs(dir: &Path, peer_id: u64, fs: Arc<dyn VaultFs>) -> Self {
         Self {
             path: dir.join(format!("ops-{peer_id}.jsonl")),
             peer_id,
+            fs,
         }
     }
 
@@ -52,7 +60,7 @@ impl OpLog {
     /// Sign `update` with `id` and append it as one JSONL line.
     pub fn append(&self, id: &Identity, update: &[u8]) -> Result<(), StorageError> {
         if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
+            self.fs.create_dir_all(parent)?;
         }
         let sig = id.sign_in_domain(OPLOG_SIG_DOMAIN, update);
         let line = EntryLine {
@@ -63,27 +71,10 @@ impl OpLog {
         let mut json = serde_json::to_vec(&line)?;
         json.push(b'\n');
 
-        // Whether this append creates the file (vs. extends an existing one).
-        let is_create = !self.path.exists();
-
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
-        file.write_all(&json)?;
-        file.sync_all()?;
-
-        // On file creation, the new directory entry itself must be flushed, or a
-        // power failure can lose the whole file (and thus the first op) despite
-        // the content sync above. Only needed on create; append-to-existing is fine.
-        #[cfg(unix)]
-        if is_create {
-            if let Some(dir) = self.path.parent() {
-                if let Ok(d) = std::fs::File::open(dir) {
-                    let _ = d.sync_all();
-                }
-            }
-        }
+        // `append_sync`, not `append`: this is the source-of-truth log, so the
+        // bytes (and, on create, the directory entry) must be durable before we
+        // return. The backend owns how that is achieved.
+        self.fs.append_sync(&self.path, &json)?;
         Ok(())
     }
 
@@ -97,7 +88,7 @@ impl OpLog {
     ///
     /// Assumes a single writer per file (the log is per-peer: `ops-<peer>.jsonl`).
     pub fn read_verified(&self, key: &VerifyingKey) -> Result<Vec<Entry>, StorageError> {
-        let text = match std::fs::read_to_string(&self.path) {
+        let text = match self.fs.read_to_string(&self.path) {
             Ok(t) => t,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(e.into()),

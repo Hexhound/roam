@@ -12,10 +12,12 @@ use crate::roster::{
 };
 use crate::snapshot;
 use crate::text_history::{TextVersion, VersionKind};
+use crate::vfs::{NativeFs, VaultFs};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use roam_crdt::{Document, Frontier, Version};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Base64-encode bytes for storage in a history marker (same STANDARD engine
 /// the op-log uses for its signed lines).
@@ -72,20 +74,18 @@ pub struct DataSize {
 /// Total byte size of every regular file at or under `path`, recursively. A
 /// missing directory counts as 0 (an empty vault has not created it yet). Any
 /// other IO error propagates — a size report must never silently undercount.
-fn dir_size(path: &Path) -> Result<u64, StorageError> {
-    let entries = match std::fs::read_dir(path) {
+fn dir_size(fs: &dyn VaultFs, path: &Path) -> Result<u64, StorageError> {
+    let entries = match fs.read_dir(path) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
         Err(e) => return Err(e.into()),
     };
     let mut total = 0u64;
     for entry in entries {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() {
-            total = total.saturating_add(dir_size(&entry.path())?);
-        } else if file_type.is_file() {
-            total = total.saturating_add(entry.metadata()?.len());
+        if fs.is_dir(&entry) {
+            total = total.saturating_add(dir_size(fs, &entry)?);
+        } else {
+            total = total.saturating_add(fs.file_len(&entry)?);
         }
     }
     Ok(total)
@@ -94,17 +94,16 @@ fn dir_size(path: &Path) -> Result<u64, StorageError> {
 /// Total byte size of the regular files sitting DIRECTLY in `path` (its
 /// non-recursive top level; subdirectories are ignored — they are summed
 /// separately by [`dir_size`]). A missing directory counts as 0.
-fn root_file_bytes(path: &Path) -> Result<u64, StorageError> {
-    let entries = match std::fs::read_dir(path) {
+fn root_file_bytes(fs: &dyn VaultFs, path: &Path) -> Result<u64, StorageError> {
+    let entries = match fs.read_dir(path) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
         Err(e) => return Err(e.into()),
     };
     let mut total = 0u64;
     for entry in entries {
-        let entry = entry?;
-        if entry.file_type()?.is_file() {
-            total = total.saturating_add(entry.metadata()?.len());
+        if !fs.is_dir(&entry) {
+            total = total.saturating_add(fs.file_len(&entry)?);
         }
     }
     Ok(total)
@@ -140,6 +139,19 @@ pub struct Store {
     /// The pinned vault founder's `peer_id` (`<root>/founder`), if any. Seeds the
     /// monotone `ever_admin` closure in `merge_roster` so grant certificates fold.
     founder: Option<u64>,
+    /// The filesystem this vault persists through. `NativeFs` natively; a
+    /// browser backend supplies its own via [`Store::open_with_fs`].
+    ///
+    /// `Arc<dyn VaultFs>` rather than a `Store<F: VaultFs>` type parameter on
+    /// purpose: making `Store` generic would ripple through every caller in the
+    /// workspace for no gain, since the backend is chosen once at startup.
+    ///
+    /// M2 is migrating modules onto this one at a time, so parts of `Store`
+    /// still call `std::fs` directly. Both paths address the same real
+    /// filesystem while `fs` is `NativeFs`, so the crate stays correct
+    /// throughout; the browser backend only becomes usable once the migration
+    /// is complete.
+    fs: Arc<dyn VaultFs>,
 }
 
 impl Store {
@@ -151,24 +163,34 @@ impl Store {
     /// cache) — `open()` always rebuilds the peer set from the signed roster logs
     /// so a lost/stale cache can never affect correctness.
     pub fn open(root: &Path, identity: Identity) -> Result<Self, StorageError> {
+        Self::open_with_fs(root, identity, Arc::new(NativeFs))
+    }
+
+    /// [`Store::open`], but persisting through a caller-supplied [`VaultFs`].
+    /// The browser client uses this to run the same vault logic over OPFS.
+    pub fn open_with_fs(
+        root: &Path,
+        identity: Identity,
+        fs: Arc<dyn VaultFs>,
+    ) -> Result<Self, StorageError> {
         let ops_dir = root.join("ops");
         let roster_dir = root.join("roster");
         let snap_path = root.join("snapshots").join("snapshot.loro");
 
         // 1. Rebuild the trusted peer set from the signed roster logs (fixpoint),
         //    seeded by the pinned founder so grant certificates actually fold.
-        let founder = crate::founder::read_founder(root)?;
+        let founder = crate::founder::read_founder(&*fs, root)?;
         let peers =
-            Self::rebuild_peers(root, identity.peer_id(), &identity.verifying_key(), founder)?;
+            Self::rebuild_peers(&fs, root, identity.peer_id(), &identity.verifying_key(), founder)?;
 
         // 2. Base document: from snapshot if present, else empty.
-        let doc = match snapshot::load(&snap_path)? {
+        let doc = match snapshot::load(&*fs, &snap_path)? {
             Some(bytes) => Document::from_snapshot(identity.peer_id(), &bytes)?,
             None => Document::new(identity.peer_id())?,
         };
 
         // 3. Replay our own log (verified against our own key).
-        let own_log = OpLog::new(&ops_dir, identity.peer_id());
+        let own_log = OpLog::new_with_fs(&ops_dir, identity.peer_id(), fs.clone());
         for entry in own_log.read_verified(&identity.verifying_key())? {
             doc.import(&entry.update)?;
         }
@@ -183,7 +205,7 @@ impl Store {
                 Ok(k) => k,
                 Err(_) => continue,
             };
-            let peer_log = OpLog::new(&ops_dir, peer.peer_id);
+            let peer_log = OpLog::new_with_fs(&ops_dir, peer.peer_id, fs.clone());
             for entry in peer_log.read_verified(&peer_key)? {
                 doc.import(&entry.update)?;
             }
@@ -191,12 +213,12 @@ impl Store {
 
         doc.commit();
         let persisted = doc.version();
-        let own_roster = RosterLog::new(&roster_dir, identity.peer_id());
+        let own_roster = RosterLog::new_with_fs(&roster_dir, identity.peer_id(), fs.clone());
         // Blob bytes live beside the CRDT state under `<root>/assets`. Opening
         // it here (creating the dir if absent) means every caller sharing this
         // Store reaches the same blob store via `blobs()`.
-        let blobs = BlobStore::open(&root.join("assets"))?;
-        let history = HistoryIndex::new(&root.join("history"));
+        let blobs = BlobStore::open_with_fs(&root.join("assets"), fs.clone())?;
+        let history = HistoryIndex::new_with_fs(&root.join("history"), fs.clone());
         let store = Self {
             root: root.to_path_buf(),
             identity,
@@ -208,6 +230,7 @@ impl Store {
             blobs,
             history,
             founder,
+            fs,
         };
         store.write_peers_cache()?;
         Ok(store)
@@ -220,12 +243,13 @@ impl Store {
     /// author is already keyed, learning new subject keys, until no new author
     /// becomes processable.
     fn rebuild_peers(
+        fs: &Arc<dyn VaultFs>,
         root: &Path,
         self_id: u64,
         self_key: &VerifyingKey,
         founder: Option<u64>,
     ) -> Result<Vec<PeerRecord>, StorageError> {
-        let mut all_entries = Self::collect_roster_entries(root, self_id, self_key, founder)?;
+        let mut all_entries = Self::collect_roster_entries(fs, root, self_id, self_key, founder)?;
         Ok(merge_roster(&mut all_entries, founder))
     }
 
@@ -234,6 +258,7 @@ impl Store {
     /// verified entries. Shared by [`Self::rebuild_peers`] (which folds them into
     /// the peer set) and the Lamport-clock lookup used when authoring a role op.
     fn collect_roster_entries(
+        fs: &Arc<dyn VaultFs>,
         root: &Path,
         self_id: u64,
         self_key: &VerifyingKey,
@@ -253,7 +278,7 @@ impl Store {
         // the peer-id binding (`fid == first-8-LE-bytes(key)`) prevents a swap.
         if let Some(fid) = founder {
             if let std::collections::hash_map::Entry::Vacant(entry) = trusted.entry(fid) {
-                let flog = RosterLog::new(&roster_dir, fid);
+                let flog = RosterLog::new_with_fs(&roster_dir, fid, fs.clone());
                 if let Some(fkey) = flog.peek_self_key()? {
                     if derived_peer_id(&fkey) == fid {
                         entry.insert(fkey);
@@ -279,7 +304,7 @@ impl Store {
                 Ok(k) => k,
                 Err(_) => continue,
             };
-            let log = RosterLog::new(&roster_dir, author);
+            let log = RosterLog::new_with_fs(&roster_dir, author, fs.clone());
             let entries = match log.read_verified(&author_key) {
                 Ok(e) => e,
                 Err(_) => continue, // a corrupt/forged log for one author must not brick the roster
@@ -329,17 +354,17 @@ impl Store {
     /// [`Store::checkpoint_dry_run`] to show "total now" vs "freeable by
     /// compacting" side by side.
     pub fn data_size(&self) -> Result<DataSize, StorageError> {
-        let blobs = dir_size(&self.root.join("assets"))?;
-        let oplog = dir_size(&self.root.join("ops"))?
-            .saturating_add(dir_size(&self.root.join("snapshots"))?);
-        let mut meta = dir_size(&self.root.join("roster"))?
-            .saturating_add(dir_size(&self.root.join("keylog"))?)
-            .saturating_add(dir_size(&self.root.join("history"))?);
+        let blobs = dir_size(&*self.fs, &self.root.join("assets"))?;
+        let oplog = dir_size(&*self.fs, &self.root.join("ops"))?
+            .saturating_add(dir_size(&*self.fs, &self.root.join("snapshots"))?);
+        let mut meta = dir_size(&*self.fs, &self.root.join("roster"))?
+            .saturating_add(dir_size(&*self.fs, &self.root.join("keylog"))?)
+            .saturating_add(dir_size(&*self.fs, &self.root.join("history"))?);
         // Bare files directly at the vault root (the `founder` pin, the
         // `peers.json` roster cache, the vault-key file, …) are all metadata.
         // Count them generically so a new root-level file is never silently
         // dropped from the total — subdirectories are summed above.
-        meta = meta.saturating_add(root_file_bytes(&self.root)?);
+        meta = meta.saturating_add(root_file_bytes(&*self.fs, &self.root)?);
         let total = blobs.saturating_add(oplog).saturating_add(meta);
         Ok(DataSize {
             blobs,
@@ -438,17 +463,17 @@ impl Store {
     /// peer's op-log line count. Later checkpoint compaction keys off these.
     pub fn write_snapshot(&self) -> Result<(), StorageError> {
         let path = self.root.join("snapshots").join("snapshot.loro");
-        snapshot::save(&path, &self.doc.snapshot()?)?;
+        snapshot::save(&*self.fs, &path, &self.doc.snapshot()?)?;
 
         let frontier = self.doc.oplog_frontier();
         let mut log_lens = std::collections::BTreeMap::new();
-        log_lens.insert(self.peer_id(), count_log_lines(&self.own_log.path()));
+        log_lens.insert(self.peer_id(), count_log_lines(&*self.fs, &self.own_log.path()));
         for peer in &self.peers {
             let path = self
                 .root
                 .join("ops")
                 .join(format!("ops-{}.jsonl", peer.peer_id));
-            log_lens.insert(peer.peer_id, count_log_lines(&path));
+            log_lens.insert(peer.peer_id, count_log_lines(&*self.fs, &path));
         }
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -464,7 +489,7 @@ impl Store {
 
     /// The raw bytes of this device's own oplog file (for copying to a peer).
     pub fn export_own_log(&self) -> Result<Vec<u8>, StorageError> {
-        match std::fs::read(self.own_log.path()) {
+        match self.fs.read(&self.own_log.path()) {
             Ok(b) => Ok(b),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
             Err(e) => Err(e.into()),
@@ -502,7 +527,7 @@ impl Store {
     /// for relaying a third-party log to another peer. NotFound ⇒ empty.
     pub fn export_peer_log(&self, peer_id: u64) -> Result<Vec<u8>, StorageError> {
         let path = self.root.join("ops").join(format!("ops-{peer_id}.jsonl"));
-        match std::fs::read(&path) {
+        match self.fs.read(&path) {
             Ok(b) => Ok(b),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
             Err(e) => Err(e.into()),
@@ -657,11 +682,11 @@ impl Store {
                 "founder must be Admin (it is the vault's root authority)".into(),
             ));
         }
-        if crate::founder::read_founder(&self.root)?.is_some() {
+        if crate::founder::read_founder(&*self.fs, &self.root)?.is_some() {
             return Err(StorageError::Peer("vault founder already pinned".into()));
         }
         let me = self.identity.peer_id();
-        crate::founder::write_founder(&self.root, me)?;
+        crate::founder::write_founder(&*self.fs, &self.root, me)?;
         self.founder = Some(me);
         let key = self.identity.verifying_key().to_bytes();
         let lamport = self.next_role_lamport(me)?;
@@ -699,13 +724,13 @@ impl Store {
     /// Write a founder pin delivered out-of-band (joiner). Idempotent if it matches;
     /// refuses a conflicting re-pin.
     pub fn pin_founder(&mut self, peer_id: u64) -> Result<(), StorageError> {
-        match crate::founder::read_founder(&self.root)? {
+        match crate::founder::read_founder(&*self.fs, &self.root)? {
             Some(existing) if existing == peer_id => Ok(()),
             Some(existing) => Err(StorageError::Peer(format!(
                 "founder already pinned to {existing}, refusing to re-pin to {peer_id}"
             ))),
             None => {
-                crate::founder::write_founder(&self.root, peer_id)?;
+                crate::founder::write_founder(&*self.fs, &self.root, peer_id)?;
                 self.founder = Some(peer_id);
                 self.refresh_peers()
             }
@@ -747,6 +772,7 @@ impl Store {
     /// client (no dependence on which admin granted the prior role).
     fn next_role_lamport(&self, subject: u64) -> Result<u64, StorageError> {
         let entries = Self::collect_roster_entries(
+            &self.fs,
             &self.root,
             self.identity.peer_id(),
             &self.identity.verifying_key(),
@@ -769,6 +795,7 @@ impl Store {
 
     fn refresh_peers(&mut self) -> Result<(), StorageError> {
         self.peers = Self::rebuild_peers(
+            &self.fs,
             &self.root,
             self.identity.peer_id(),
             &self.identity.verifying_key(),
@@ -779,7 +806,7 @@ impl Store {
 
     /// The raw bytes of this device's own roster log (for copying to a peer).
     pub fn export_own_roster(&self) -> Result<Vec<u8>, StorageError> {
-        match std::fs::read(self.own_roster.path()) {
+        match self.fs.read(&self.own_roster.path()) {
             Ok(b) => Ok(b),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
             Err(e) => Err(e.into()),
@@ -802,8 +829,8 @@ impl Store {
         }
 
         let roster_dir = self.roster_dir();
-        std::fs::create_dir_all(&roster_dir)?;
-        let roster_log = RosterLog::new(&roster_dir, author);
+        self.fs.create_dir_all(&roster_dir)?;
+        let roster_log = RosterLog::new_with_fs(&roster_dir, author, self.fs.clone());
         let roster_path = roster_log.path();
 
         // H-B: roster logs are append-only, so a correct incoming log is a byte
@@ -813,7 +840,7 @@ impl Store {
         // (e.g. omitting a `Revoke`) that a length-only guard would let clobber the
         // good copy. Take the incoming bytes only when they truly extend ours (or
         // are an identical resend); refuse a stale prefix, a shrink, or a fork.
-        if let Ok(existing) = std::fs::read(&roster_path) {
+        if let Ok(existing) = self.fs.read(&roster_path) {
             if !bytes.starts_with(&existing) {
                 return Err(StorageError::Peer(format!(
                     "refusing to clobber roster {author} log with a non-extending fork \
@@ -826,7 +853,7 @@ impl Store {
 
         // Verify BEFORE persisting: a forged/tampered roster must never touch disk.
         roster_log.verify_bytes(key, &bytes)?;
-        std::fs::write(&roster_path, &bytes)?;
+        self.fs.write(&roster_path, &bytes)?;
         self.refresh_peers()
     }
 
@@ -839,14 +866,13 @@ impl Store {
     pub fn export_all_rosters(&self) -> Result<Vec<(u64, Vec<u8>)>, StorageError> {
         let roster_dir = self.roster_dir();
         let mut out = Vec::new();
-        let entries = match std::fs::read_dir(&roster_dir) {
+        let entries = match self.fs.read_dir(&roster_dir) {
             Ok(rd) => rd,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
             Err(e) => return Err(e.into()),
         };
         for entry in entries {
-            let entry = entry?;
-            let name = entry.file_name();
+            let name = entry.file_name().unwrap_or_default().to_os_string();
             let Some(name) = name.to_str() else { continue };
             // Filenames are `roster-<author>.jsonl`; skip anything else.
             let Some(rest) = name.strip_prefix("roster-") else {
@@ -858,7 +884,7 @@ impl Store {
             let Ok(author) = author_str.parse::<u64>() else {
                 continue;
             };
-            let bytes = std::fs::read(entry.path())?;
+            let bytes = self.fs.read(&entry)?;
             out.push((author, bytes));
         }
         Ok(out)
@@ -872,14 +898,14 @@ impl Store {
     /// author's log as it folds, and skips any that fail.
     pub fn import_roster_bundle(&mut self, logs: Vec<(u64, Vec<u8>)>) -> Result<(), StorageError> {
         let roster_dir = self.roster_dir();
-        std::fs::create_dir_all(&roster_dir)?;
+        self.fs.create_dir_all(&roster_dir)?;
         let me = self.identity.peer_id();
         for (author, bytes) in logs {
             // Never overwrite our own roster log with foreign bytes.
             if author == me {
                 continue;
             }
-            let roster_log = RosterLog::new(&roster_dir, author);
+            let roster_log = RosterLog::new_with_fs(&roster_dir, author, self.fs.clone());
             let roster_path = roster_log.path();
             // M6/N4: roster logs are append-only, so a correct incoming log is
             // byte-PREFIX-consistent with what we already hold. Because these
@@ -890,7 +916,7 @@ impl Store {
             // ours for a stale prefix; and REFUSE a fork (neither is a prefix of
             // the other). Bundles always ship an author's FULL log, so there is no
             // mid-log suffix case to reconcile (unlike `apply_peer_ops`).
-            if let Ok(existing) = std::fs::read(&roster_path) {
+            if let Ok(existing) = self.fs.read(&roster_path) {
                 if bytes.starts_with(&existing) {
                     // Genuine append-only extension (or an identical resend) → take it.
                 } else {
@@ -898,7 +924,7 @@ impl Store {
                     continue;
                 }
             }
-            std::fs::write(&roster_path, &bytes)?;
+            self.fs.write(&roster_path, &bytes)?;
         }
         self.refresh_peers()
     }
@@ -913,7 +939,7 @@ impl Store {
     fn merged_keylog(&self) -> Result<Vec<KeyLogEntry>, StorageError> {
         let dir = self.keylog_dir();
         let mut all = Vec::new();
-        let own = KeyLog::new(&dir, self.identity.peer_id());
+        let own = KeyLog::new_with_fs(&dir, self.identity.peer_id(), self.fs.clone());
         all.extend(own.read_verified(&self.identity.verifying_key())?);
         for peer in self.peers.iter() {
             // N5: epoch rotation is Admin-only. Fold a peer's key-log ONLY if its
@@ -930,7 +956,7 @@ impl Store {
             let Ok(pkey) = VerifyingKey::from_bytes(&peer.verifying_key) else {
                 continue;
             };
-            let log = KeyLog::new(&dir, peer.peer_id);
+            let log = KeyLog::new_with_fs(&dir, peer.peer_id, self.fs.clone());
             all.extend(log.read_verified(&pkey)?);
         }
         Ok(all)
@@ -985,7 +1011,7 @@ impl Store {
         rand::rngs::OsRng.fill_bytes(&mut new_key);
         let epoch_id = compute_epoch_id(&parents, self.identity.peer_id(), &nonce, &new_key);
 
-        let log = KeyLog::new(&self.keylog_dir(), self.identity.peer_id());
+        let log = KeyLog::new_with_fs(&self.keylog_dir(), self.identity.peer_id(), self.fs.clone());
         log.append(
             &self.identity,
             epoch_id,
@@ -1052,7 +1078,7 @@ impl Store {
         if targets.is_empty() {
             return Ok(0);
         }
-        let log = KeyLog::new(&self.keylog_dir(), self.identity.peer_id());
+        let log = KeyLog::new_with_fs(&self.keylog_dir(), self.identity.peer_id(), self.fs.clone());
         let mut published = 0;
         for (epoch, key, peer_id) in targets {
             let pub_x = match self.peers.iter().find(|p| p.peer_id == peer_id) {
@@ -1105,7 +1131,7 @@ impl Store {
         let kc = self.keychain(id_key, epoch0_key)?;
         let entries = self.merged_keylog()?;
         let self_pub = self.identity.x25519_public();
-        let log = KeyLog::new(&self.keylog_dir(), self.identity.peer_id());
+        let log = KeyLog::new_with_fs(&self.keylog_dir(), self.identity.peer_id(), self.fs.clone());
 
         let mut recovered = 0usize;
         let mut done: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
@@ -1154,7 +1180,7 @@ impl Store {
 
     /// The raw bytes of this device's own key-log (for copying to a peer).
     pub fn export_own_keylog(&self) -> Result<Vec<u8>, StorageError> {
-        match std::fs::read(KeyLog::new(&self.keylog_dir(), self.identity.peer_id()).path()) {
+        match self.fs.read(&KeyLog::new_with_fs(&self.keylog_dir(), self.identity.peer_id(), self.fs.clone()).path()) {
             Ok(b) => Ok(b),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
             Err(e) => Err(e.into()),
@@ -1163,7 +1189,7 @@ impl Store {
 
     /// The raw bytes of `author`'s stored key-log (for relaying). NotFound ⇒ empty.
     pub fn export_keylog(&self, author: u64) -> Result<Vec<u8>, StorageError> {
-        match std::fs::read(KeyLog::new(&self.keylog_dir(), author).path()) {
+        match self.fs.read(&KeyLog::new_with_fs(&self.keylog_dir(), author, self.fs.clone()).path()) {
             Ok(b) => Ok(b),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
             Err(e) => Err(e.into()),
@@ -1184,15 +1210,15 @@ impl Store {
             ));
         }
         let dir = self.keylog_dir();
-        std::fs::create_dir_all(&dir)?;
-        let log = KeyLog::new(&dir, author);
+        self.fs.create_dir_all(&dir)?;
+        let log = KeyLog::new_with_fs(&dir, author, self.fs.clone());
         let path = log.path();
         // H-B: key-logs are append-only — a correct incoming log is a byte PREFIX
         // extension of ours. `verify_bytes` proves author-signing, not prefix
         // consistency; a divergent longer fork must not clobber ours (which would
         // drop a previously-published `Rotate`/`Wrap` from the epoch DAG). Refuse
         // anything that is not a genuine extension (or identical resend).
-        if let Ok(existing) = std::fs::read(&path) {
+        if let Ok(existing) = self.fs.read(&path) {
             if !bytes.starts_with(&existing) {
                 return Err(StorageError::Peer(format!(
                     "refusing to clobber keylog {author} with a non-extending fork \
@@ -1203,7 +1229,7 @@ impl Store {
             }
         }
         log.verify_bytes(key, &bytes)?;
-        std::fs::write(&path, &bytes)?;
+        self.fs.write(&path, &bytes)?;
         Ok(())
     }
 
@@ -1244,7 +1270,7 @@ impl Store {
         }
 
         let ops_dir = self.root.join("ops");
-        std::fs::create_dir_all(&ops_dir)?;
+        self.fs.create_dir_all(&ops_dir)?;
         let peer_log_path = ops_dir.join(format!("ops-{peer_id}.jsonl"));
 
         // Op logs are append-only and single-author, so every correct copy of an
@@ -1257,7 +1283,7 @@ impl Store {
         // clobber newer peer ops already on disk. (`apply_peer_ops` never trips it
         // — it always yields a longer-or-equal log; it only catches a raw,
         // out-of-band shorter `import_peer` call.)
-        if let Ok(existing) = std::fs::read(&peer_log_path) {
+        if let Ok(existing) = self.fs.read(&peer_log_path) {
             if log_bytes.len() < existing.len() {
                 return Err(StorageError::Peer(format!(
                     "refusing to shrink peer {peer_id} log ({} < {} bytes)",
@@ -1270,7 +1296,7 @@ impl Store {
         // Verify BEFORE persisting: a forged/tampered peer log must never touch
         // disk (it would become a live corruption source once `open` replays
         // peer logs). Only after full verification do we write, then merge.
-        let peer_log = OpLog::new(&ops_dir, peer_id);
+        let peer_log = OpLog::new_with_fs(&ops_dir, peer_id, self.fs.clone());
         let entries = peer_log.verify_bytes(key, &log_bytes)?;
         // EN1: reject BEFORE persisting if any entry's update carries ops
         // attributed to a loro peer other than `peer_id`. The ed25519 signature
@@ -1284,7 +1310,7 @@ impl Store {
         }
         // All entries are author-clean; persist and merge (plain import — the
         // authorship invariant is already established above).
-        std::fs::write(&peer_log_path, &log_bytes)?;
+        self.fs.write(&peer_log_path, &log_bytes)?;
         for entry in entries {
             self.doc.import(&entry.update)?;
         }
@@ -1345,12 +1371,12 @@ impl Store {
     fn write_peers_cache(&self) -> Result<(), StorageError> {
         let path = self.root.join("peers.json");
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            self.fs.create_dir_all(parent)?;
         }
         let tmp = path.with_extension("json.tmp");
         let bytes = serde_json::to_vec(&self.peers)?;
-        std::fs::write(&tmp, &bytes)?;
-        std::fs::rename(&tmp, &path)?;
+        self.fs.write(&tmp, &bytes)?;
+        self.fs.rename(&tmp, &path)?;
         Ok(())
     }
 
@@ -1383,7 +1409,7 @@ impl Store {
 
     /// Bytes a checkpoint at `before_ts` would free (blobs). No mutation.
     pub fn checkpoint_dry_run(&self, before_ts: i64) -> Result<u64, StorageError> {
-        let idx = HistoryIndex::new(&self.root.join("history"));
+        let idx = HistoryIndex::new_with_fs(&self.root.join("history"), self.fs.clone());
         let target = match idx.marker_before(before_ts)? {
             Some(m) => m,
             None => return Ok(0),
@@ -1412,7 +1438,7 @@ impl Store {
     /// emits no ops. Returns bytes freed. `i64::MAX` = checkpoint to latest.
     pub fn checkpoint(&mut self, before_ts: i64) -> Result<u64, StorageError> {
         use roam_crdt::Frontier;
-        let idx = HistoryIndex::new(&self.root.join("history"));
+        let idx = HistoryIndex::new_with_fs(&self.root.join("history"), self.fs.clone());
         let target = match idx.marker_before(before_ts)? {
             Some(m) => m,
             None => return Ok(0),
@@ -1433,7 +1459,7 @@ impl Store {
             .map_err(|e| StorageError::Base64(e.to_string()))?;
         let frontier = Frontier::from_bytes(&fbytes)?;
         let shallow = self.doc.shallow_snapshot(&frontier)?;
-        crate::snapshot::save(&self.root.join("snapshots").join("snapshot.loro"), &shallow)?;
+        crate::snapshot::save(&*self.fs, &self.root.join("snapshots").join("snapshot.loro"), &shallow)?;
 
         // 3. Truncate each peer op-log to its retained tail.
         let plan = crate::checkpoint::plan_from_marker(&target);
@@ -1443,7 +1469,7 @@ impl Store {
             } else {
                 self.root.join("ops").join(format!("ops-{peer}.jsonl"))
             };
-            truncate_leading_lines(&path, *drop as usize)?;
+            truncate_leading_lines(&*self.fs, &path, *drop as usize)?;
         }
 
         // 4. Reclaim unreferenced blobs.
@@ -1456,7 +1482,7 @@ impl Store {
         }
 
         // 5. Compact history to the retained markers.
-        rewrite_history(&self.root.join("history"), &all, target.ts_ms)?;
+        rewrite_history(&*self.fs, &self.root.join("history"), &all, target.ts_ms)?;
         Ok(freed)
     }
 
@@ -1475,7 +1501,7 @@ impl Store {
         before_ts: i64,
     ) -> Result<Option<BackendSnapshot>, StorageError> {
         use roam_crdt::Frontier;
-        let idx = HistoryIndex::new(&self.root.join("history"));
+        let idx = HistoryIndex::new_with_fs(&self.root.join("history"), self.fs.clone());
         let target = match idx.marker_before(before_ts)? {
             Some(m) => m,
             None => return Ok(None),
@@ -1533,26 +1559,21 @@ impl Store {
             return Ok(());
         }
         let dir = self.root.join("snapshots");
-        std::fs::create_dir_all(&dir)?;
+        self.fs.create_dir_all(&dir)?;
         let held = HeldSnapshot {
             id: id.to_string(),
             subsumed: subsumed.to_vec(),
         };
         let mut line = serde_json::to_vec(&held)?;
         line.push(b'\n');
-        use std::io::Write;
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(dir.join("held.jsonl"))?;
-        f.write_all(&line)?;
+        self.fs.append(&dir.join("held.jsonl"), &line)?;
         Ok(())
     }
 
     /// The backend snapshots this device holds (see [`Store::record_held_snapshot`]).
     pub fn held_snapshots(&self) -> Result<Vec<HeldSnapshot>, StorageError> {
         let path = self.root.join("snapshots").join("held.jsonl");
-        let text = match std::fs::read_to_string(&path) {
+        let text = match self.fs.read_to_string(&path) {
             Ok(t) => t,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(e.into()),
@@ -1574,19 +1595,15 @@ impl Store {
         if self.poisoned_ids()?.contains(id) {
             return Ok(());
         }
-        use std::io::Write;
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.root.join("poisoned.jsonl"))?;
-        writeln!(f, "{id}")?;
+        self.fs
+            .append(&self.root.join("poisoned.jsonl"), format!("{id}\n").as_bytes())?;
         Ok(())
     }
 
     /// Backend ids this device has marked poisoned (see [`Store::mark_poisoned`]).
     pub fn poisoned_ids(&self) -> Result<std::collections::BTreeSet<String>, StorageError> {
         let path = self.root.join("poisoned.jsonl");
-        let text = match std::fs::read_to_string(&path) {
+        let text = match self.fs.read_to_string(&path) {
             Ok(t) => t,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
             Err(e) => return Err(e.into()),
@@ -1604,10 +1621,10 @@ impl Store {
     /// Atomic: write to `<id>.tmp` then rename. Idempotent overwrite.
     pub fn persist_snapshot_object(&self, id: &str, framed: &[u8]) -> Result<(), StorageError> {
         let dir = self.root.join("snapshots");
-        std::fs::create_dir_all(&dir)?;
+        self.fs.create_dir_all(&dir)?;
         let tmp = dir.join(format!("{id}.tmp"));
-        std::fs::write(&tmp, framed)?;
-        std::fs::rename(&tmp, dir.join(id))?;
+        self.fs.write(&tmp, framed)?;
+        self.fs.rename(&tmp, &dir.join(id))?;
         Ok(())
     }
 
@@ -1616,15 +1633,14 @@ impl Store {
     /// (`held.jsonl`), and any in-flight `.tmp`.
     pub fn held_snapshot_ids(&self) -> Result<Vec<String>, StorageError> {
         let dir = self.root.join("snapshots");
-        let names = match std::fs::read_dir(&dir) {
+        let names = match self.fs.read_dir(&dir) {
             Ok(rd) => rd,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(e.into()),
         };
         let mut out = Vec::new();
         for ent in names {
-            let ent = ent?;
-            let name = ent.file_name().to_string_lossy().into_owned();
+            let name = ent.file_name().unwrap_or_default().to_string_lossy().into_owned();
             if name == "snapshot.loro" || name == "held.jsonl" || name.ends_with(".tmp") {
                 continue;
             }
@@ -1637,7 +1653,7 @@ impl Store {
     /// Read the framed snapshot object for `id`, or `None` if not held.
     pub fn load_snapshot_object(&self, id: &str) -> Result<Option<Vec<u8>>, StorageError> {
         let path = self.root.join("snapshots").join(id);
-        match std::fs::read(&path) {
+        match self.fs.read(&path) {
             Ok(bytes) => Ok(Some(bytes)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e.into()),
@@ -1648,7 +1664,7 @@ impl Store {
     /// for client-side GC; the library never calls this as policy. Missing = Ok.
     pub fn drop_snapshot(&self, id: &str) -> Result<(), StorageError> {
         let path = self.root.join("snapshots").join(id);
-        match std::fs::remove_file(&path) {
+        match self.fs.remove_file(&path) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
@@ -1661,7 +1677,7 @@ impl Store {
             .collect();
         let held_path = self.root.join("snapshots").join("held.jsonl");
         if kept.is_empty() {
-            match std::fs::remove_file(&held_path) {
+            match self.fs.remove_file(&held_path) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e.into()),
@@ -1672,7 +1688,7 @@ impl Store {
                 buf.extend_from_slice(&serde_json::to_vec(h)?);
                 buf.push(b'\n');
             }
-            std::fs::write(&held_path, buf)?;
+            self.fs.write(&held_path, &buf)?;
         }
         Ok(())
     }
@@ -1691,7 +1707,7 @@ impl Store {
         // lost on reload. No history marker: adopting a peer's snapshot is not a
         // local checkpoint moment.
         let path = self.root.join("snapshots").join("snapshot.loro");
-        snapshot::save(&path, &self.doc.snapshot()?)?;
+        snapshot::save(&*self.fs, &path, &self.doc.snapshot()?)?;
         // Advance `persisted` so these foreign ops are never re-exported into our
         // own (own-key-signed) log — mirrors `import_peer`.
         self.persisted = self.doc.version();
@@ -1708,7 +1724,7 @@ impl Store {
         key: &str,
         before_ts: i64,
     ) -> Result<Option<String>, StorageError> {
-        let idx = HistoryIndex::new(&self.root.join("history"));
+        let idx = HistoryIndex::new_with_fs(&self.root.join("history"), self.fs.clone());
         let marker = match idx.marker_before(before_ts)? {
             Some(m) => m,
             None => return Ok(None),
@@ -1838,8 +1854,8 @@ fn split_log_lines_bytes(log: &[u8]) -> Vec<Vec<u8>> {
 }
 
 /// Drop the first `n` non-empty lines from a JSONL file, rewriting atomically.
-fn truncate_leading_lines(path: &std::path::Path, n: usize) -> Result<(), StorageError> {
-    let text = match std::fs::read_to_string(path) {
+fn truncate_leading_lines(fs: &dyn VaultFs, path: &std::path::Path, n: usize) -> Result<(), StorageError> {
+    let text = match fs.read_to_string(path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e.into()),
@@ -1854,13 +1870,14 @@ fn truncate_leading_lines(path: &std::path::Path, n: usize) -> Result<(), Storag
         out.push('\n');
     }
     let tmp = path.with_extension("jsonl.tmp");
-    std::fs::write(&tmp, out.as_bytes())?;
-    std::fs::rename(&tmp, path)?;
+    fs.write(&tmp, out.as_bytes())?;
+    fs.rename(&tmp, path)?;
     Ok(())
 }
 
 /// Rewrite history.jsonl keeping only markers with `ts_ms >= keep_from`.
 fn rewrite_history(
+    fs: &dyn VaultFs,
     dir: &std::path::Path,
     all: &[Marker],
     keep_from: i64,
@@ -1872,8 +1889,8 @@ fn rewrite_history(
         out.push('\n');
     }
     let tmp = path.with_extension("jsonl.tmp");
-    std::fs::write(&tmp, out.as_bytes())?;
-    std::fs::rename(&tmp, &path)?;
+    fs.write(&tmp, out.as_bytes())?;
+    fs.rename(&tmp, &path)?;
     Ok(())
 }
 

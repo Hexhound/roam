@@ -1,0 +1,7 @@
+assets/d3e12b38a0d9df5d327e64c6f12296d1fa332b0b9e06b3be601db24445cfd4d4
+founder
+history/history.jsonl
+ops/ops-<PEER>.jsonl
+peers.json
+roster/roster-<PEER>.jsonl
+snapshots/snapshot.loro

@@ -8,8 +8,9 @@
 //! hash before transferring bytes over the wire.
 
 use crate::error::StorageError;
-use std::io::{Read, Seek, SeekFrom, Write};
+use crate::vfs::{NativeFs, VaultFs};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// A blake3 hex digest is exactly 32 bytes rendered as 64 lowercase hex chars.
 const HASH_HEX_LEN: usize = 64;
@@ -22,15 +23,22 @@ const HASH_HEX_LEN: usize = 64;
 /// only ever references the hash.
 pub struct BlobStore {
     root: PathBuf,
+    fs: Arc<dyn VaultFs>,
 }
 
 impl BlobStore {
     /// Open a blob store rooted at `assets_dir`, creating the directory (and
     /// any missing parents) if absent.
     pub fn open(assets_dir: &Path) -> Result<Self, StorageError> {
-        std::fs::create_dir_all(assets_dir)?;
+        Self::open_with_fs(assets_dir, Arc::new(NativeFs))
+    }
+
+    /// [`BlobStore::open`], but persisting through a caller-supplied backend.
+    pub fn open_with_fs(assets_dir: &Path, fs: Arc<dyn VaultFs>) -> Result<Self, StorageError> {
+        fs.create_dir_all(assets_dir)?;
         Ok(Self {
             root: assets_dir.to_path_buf(),
+            fs,
         })
     }
 
@@ -52,7 +60,7 @@ impl BlobStore {
 
         // Dedup: an existing blob with this hash already holds these exact bytes
         // (the filename is the content hash), so never rewrite it.
-        if path.exists() {
+        if self.fs.exists(&path) {
             return Ok(hash);
         }
 
@@ -61,11 +69,11 @@ impl BlobStore {
         // (unique per content) so concurrent puts of distinct blobs never race
         // on the same temp path.
         let temp = self.root.join(format!("{hash}.tmp"));
-        std::fs::write(&temp, bytes)?;
-        match std::fs::rename(&temp, &path) {
+        self.fs.write(&temp, bytes)?;
+        match self.fs.rename(&temp, &path) {
             Ok(()) => Ok(hash),
             Err(err) => {
-                let _ = std::fs::remove_file(&temp);
+                let _ = self.fs.remove_file(&temp);
                 Err(err.into())
             }
         }
@@ -78,7 +86,7 @@ impl BlobStore {
     /// [`StorageError::Blob`] error rather than ever handing back wrong bytes.
     pub fn get(&self, hash: &str) -> Result<Option<Vec<u8>>, StorageError> {
         let path = self.blob_path(hash)?;
-        let bytes = match std::fs::read(&path) {
+        let bytes = match self.fs.read(&path) {
             Ok(bytes) => bytes,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(err) => return Err(err.into()),
@@ -95,7 +103,7 @@ impl BlobStore {
     /// present (and never touches the filesystem outside `assets`).
     pub fn has(&self, hash: &str) -> bool {
         match self.blob_path(hash) {
-            Ok(path) => path.exists(),
+            Ok(path) => self.fs.exists(&path),
             Err(_) => false,
         }
     }
@@ -104,7 +112,7 @@ impl BlobStore {
     /// so this is safe to call from a later garbage collector.
     pub fn remove(&self, hash: &str) -> Result<(), StorageError> {
         let path = self.blob_path(hash)?;
-        match std::fs::remove_file(&path) {
+        match self.fs.remove_file(&path) {
             Ok(()) => Ok(()),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(err) => Err(err.into()),
@@ -115,8 +123,11 @@ impl BlobStore {
     /// leftover `.tmp`) are skipped, so the list is exactly the valid hashes.
     pub fn list(&self) -> Result<Vec<String>, StorageError> {
         let mut hashes = Vec::new();
-        for entry in std::fs::read_dir(&self.root)? {
-            let name = entry?.file_name();
+        for entry in self.fs.read_dir(&self.root)? {
+            let name = match entry.file_name() {
+                Some(n) => n.to_os_string(),
+                None => continue,
+            };
             if let Some(name) = name.to_str() {
                 if is_valid_hash(name) {
                     hashes.push(name.to_string());
@@ -130,8 +141,8 @@ impl BlobStore {
     /// checkpoint reclaim accounting without reading the whole file.
     pub fn size(&self, hash: &str) -> Result<Option<u64>, StorageError> {
         let path = self.blob_path(hash)?;
-        match std::fs::metadata(&path) {
-            Ok(m) => Ok(Some(m.len())),
+        match self.fs.file_len(&path) {
+            Ok(len) => Ok(Some(len)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e.into()),
         }
@@ -170,21 +181,8 @@ impl BlobStore {
     /// is never fully loaded into memory for a single transfer.
     pub fn read_range(&self, hash: &str, offset: u64, len: usize) -> Result<Vec<u8>, StorageError> {
         let path = self.blob_path(hash)?;
-        let mut file = std::fs::File::open(&path)?;
-        file.seek(SeekFrom::Start(offset))?;
-
-        let mut buf = vec![0u8; len];
-        let mut filled = 0;
-        while filled < len {
-            let read = file.read(&mut buf[filled..])?;
-            if read == 0 {
-                // Hit EOF before filling the requested length — clamp.
-                break;
-            }
-            filled += read;
-        }
-        buf.truncate(filled);
-        Ok(buf)
+        // The backend clamps at EOF for us.
+        Ok(self.fs.read_range(&path, offset, len)?)
     }
 
     /// Write one chunk of an in-flight blob into `incoming/<hash>.part`.
@@ -221,15 +219,10 @@ impl BlobStore {
         }
 
         let dir = self.incoming_dir();
-        std::fs::create_dir_all(&dir)?;
+        self.fs.create_dir_all(&dir)?;
         let part = dir.join(format!("{hash}.part"));
 
-        let existed = part.exists();
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .open(&part)?;
+        let existed = self.fs.exists(&part);
         // Pin `total_len` to the first-seen value. It is a property of the
         // content-addressed hash, so every honest chunk for a hash carries the
         // same value; a co-serving peer that re-announces a DIFFERENT (smaller)
@@ -238,17 +231,16 @@ impl BlobStore {
         // finalizes, repeatable to stall it forever. Size the file once on
         // creation and refuse any later disagreement.
         if existed {
-            let pinned = file.metadata()?.len();
+            let pinned = self.fs.file_len(&part)?;
             if pinned != total_len {
                 return Err(StorageError::Blob(format!(
                     "blob chunk total_len {total_len} disagrees with pinned {pinned} for {hash}"
                 )));
             }
         } else {
-            file.set_len(total_len)?;
+            self.fs.create_sized(&part, total_len)?;
         }
-        file.seek(SeekFrom::Start(offset))?;
-        file.write_all(bytes)?;
+        self.fs.write_range(&part, offset, bytes)?;
         Ok(())
     }
 
@@ -266,7 +258,7 @@ impl BlobStore {
         }
 
         let part = self.incoming_dir().join(format!("{hash}.part"));
-        let bytes = match std::fs::read(&part) {
+        let bytes = match self.fs.read(&part) {
             Ok(bytes) => bytes,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(err) => return Err(err.into()),
@@ -274,12 +266,12 @@ impl BlobStore {
 
         if Self::hash(&bytes) != hash {
             // Poisoned or incomplete: never let this become a readable blob.
-            let _ = std::fs::remove_file(&part);
+            let _ = self.fs.remove_file(&part);
             return Ok(false);
         }
 
         let final_path = self.root.join(hash);
-        match std::fs::rename(&part, &final_path) {
+        match self.fs.rename(&part, &final_path) {
             Ok(()) => Ok(true),
             Err(_) => {
                 // Cross-filesystem rename can fail even though the content is
@@ -287,8 +279,8 @@ impl BlobStore {
                 // finished blob still lands. Always clean up the `.part`,
                 // even if the write itself fails, so a failed fallback never
                 // leaves scratch debris behind.
-                let written = std::fs::write(&final_path, &bytes);
-                let _ = std::fs::remove_file(&part);
+                let written = self.fs.write(&final_path, &bytes);
+                let _ = self.fs.remove_file(&part);
                 written?;
                 Ok(true)
             }
@@ -305,7 +297,7 @@ impl BlobStore {
         }
 
         let part = self.incoming_dir().join(format!("{hash}.part"));
-        match std::fs::remove_file(&part) {
+        match self.fs.remove_file(&part) {
             Ok(()) => Ok(()),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(err) => Err(err.into()),

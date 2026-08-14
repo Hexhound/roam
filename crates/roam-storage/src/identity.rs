@@ -1,4 +1,5 @@
 use crate::error::StorageError;
+use crate::vfs::{NativeFs, VaultFs};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey as DalekVerifyingKey};
 use rand::rngs::OsRng;
@@ -101,8 +102,13 @@ impl Identity {
     /// (`0600` on unix) and atomically (write to a temp file, then rename) — the
     /// secret is irreplaceable, so a half-written file must never clobber it.
     pub fn save(&self, path: &Path) -> Result<(), StorageError> {
+        self.save_with_fs(&NativeFs, path)
+    }
+
+    /// [`Identity::save`], but persisting through a caller-supplied backend.
+    pub fn save_with_fs(&self, fs: &dyn VaultFs, path: &Path) -> Result<(), StorageError> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            fs.create_dir_all(parent)?;
         }
         let file = IdentityFile {
             peer_id: self.peer_id,
@@ -111,19 +117,22 @@ impl Identity {
         let bytes = serde_json::to_vec_pretty(&file)?;
 
         let tmp = path.with_extension("key.tmp");
-        std::fs::write(&tmp, &bytes)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-        }
-        std::fs::rename(&tmp, path)?;
+        fs.write(&tmp, &bytes)?;
+        // Restrict BEFORE the rename: the secret must never be readable at its
+        // final path, however briefly.
+        fs.set_owner_only(&tmp)?;
+        fs.rename(&tmp, path)?;
         Ok(())
     }
 
     /// Load a previously saved identity.
     pub fn load(path: &Path) -> Result<Self, StorageError> {
-        let bytes = std::fs::read(path)?;
+        Self::load_with_fs(&NativeFs, path)
+    }
+
+    /// [`Identity::load`], but reading through a caller-supplied backend.
+    pub fn load_with_fs(fs: &dyn VaultFs, path: &Path) -> Result<Self, StorageError> {
+        let bytes = fs.read(path)?;
         let file: IdentityFile = serde_json::from_slice(&bytes)?;
         let raw = B64
             .decode(file.secret_key.as_bytes())
@@ -187,7 +196,41 @@ impl VerifyingKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vfs::MemFs;
     use tempfile::tempdir;
+
+    /// The secret key must be restricted on EVERY backend, and restricted on the
+    /// temp file so it is never exposed at its final path even briefly. `MemFs`
+    /// records the call, so this holds even where unix modes do not exist.
+    #[test]
+    fn saving_restricts_the_secret_before_publishing_it() {
+        let fs = MemFs::new();
+        let path = Path::new("/keys/identity.json");
+
+        Identity::generate().save_with_fs(&fs, path).unwrap();
+
+        assert!(
+            fs.is_owner_only(path),
+            "secret key was published without owner-only permissions"
+        );
+        assert!(
+            !fs.exists(&path.with_extension("key.tmp")),
+            "tmp file survived the rename"
+        );
+    }
+
+    #[test]
+    fn save_and_load_round_trip_on_a_non_native_backend() {
+        let fs = MemFs::new();
+        let path = Path::new("/keys/identity.json");
+
+        let original = Identity::generate();
+        original.save_with_fs(&fs, path).unwrap();
+        let loaded = Identity::load_with_fs(&fs, path).unwrap();
+
+        assert_eq!(loaded.peer_id(), original.peer_id());
+        assert_eq!(loaded.verifying_key_bytes(), original.verifying_key_bytes());
+    }
 
     #[test]
     fn generates_signs_and_verifies() {

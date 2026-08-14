@@ -7,9 +7,11 @@
 //! lines *after* its recorded length. Purely a local cache — never gossiped.
 
 use crate::error::StorageError;
+use crate::vfs::{NativeFs, VaultFs};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// One retained point in local history.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -25,36 +27,39 @@ pub struct Marker {
 /// Append-only marker log at `<dir>/history.jsonl`.
 pub struct HistoryIndex {
     path: PathBuf,
+    fs: Arc<dyn VaultFs>,
 }
 
 impl HistoryIndex {
-    /// Open (lazily; the file is created on first append) rooted at `dir`.
+    /// Open (lazily; the file is created on first append) rooted at `dir`,
+    /// backed by the real filesystem.
     pub fn new(dir: &Path) -> Self {
+        Self::new_with_fs(dir, Arc::new(NativeFs))
+    }
+
+    /// [`HistoryIndex::new`], but persisting through a caller-supplied backend.
+    pub fn new_with_fs(dir: &Path, fs: Arc<dyn VaultFs>) -> Self {
         Self {
             path: dir.join("history.jsonl"),
+            fs,
         }
     }
 
     /// Append one marker as a JSON line.
     pub fn append(&self, marker: &Marker) -> Result<(), StorageError> {
-        use std::io::Write;
         if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
+            self.fs.create_dir_all(parent)?;
         }
         let mut line = serde_json::to_string(marker)?;
         line.push('\n');
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
-        f.write_all(line.as_bytes())?;
+        self.fs.append(&self.path, line.as_bytes())?;
         Ok(())
     }
 
     /// All markers in write order. Missing file => empty. A torn final line
     /// (partial write) is tolerated and dropped, matching the op-log reader.
     pub fn markers(&self) -> Result<Vec<Marker>, StorageError> {
-        let text = match std::fs::read_to_string(&self.path) {
+        let text = match self.fs.read_to_string(&self.path) {
             Ok(t) => t,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(e.into()),
@@ -128,5 +133,44 @@ mod tests {
         idx.append(&marker(100)).unwrap();
         idx.append(&marker(200)).unwrap();
         assert_eq!(idx.latest().unwrap(), Some(marker(200)));
+    }
+
+    /// The index behaves identically off a non-`std::fs` backend, and appends
+    /// really append — a marker log that got rewritten would lose history.
+    #[test]
+    fn appends_on_a_non_native_backend_extend_the_log() {
+        use crate::vfs::MemFs;
+
+        let fs = Arc::new(MemFs::new());
+        let idx = HistoryIndex::new_with_fs(Path::new("/vault/history"), fs.clone());
+
+        assert_eq!(idx.markers().unwrap(), vec![], "absent log reads empty");
+
+        idx.append(&marker(100)).unwrap();
+        let after_first = fs.read(Path::new("/vault/history/history.jsonl")).unwrap();
+
+        idx.append(&marker(200)).unwrap();
+        let after_second = fs.read(Path::new("/vault/history/history.jsonl")).unwrap();
+
+        assert!(
+            after_second.starts_with(&after_first),
+            "second append rewrote the log instead of extending it"
+        );
+        assert_eq!(idx.markers().unwrap(), vec![marker(100), marker(200)]);
+    }
+
+    /// A torn final line is dropped rather than failing the whole read.
+    #[test]
+    fn a_torn_final_line_is_tolerated() {
+        use crate::vfs::MemFs;
+
+        let fs = Arc::new(MemFs::new());
+        let path = Path::new("/vault/history/history.jsonl");
+        let idx = HistoryIndex::new_with_fs(Path::new("/vault/history"), fs.clone());
+
+        idx.append(&marker(100)).unwrap();
+        fs.append(path, b"{\"ts_ms\":200,\"fron").unwrap(); // half a line
+
+        assert_eq!(idx.markers().unwrap(), vec![marker(100)]);
     }
 }

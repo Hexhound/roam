@@ -21,6 +21,7 @@ pub mod snapshot_msg;
 mod store;
 mod text_history;
 mod vault_key;
+pub mod vfs;
 
 pub use blob::BlobStore;
 pub use error::StorageError;

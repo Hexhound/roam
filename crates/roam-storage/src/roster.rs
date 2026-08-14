@@ -3,9 +3,9 @@ use crate::identity::{Identity, VerifyingKey};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use ed25519_dalek::Signature;
 use serde::{Deserialize, Serialize};
-use std::fs::OpenOptions;
-use std::io::Write;
+use crate::vfs::{NativeFs, VaultFs};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// A client role, ordered ascending by privilege so that `Ord`'s `min()`
 /// selects the LEAST privilege: Reader < Writer < Admin.
@@ -281,13 +281,20 @@ pub fn merge_roster(entries: &mut [RosterEntry], founder: Option<u64>) -> Vec<Pe
 pub struct RosterLog {
     path: PathBuf,
     author: u64,
+    fs: Arc<dyn VaultFs>,
 }
 
 impl RosterLog {
     pub fn new(dir: &Path, author: u64) -> Self {
+        Self::new_with_fs(dir, author, Arc::new(NativeFs))
+    }
+
+    /// [`RosterLog::new`], but persisting through a caller-supplied backend.
+    pub fn new_with_fs(dir: &Path, author: u64, fs: Arc<dyn VaultFs>) -> Self {
         Self {
             path: dir.join(format!("roster-{author}.jsonl")),
             author,
+            fs,
         }
     }
 
@@ -319,7 +326,7 @@ impl RosterLog {
             )));
         }
         if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
+            self.fs.create_dir_all(parent)?;
         }
         let seq = self.last_seq(&id.verifying_key())? + 1;
         let entry = RosterEntry {
@@ -343,27 +350,9 @@ impl RosterLog {
         let mut json = serde_json::to_vec(&line)?;
         json.push(b'\n');
 
-        // Whether this append creates the file (vs. extends an existing one).
-        let is_create = !self.path.exists();
-
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
-        file.write_all(&json)?;
-        file.sync_all()?;
-
-        // On file creation, the new directory entry itself must be flushed, or a
-        // power failure can lose the whole file (and thus the first entry) despite
-        // the content sync above. Only needed on create; append-to-existing is fine.
-        #[cfg(unix)]
-        if is_create {
-            if let Some(dir) = self.path.parent() {
-                if let Ok(d) = std::fs::File::open(dir) {
-                    let _ = d.sync_all();
-                }
-            }
-        }
+        // Durable append: membership changes gate access, so a lost entry is a
+        // security-relevant loss, not just a data one.
+        self.fs.append_sync(&self.path, &json)?;
         Ok(entry)
     }
 
@@ -374,7 +363,7 @@ impl RosterLog {
     /// pinned founder whose self-signed log is the only proof of its key. Returns
     /// `None` if the log is absent or carries no self entry.
     pub fn peek_self_key(&self) -> Result<Option<[u8; 32]>, StorageError> {
-        let text = match std::fs::read_to_string(&self.path) {
+        let text = match self.fs.read_to_string(&self.path) {
             Ok(t) => t,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e.into()),
@@ -401,7 +390,7 @@ impl RosterLog {
     /// Read every entry, verifying each signature against `key` (the author's).
     /// Same fail-closed + torn-tail rules as `OpLog::read_verified`.
     pub fn read_verified(&self, key: &VerifyingKey) -> Result<Vec<RosterEntry>, StorageError> {
-        let text = match std::fs::read_to_string(&self.path) {
+        let text = match self.fs.read_to_string(&self.path) {
             Ok(t) => t,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(e.into()),
