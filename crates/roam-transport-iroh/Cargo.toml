@@ -8,6 +8,7 @@ repository.workspace = true
 [dependencies]
 roam-sync-core = { path = "../roam-sync-core" }
 roam-storage = { path = "../roam-storage" }
+roam-pake = { path = "../roam-pake" }
 ed25519-dalek.workspace = true
 iroh.workspace = true
 iroh-mdns-address-lookup = { workspace = true }
@@ -24,3 +25,4 @@ zeroize = { workspace = true }
 
 [dev-dependencies]
 tempfile.workspace = true
+futures.workspace = true
