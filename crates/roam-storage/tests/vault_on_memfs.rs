@@ -27,8 +27,12 @@ fn a_full_vault_lifecycle_runs_entirely_on_a_non_filesystem_backend() {
             .expect("open vault on MemFs");
 
         store.declare_founder(Role::Admin).expect("declare founder");
-        store.edit_text(TEXT_ID, 0, "hello from memfs").expect("edit text");
-        store.set_entry("meta", "title", "Hello").expect("set entry");
+        store
+            .edit_text(TEXT_ID, 0, "hello from memfs")
+            .expect("edit text");
+        store
+            .set_entry("meta", "title", "Hello")
+            .expect("set entry");
         let hash = store.blobs().put(b"blob payload").expect("put blob");
         store.write_snapshot().expect("write snapshot");
 

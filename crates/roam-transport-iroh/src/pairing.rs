@@ -758,8 +758,9 @@ mod tests {
             "[fe80::1]:41234",
             "[2001:db8::dead:beef]:41234",
         ] {
-            addr.addrs
-                .insert(TransportAddr::Ip(a.parse::<std::net::SocketAddr>().unwrap()));
+            addr.addrs.insert(TransportAddr::Ip(
+                a.parse::<std::net::SocketAddr>().unwrap(),
+            ));
         }
         addr.addrs.insert(TransportAddr::Relay(
             "https://euw1-1.relay.iroh.network./".parse().unwrap(),

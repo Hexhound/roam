@@ -1,9 +1,9 @@
 use crate::error::StorageError;
 use crate::identity::{Identity, VerifyingKey};
+use crate::vfs::{NativeFs, VaultFs};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use ed25519_dalek::Signature;
 use serde::{Deserialize, Serialize};
-use crate::vfs::{NativeFs, VaultFs};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 

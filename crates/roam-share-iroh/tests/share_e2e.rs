@@ -62,8 +62,16 @@ async fn a_folder_and_a_file_transfer_with_the_right_code() {
     let dest = tempfile::tempdir().unwrap();
 
     let single = write(source.path(), "notes.txt", b"hello from the sender");
-    write(source.path(), "holiday/beach.jpg", b"\xff\xd8jpeg-ish bytes");
-    write(source.path(), "holiday/raw/DSC_0001.arw", &vec![7u8; 200_000]);
+    write(
+        source.path(),
+        "holiday/beach.jpg",
+        b"\xff\xd8jpeg-ish bytes",
+    );
+    write(
+        source.path(),
+        "holiday/raw/DSC_0001.arw",
+        &vec![7u8; 200_000],
+    );
     let folder = source.path().join("holiday");
 
     let (mut offer, sources) =
@@ -166,13 +174,18 @@ async fn declining_writes_nothing() {
     let (sender, code) = ShareSender::new(sender_endpoint, offer, sources);
     let serve = tokio::spawn(sender.serve_one());
 
-    let received = receive_share(&receiver_endpoint, sender_addr, &code, dest.path(), |_| false)
-        .await
-        .expect("declining is not an error");
+    let received = receive_share(&receiver_endpoint, sender_addr, &code, dest.path(), |_| {
+        false
+    })
+    .await
+    .expect("declining is not an error");
 
     assert!(received.files.is_empty());
     assert!(std::fs::read_dir(dest.path()).unwrap().next().is_none());
-    serve.await.unwrap().expect("sender handles a decline cleanly");
+    serve
+        .await
+        .unwrap()
+        .expect("sender handles a decline cleanly");
 }
 
 /// A symlink inside a shared folder must not be followed — otherwise "share this
@@ -314,13 +327,9 @@ async fn a_peer_that_connects_and_stalls_does_not_block_a_real_receiver() {
     let started = std::time::Instant::now();
     let received = tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        receive_share(
-            &receiver_endpoint,
-            sender_addr,
-            &code,
-            dest.path(),
-            |_| true,
-        ),
+        receive_share(&receiver_endpoint, sender_addr, &code, dest.path(), |_| {
+            true
+        }),
     )
     .await
     .expect("a stalled peer blocked the sender past any reasonable bound")
@@ -392,13 +401,9 @@ async fn junk_connections_cannot_retire_the_share_code() {
     // The code must still be good.
     let received = tokio::time::timeout(
         std::time::Duration::from_secs(20),
-        receive_share(
-            &receiver_endpoint,
-            sender_addr,
-            &code,
-            dest.path(),
-            |_| true,
-        ),
+        receive_share(&receiver_endpoint, sender_addr, &code, dest.path(), |_| {
+            true
+        }),
     )
     .await
     .expect("the sender stopped listening after junk connections")

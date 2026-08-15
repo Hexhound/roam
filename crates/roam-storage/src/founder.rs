@@ -40,7 +40,11 @@ mod tests {
     /// Runs against any backend: the founder pin is storage-agnostic, which is
     /// the whole point of routing it through `VaultFs`.
     fn round_trip(fs: &dyn VaultFs, root: &Path) {
-        assert_eq!(read_founder(fs, root).unwrap(), None, "absent pin reads None");
+        assert_eq!(
+            read_founder(fs, root).unwrap(),
+            None,
+            "absent pin reads None"
+        );
 
         write_founder(fs, root, 0xDEAD_BEEF_1234_5678).unwrap();
         assert_eq!(read_founder(fs, root).unwrap(), Some(0xDEAD_BEEF_1234_5678));

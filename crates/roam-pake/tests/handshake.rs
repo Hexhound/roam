@@ -16,7 +16,8 @@ fn run(
     let (initiator, msg1) = Initiator::start(initiator_code, initiator_id, responder_id);
     let (pending_responder, msg2) = responder.respond(initiator_id, &msg1)?;
     let (pending_initiator, initiator_confirm) = initiator.accept(&msg2)?;
-    let (responder_key, responder_confirm) = responder.verify(pending_responder, &initiator_confirm)?;
+    let (responder_key, responder_confirm) =
+        responder.verify(pending_responder, &initiator_confirm)?;
     let initiator_key = pending_initiator.verify(&responder_confirm)?;
     Ok((initiator_key, responder_key))
 }
@@ -64,7 +65,9 @@ fn a_run_bound_to_one_device_does_not_verify_against_another() {
     let (_, initiator_confirm) = initiator.accept(&msg2).unwrap();
 
     assert_eq!(
-        impostor.verify(pending_responder, &initiator_confirm).unwrap_err(),
+        impostor
+            .verify(pending_responder, &initiator_confirm)
+            .unwrap_err(),
         PakeError::BadCode,
         "a key bound to one endpoint id verified against another — MITM is open"
     );
@@ -174,7 +177,9 @@ fn a_replayed_confirmation_from_the_wrong_role_is_refused() {
     let (initiator, msg1) = Initiator::start(&code, JOINER_ID, HOST_ID);
     let (pending_responder, msg2) = responder.respond(JOINER_ID, &msg1).unwrap();
     let (pending_initiator, initiator_confirm) = initiator.accept(&msg2).unwrap();
-    let (_key, _responder_confirm) = responder.verify(pending_responder, &initiator_confirm).unwrap();
+    let (_key, _responder_confirm) = responder
+        .verify(pending_responder, &initiator_confirm)
+        .unwrap();
 
     // Echo the initiator's own confirmation back at it instead of the
     // responder's. Role tagging must make these different values.
@@ -190,7 +195,9 @@ fn a_malformed_message_is_rejected_rather_than_panicking() {
     let code = PairingCode::generate();
     let mut responder = Responder::new(code.clone(), HOST_ID);
     assert_eq!(
-        responder.respond(JOINER_ID, b"not a spake2 message").unwrap_err(),
+        responder
+            .respond(JOINER_ID, b"not a spake2 message")
+            .unwrap_err(),
         PakeError::MalformedMessage
     );
 
@@ -225,7 +232,10 @@ fn codes_are_six_digits_and_parse_strictly() {
     assert!(generated.as_str().chars().all(|c| c.is_ascii_digit()));
 
     assert!(PairingCode::parse("012345").is_ok());
-    assert!(PairingCode::parse("  012345  ").is_ok(), "whitespace is trimmed");
+    assert!(
+        PairingCode::parse("  012345  ").is_ok(),
+        "whitespace is trimmed"
+    );
     assert!(PairingCode::parse("12345").is_err(), "too short");
     assert!(PairingCode::parse("1234567").is_err(), "too long");
     assert!(PairingCode::parse("12345a").is_err(), "not all digits");
@@ -263,7 +273,10 @@ fn sealing_twice_does_not_reuse_the_nonce() {
 
     let first = send.seal(b"same plaintext");
     let second = send.seal(b"same plaintext");
-    assert_ne!(first, second, "identical plaintext sealed to identical bytes");
+    assert_ne!(
+        first, second,
+        "identical plaintext sealed to identical bytes"
+    );
 
     // ...and they still open, in order.
     assert_eq!(recv.open(&first).unwrap(), b"same plaintext");

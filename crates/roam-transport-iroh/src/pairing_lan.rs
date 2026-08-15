@@ -321,18 +321,17 @@ impl LanPairingHost<'_> {
         let (mut sealer, mut opener) = key.split(Side::Responder);
 
         // --- authenticated; the joiner may now name itself ---------------
-        let request: LanJoinRequest =
-            serde_json::from_slice(&opener.open(&timeout_read(&mut recv, self.handshake_timeout).await?)?)
-                .context("decode the joiner's request")?;
+        let request: LanJoinRequest = serde_json::from_slice(
+            &opener.open(&timeout_read(&mut recv, self.handshake_timeout).await?)?,
+        )
+        .context("decode the joiner's request")?;
 
         // IDENTITY BINDING: the code proves this connection knows six digits,
         // not which key is behind it. Refuse to enrol anything but the key iroh
         // authenticated, or a joiner shown a legitimate code could smuggle a
         // third party into the roster.
         if &request.verifying_key != joiner_id.as_bytes() {
-            bail!(
-                "joiner claims a key that is not the device we authenticated — refusing to pair"
-            );
+            bail!("joiner claims a key that is not the device we authenticated — refusing to pair");
         }
 
         let founder = self
@@ -357,7 +356,10 @@ impl LanPairingHost<'_> {
                 .export_all_rosters()
                 .context("export transitive roster")?,
             keylog_author: self.identity.peer_id(),
-            keylog_jsonl: self.store.export_own_keylog().context("export own keylog")?,
+            keylog_jsonl: self
+                .store
+                .export_own_keylog()
+                .context("export own keylog")?,
             founder,
         };
         let bytes = serde_json::to_vec(&accept).context("serialize LAN pairing accept")?;
@@ -481,23 +483,16 @@ async fn run_lan_join(
     // cross-check: the key we will hand to `import_keylog` is by construction the
     // device we talked to.
     let host_id = host.id;
-    let host_key =
-        VerifyingKey::from_bytes(host_id.as_bytes()).context("host endpoint id is not a valid key")?;
+    let host_key = VerifyingKey::from_bytes(host_id.as_bytes())
+        .context("host endpoint id is not a valid key")?;
 
     let conn = endpoint
         .connect(host, PAIRING_LAN_ALPN)
         .await
         .context("connect to LAN pairing host")?;
-    let (mut send, mut recv) = conn
-        .open_bi()
-        .await
-        .context("open LAN pairing bi stream")?;
+    let (mut send, mut recv) = conn.open_bi().await.context("open LAN pairing bi stream")?;
 
-    let (initiator, msg1) = Initiator::start(
-        code,
-        *endpoint.id().as_bytes(),
-        *host_id.as_bytes(),
-    );
+    let (initiator, msg1) = Initiator::start(code, *endpoint.id().as_bytes(), *host_id.as_bytes());
     write_frame(&mut send, &msg1).await?;
 
     let msg2 = timeout_read(&mut recv, HANDSHAKE_TIMEOUT).await?;
@@ -508,13 +503,13 @@ async fn run_lan_join(
         .await?
         .try_into()
         .map_err(|_| anyhow::anyhow!("malformed confirmation"))?;
-    let key = pending.verify(&their_confirm).map_err(anyhow::Error::from)?;
+    let key = pending
+        .verify(&their_confirm)
+        .map_err(anyhow::Error::from)?;
     let (mut sealer, mut opener) = key.split(Side::Initiator);
 
-    let (verifying_key, peer_id) = claim_instead.unwrap_or((
-        identity.verifying_key().to_bytes(),
-        identity.peer_id(),
-    ));
+    let (verifying_key, peer_id) =
+        claim_instead.unwrap_or((identity.verifying_key().to_bytes(), identity.peer_id()));
     let request = serde_json::to_vec(&LanJoinRequest {
         verifying_key,
         peer_id,
@@ -607,10 +602,7 @@ async fn read_frame(recv: &mut iroh::endpoint::RecvStream) -> Result<Vec<u8>> {
 
 /// [`read_frame`] under [`HANDSHAKE_TIMEOUT`], so a peer that connects and then
 /// goes quiet cannot pin either side open.
-async fn timeout_read(
-    recv: &mut iroh::endpoint::RecvStream,
-    timeout: Duration,
-) -> Result<Vec<u8>> {
+async fn timeout_read(recv: &mut iroh::endpoint::RecvStream, timeout: Duration) -> Result<Vec<u8>> {
     tokio::time::timeout(timeout, read_frame(recv))
         .await
         .context("timed out reading a pairing frame")?

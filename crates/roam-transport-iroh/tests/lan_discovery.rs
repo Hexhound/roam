@@ -10,7 +10,7 @@
 
 use iroh::endpoint::presets;
 use iroh::{Endpoint, SecretKey};
-use roam_transport_iroh::discovery::{LanDiscovery, ROAM_MDNS_SERVICE, advertise_name};
+use roam_transport_iroh::discovery::{advertise_name, LanDiscovery, ROAM_MDNS_SERVICE};
 use std::time::Duration;
 
 /// Generous: mDNS announcements are timer-driven, and a tight window would make
@@ -39,10 +39,8 @@ async fn two_devices_find_each_other_with_no_internet() {
     let alice_discovery = LanDiscovery::attach(&alice, true).unwrap();
     let bob_discovery = LanDiscovery::attach(&bob, true).unwrap();
 
-    let (alice_sees, bob_sees) = tokio::join!(
-        alice_discovery.peers(WINDOW),
-        bob_discovery.peers(WINDOW)
-    );
+    let (alice_sees, bob_sees) =
+        tokio::join!(alice_discovery.peers(WINDOW), bob_discovery.peers(WINDOW));
 
     let found_bob = alice_sees
         .iter()
@@ -76,13 +74,17 @@ async fn a_passive_browser_does_not_announce_itself() {
     );
 
     assert!(
-        !watcher_sees.iter().any(|peer| peer.endpoint_id == lurker.id()),
+        !watcher_sees
+            .iter()
+            .any(|peer| peer.endpoint_id == lurker.id()),
         "a passive browser announced itself on the network"
     );
     // The lurker must still be able to *see*, or "browse without advertising"
     // would be useless rather than private.
     assert!(
-        lurker_sees.iter().any(|peer| peer.endpoint_id == watcher.id()),
+        lurker_sees
+            .iter()
+            .any(|peer| peer.endpoint_id == watcher.id()),
         "the passive browser saw nothing, so the test above proves nothing"
     );
 }
@@ -111,7 +113,8 @@ async fn devices_on_irohs_default_service_are_not_seen_as_roam_peers() {
     let seen = roam_discovery.peers(WINDOW).await;
 
     assert!(
-        seen.iter().any(|peer| peer.endpoint_id == roam_control.id()),
+        seen.iter()
+            .any(|peer| peer.endpoint_id == roam_control.id()),
         "the browser saw no roam peer at all, so the assertion below is vacuous"
     );
     assert!(
@@ -174,4 +177,3 @@ async fn a_device_pairs_over_the_lan_knowing_only_the_host_id() {
     assert_eq!(*joined.vault_key, vault_key);
     assert_eq!(joined.vault, vault);
 }
-

@@ -177,7 +177,10 @@ fn new_identity_refuses_to_overwrite_an_existing_keyfile() {
 
     let (out, ok) = run_roam(&["new-identity", "--out", key.to_str().unwrap()]);
     assert!(ok, "first mint should succeed");
-    assert!(out.contains("peer_id:"), "should print the new peer id: {out}");
+    assert!(
+        out.contains("peer_id:"),
+        "should print the new peer id: {out}"
+    );
     let original = std::fs::read(&key).unwrap();
 
     let (_out, ok) = run_roam(&["new-identity", "--out", key.to_str().unwrap()]);

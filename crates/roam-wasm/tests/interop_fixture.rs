@@ -28,7 +28,8 @@ fn fixture_path() -> PathBuf {
 fn canonical_doc() -> Doc {
     let doc = Doc::new(PEER_ID).expect("new doc");
     doc.insert_text(TEXT_ID, 0, TEXT_BODY).expect("insert text");
-    doc.set_entry(MAP_ID, MAP_KEY, MAP_VALUE).expect("set entry");
+    doc.set_entry(MAP_ID, MAP_KEY, MAP_VALUE)
+        .expect("set entry");
     doc.commit();
     doc
 }
@@ -85,8 +86,7 @@ fn committed_fixture_decodes_to_canonical_content() {
 /// lookalike. Regenerate with `tests/js/run.sh`.
 #[test]
 fn js_produced_fixture_decodes_to_canonical_content() {
-    let path =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/js_snapshot.loro");
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/js_snapshot.loro");
 
     let bytes = std::fs::read(&path).unwrap_or_else(|e| {
         panic!(

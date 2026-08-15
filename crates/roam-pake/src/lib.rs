@@ -422,7 +422,9 @@ impl Responder {
             &Identity::new(&initiator_id),
             &Identity::new(&self.responder_id),
         );
-        let spake_key = state.finish(msg1).map_err(|_| PakeError::MalformedMessage)?;
+        let spake_key = state
+            .finish(msg1)
+            .map_err(|_| PakeError::MalformedMessage)?;
         Ok((
             PendingResponder {
                 expected: confirm_mac(

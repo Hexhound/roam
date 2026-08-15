@@ -45,7 +45,10 @@ fn a_relative_path_can_never_escape_its_destination() {
     assert_eq!(resolved, Path::new("/downloads/photos/holiday/beach.jpg"));
 
     // ...and the escaping form never parses in the first place.
-    assert_eq!(RelPath::new("../../etc/passwd").unwrap_err(), NameError::DotSegment);
+    assert_eq!(
+        RelPath::new("../../etc/passwd").unwrap_err(),
+        NameError::DotSegment
+    );
 }
 
 #[test]
@@ -196,7 +199,9 @@ fn frames_round_trip() {
     };
     for frame in [
         ShareFrame::Offer(offer.clone()),
-        ShareFrame::Accept { streams: vec![0, 1] },
+        ShareFrame::Accept {
+            streams: vec![0, 1],
+        },
         ShareFrame::Decline,
         ShareFrame::Chunk {
             stream: 1,

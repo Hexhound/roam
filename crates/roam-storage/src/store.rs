@@ -180,8 +180,13 @@ impl Store {
         // 1. Rebuild the trusted peer set from the signed roster logs (fixpoint),
         //    seeded by the pinned founder so grant certificates actually fold.
         let founder = crate::founder::read_founder(&*fs, root)?;
-        let peers =
-            Self::rebuild_peers(&fs, root, identity.peer_id(), &identity.verifying_key(), founder)?;
+        let peers = Self::rebuild_peers(
+            &fs,
+            root,
+            identity.peer_id(),
+            &identity.verifying_key(),
+            founder,
+        )?;
 
         // 2. Base document: from snapshot if present, else empty.
         let doc = match snapshot::load(&*fs, &snap_path)? {
@@ -491,7 +496,10 @@ impl Store {
 
         let frontier = self.doc.oplog_frontier();
         let mut log_lens = std::collections::BTreeMap::new();
-        log_lens.insert(self.peer_id(), count_log_lines(&*self.fs, &self.own_log.path()));
+        log_lens.insert(
+            self.peer_id(),
+            count_log_lines(&*self.fs, &self.own_log.path()),
+        );
         for peer in &self.peers {
             let path = self
                 .root
@@ -1200,7 +1208,10 @@ impl Store {
 
     /// The raw bytes of this device's own key-log (for copying to a peer).
     pub fn export_own_keylog(&self) -> Result<Vec<u8>, StorageError> {
-        match self.fs.read(&KeyLog::new_with_fs(&self.keylog_dir(), self.identity.peer_id(), self.fs.clone()).path()) {
+        match self.fs.read(
+            &KeyLog::new_with_fs(&self.keylog_dir(), self.identity.peer_id(), self.fs.clone())
+                .path(),
+        ) {
             Ok(b) => Ok(b),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
             Err(e) => Err(e.into()),
@@ -1209,7 +1220,10 @@ impl Store {
 
     /// The raw bytes of `author`'s stored key-log (for relaying). NotFound ⇒ empty.
     pub fn export_keylog(&self, author: u64) -> Result<Vec<u8>, StorageError> {
-        match self.fs.read(&KeyLog::new_with_fs(&self.keylog_dir(), author, self.fs.clone()).path()) {
+        match self
+            .fs
+            .read(&KeyLog::new_with_fs(&self.keylog_dir(), author, self.fs.clone()).path())
+        {
             Ok(b) => Ok(b),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
             Err(e) => Err(e.into()),
@@ -1537,7 +1551,11 @@ impl Store {
             .map_err(|e| StorageError::Base64(e.to_string()))?;
         let frontier = Frontier::from_bytes(&fbytes)?;
         let shallow = self.doc.shallow_snapshot(&frontier)?;
-        crate::snapshot::save(&*self.fs, &self.root.join("snapshots").join("snapshot.loro"), &shallow)?;
+        crate::snapshot::save(
+            &*self.fs,
+            &self.root.join("snapshots").join("snapshot.loro"),
+            &shallow,
+        )?;
 
         // 3. Truncate each peer op-log to its retained tail.
         let plan = crate::checkpoint::plan_from_marker(&target);
@@ -1673,8 +1691,10 @@ impl Store {
         if self.poisoned_ids()?.contains(id) {
             return Ok(());
         }
-        self.fs
-            .append(&self.root.join("poisoned.jsonl"), format!("{id}\n").as_bytes())?;
+        self.fs.append(
+            &self.root.join("poisoned.jsonl"),
+            format!("{id}\n").as_bytes(),
+        )?;
         Ok(())
     }
 
@@ -1718,7 +1738,11 @@ impl Store {
         };
         let mut out = Vec::new();
         for ent in names {
-            let name = ent.file_name().unwrap_or_default().to_string_lossy().into_owned();
+            let name = ent
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
             if name == "snapshot.loro" || name == "held.jsonl" || name.ends_with(".tmp") {
                 continue;
             }
@@ -1932,7 +1956,11 @@ fn split_log_lines_bytes(log: &[u8]) -> Vec<Vec<u8>> {
 }
 
 /// Drop the first `n` non-empty lines from a JSONL file, rewriting atomically.
-fn truncate_leading_lines(fs: &dyn VaultFs, path: &std::path::Path, n: usize) -> Result<(), StorageError> {
+fn truncate_leading_lines(
+    fs: &dyn VaultFs,
+    path: &std::path::Path,
+    n: usize,
+) -> Result<(), StorageError> {
     let text = match fs.read_to_string(path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),

@@ -28,8 +28,8 @@ pub fn offer_paths(from: &str, paths: &[PathBuf]) -> Result<(ShareOffer, SourceM
     let mut sources = SourceMap::new();
 
     for path in paths {
-        let metadata = std::fs::symlink_metadata(path)
-            .with_context(|| format!("stat {}", path.display()))?;
+        let metadata =
+            std::fs::symlink_metadata(path).with_context(|| format!("stat {}", path.display()))?;
         let name = path
             .file_name()
             .and_then(|n| n.to_str())
@@ -287,9 +287,10 @@ impl ShareSender {
             // file we cannot produce. Another receiver would hit exactly the
             // same wall, so `serve_one` must stop and say so rather than
             // silently wait for someone else to connect.
-            let source = self.sources.get(&stream.path).ok_or_else(|| {
-                LocalFailure(format!("no local file backs {}", stream.path))
-            })?;
+            let source = self
+                .sources
+                .get(&stream.path)
+                .ok_or_else(|| LocalFailure(format!("no local file backs {}", stream.path)))?;
             let bytes = std::fs::read(source)
                 .map_err(|e| LocalFailure(format!("read {}: {e}", source.display())))?;
             for (chunk_index, chunk) in bytes.chunks(CHUNK_BYTES).enumerate() {

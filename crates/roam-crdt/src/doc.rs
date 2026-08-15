@@ -320,9 +320,7 @@ impl Document {
                     container: name.to_string(),
                     key: key.to_string(),
                     value: value.as_ref().and_then(|entry| match entry {
-                        ValueOrContainer::Value(LoroValue::String(text)) => {
-                            Some(text.to_string())
-                        }
+                        ValueOrContainer::Value(LoroValue::String(text)) => Some(text.to_string()),
                         _ => None,
                     }),
                 });
@@ -395,7 +393,8 @@ mod tests {
     fn map_delta_reports_a_set_key() {
         let doc = Document::new(1).unwrap();
         let before = doc.oplog_frontier();
-        doc.set_entry("journeys", "j1", "{\"title\":\"knee\"}").unwrap();
+        doc.set_entry("journeys", "j1", "{\"title\":\"knee\"}")
+            .unwrap();
         doc.commit();
 
         let changes = doc.map_delta(&before, &doc.oplog_frontier()).unwrap();
@@ -469,7 +468,10 @@ mod tests {
         doc.insert_text("note", 0, "hello").unwrap();
         doc.commit();
 
-        assert!(doc.map_delta(&before, &doc.oplog_frontier()).unwrap().is_empty());
+        assert!(doc
+            .map_delta(&before, &doc.oplog_frontier())
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -481,7 +483,9 @@ mod tests {
 
         remote.set_entry("journeys", "j1", "from-peer").unwrap();
         remote.commit();
-        let ops = remote.export_from(&Version(VersionVector::default())).unwrap();
+        let ops = remote
+            .export_from(&Version(VersionVector::default()))
+            .unwrap();
 
         let before = local.oplog_frontier();
         local.import(&ops).unwrap();

@@ -58,7 +58,12 @@ impl WasmTestRelay {
     }
 
     /// `None` becomes JS `undefined`, which the harness maps to HTTP 404.
-    pub async fn get(&self, bucket: String, set: String, id: String) -> Result<Option<Vec<u8>>, JsError> {
+    pub async fn get(
+        &self,
+        bucket: String,
+        set: String,
+        id: String,
+    ) -> Result<Option<Vec<u8>>, JsError> {
         match kind(&set)? {
             SetKind::Entries => self.inner.get_entry(&bucket, &id).await,
             SetKind::Blobs => self.inner.get_blob(&bucket, &id).await,
@@ -69,7 +74,13 @@ impl WasmTestRelay {
 
     /// Returns true when newly created, false when the id already existed —
     /// the harness turns that into 201 vs 409, matching the real routes.
-    pub async fn put(&self, bucket: String, set: String, id: String, body: Vec<u8>) -> Result<bool, JsError> {
+    pub async fn put(
+        &self,
+        bucket: String,
+        set: String,
+        id: String,
+        body: Vec<u8>,
+    ) -> Result<bool, JsError> {
         use roam_backend_client::transport::PutOutcome;
         let outcome = match kind(&set)? {
             SetKind::Entries => self.inner.put_entry(&bucket, &id, body).await,
@@ -80,7 +91,12 @@ impl WasmTestRelay {
         Ok(outcome == PutOutcome::Created)
     }
 
-    pub async fn reconcile(&self, bucket: String, set: String, msg: Vec<u8>) -> Result<Vec<u8>, JsError> {
+    pub async fn reconcile(
+        &self,
+        bucket: String,
+        set: String,
+        msg: Vec<u8>,
+    ) -> Result<Vec<u8>, JsError> {
         self.inner
             .reconcile(&bucket, kind(&set)?, msg)
             .await
@@ -91,7 +107,13 @@ impl WasmTestRelay {
     /// assert that data really crossed the wire rather than passing vacuously.
     #[wasm_bindgen(js_name = entryCount)]
     pub async fn entry_count(&self, bucket: String) -> Result<usize, JsError> {
-        Ok(self.inner.manifest(&bucket).await.map_err(err)?.entry_ids.len())
+        Ok(self
+            .inner
+            .manifest(&bucket)
+            .await
+            .map_err(err)?
+            .entry_ids
+            .len())
     }
 }
 

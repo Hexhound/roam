@@ -374,7 +374,10 @@ mod tests {
         pair(&b, &c).await;
         reconcile_once(&b, &backend, &key).await.unwrap();
 
-        c.lock().await.set_entry("files", "from-c", "hello").unwrap();
+        c.lock()
+            .await
+            .set_entry("files", "from-c", "hello")
+            .unwrap();
         reconcile_once(&c, &backend, &key).await.unwrap();
 
         reconcile_once(&a, &backend, &key).await.unwrap();

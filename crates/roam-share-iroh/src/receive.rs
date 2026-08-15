@@ -109,11 +109,8 @@ where
     let (mut send, mut recv) = conn.open_bi().await.context("open share stream")?;
 
     // --- prove the code before anything is revealed to us ----------------
-    let (initiator, msg1) = Initiator::start(
-        code,
-        *endpoint.id().as_bytes(),
-        *sender_id.as_bytes(),
-    );
+    let (initiator, msg1) =
+        Initiator::start(code, *endpoint.id().as_bytes(), *sender_id.as_bytes());
     write_frame(&mut send, &msg1).await?;
 
     let msg2 = bounded_read(&mut recv, timeouts.handshake).await?;
@@ -124,12 +121,16 @@ where
     let their_confirm: [u8; 32] = their_confirm
         .try_into()
         .map_err(|_| anyhow::anyhow!("malformed confirmation"))?;
-    let key = pending.verify(&their_confirm).map_err(anyhow::Error::from)?;
+    let key = pending
+        .verify(&their_confirm)
+        .map_err(anyhow::Error::from)?;
     let (mut sealer, mut opener) = key.split(Side::Initiator);
 
     // --- authenticated; the offer is now trustworthy-ish -----------------
-    let offer = match ShareFrame::decode(&opener.open(&bounded_read(&mut recv, timeouts.handshake).await?)?)
-        .context("decode the offer")?
+    let offer = match ShareFrame::decode(
+        &opener.open(&bounded_read(&mut recv, timeouts.handshake).await?)?,
+    )
+    .context("decode the offer")?
     {
         ShareFrame::Offer(offer) => offer,
         other => bail!("expected an Offer, got {}", other.kind()),
@@ -148,8 +149,9 @@ where
         // and the sender would see a bare "connection lost" instead. Wait for
         // the sender's Done, which acknowledges the Decline arrived, then close
         // — the same direction as the success path.
-        let ack = ShareFrame::decode(&opener.open(&bounded_read(&mut recv, timeouts.handshake).await?)?)
-            .context("decode the sender's acknowledgement")?;
+        let ack =
+            ShareFrame::decode(&opener.open(&bounded_read(&mut recv, timeouts.handshake).await?)?)
+                .context("decode the sender's acknowledgement")?;
         if !matches!(ack, ShareFrame::Done) {
             bail!("expected Done after declining, got {}", ack.kind());
         }
@@ -170,8 +172,9 @@ where
     // complete. Bounded by the size check above.
     let mut buffers: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
     loop {
-        let frame = ShareFrame::decode(&opener.open(&bounded_read(&mut recv, timeouts.data).await?)?)
-            .context("decode a share frame")?;
+        let frame =
+            ShareFrame::decode(&opener.open(&bounded_read(&mut recv, timeouts.data).await?)?)
+                .context("decode a share frame")?;
         match frame {
             ShareFrame::Chunk {
                 stream,
@@ -181,7 +184,8 @@ where
                 let meta = streams
                     .get(stream as usize)
                     .with_context(|| format!("chunk for unknown stream {stream}"))?;
-                let offset = usize::try_from(offset).context("chunk offset does not fit in memory")?;
+                let offset =
+                    usize::try_from(offset).context("chunk offset does not fit in memory")?;
                 // The sender declared a length; hold it to that. Without this a
                 // sender could accept-then-flood far past what the user
                 // approved. Checked with saturating/overflow-safe arithmetic
@@ -190,12 +194,11 @@ where
                     .checked_add(bytes.len())
                     .context("chunk offset + length overflows")?;
                 if end as u64 > meta.len {
-                    bail!(
-                        "stream {stream} sent {end} bytes but declared {}",
-                        meta.len
-                    );
+                    bail!("stream {stream} sent {end} bytes but declared {}", meta.len);
                 }
-                let buffer = buffers.entry(stream).or_insert_with(|| vec![0u8; meta.len as usize]);
+                let buffer = buffers
+                    .entry(stream)
+                    .or_insert_with(|| vec![0u8; meta.len as usize]);
                 buffer[offset..end].copy_from_slice(&bytes);
             }
             ShareFrame::Done => break,

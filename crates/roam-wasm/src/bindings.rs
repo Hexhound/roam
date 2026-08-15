@@ -126,7 +126,12 @@ impl WasmVault {
     }
 
     #[wasm_bindgen(js_name = setEntry)]
-    pub async fn set_entry(&self, container: String, key: String, value: String) -> Result<(), JsError> {
+    pub async fn set_entry(
+        &self,
+        container: String,
+        key: String,
+        value: String,
+    ) -> Result<(), JsError> {
         self.inner
             .set_entry(&container, &key, &value)
             .await
@@ -140,7 +145,10 @@ impl WasmVault {
 
     #[wasm_bindgen(js_name = editText)]
     pub async fn edit_text(&self, id: String, at: usize, text: String) -> Result<(), JsError> {
-        self.inner.edit_text(&id, at, &text).await.map_err(any_to_js)
+        self.inner
+            .edit_text(&id, at, &text)
+            .await
+            .map_err(any_to_js)
     }
 
     pub async fn text(&self, id: String) -> String {

@@ -447,8 +447,10 @@ mod tests {
         // durability promise differs. Both create-then-extend paths matter,
         // since the native backend takes a different branch on create.
         let durable = root.join("durable.bin");
-        fs.append_sync(&durable, b"first").expect("append_sync creates");
-        fs.append_sync(&durable, b"-second").expect("append_sync extends");
+        fs.append_sync(&durable, b"first")
+            .expect("append_sync creates");
+        fs.append_sync(&durable, b"-second")
+            .expect("append_sync extends");
         assert_eq!(fs.read(&durable).unwrap(), b"first-second");
 
         // Ranged reads, including a clamped tail.

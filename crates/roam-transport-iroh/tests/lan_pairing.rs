@@ -196,7 +196,9 @@ async fn the_code_dies_after_the_attempt_budget_is_spent() {
     )
     .await
     .expect("host did not hang");
-    let message = outcome.expect_err("the host must give up, not pair").to_string();
+    let message = outcome
+        .expect_err("the host must give up, not pair")
+        .to_string();
     assert!(
         message.contains("used up"),
         "expected a spent-code error, got: {message}"

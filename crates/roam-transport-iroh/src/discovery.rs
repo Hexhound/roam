@@ -27,8 +27,8 @@
 
 use anyhow::{Context, Result};
 use futures::StreamExt;
-use iroh::Endpoint;
 use iroh::endpoint_info::UserData;
+use iroh::Endpoint;
 use iroh_mdns_address_lookup::{DiscoveryEvent, MdnsAddressLookup};
 use std::collections::BTreeMap;
 use std::time::Duration;

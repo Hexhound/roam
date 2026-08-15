@@ -391,7 +391,6 @@ fn seal_under_head(kc: &Keychain, key: &VaultKey, plaintext: &[u8]) -> Option<Ve
     }
 }
 
-
 /// Op-log tail (in ms) left replayable beyond the snapshot frontier. Peers only
 /// recently behind catch up by normal op-replay and never adopt a snapshot.
 /// Default 14 days; override with `ROAM_SNAPSHOT_LAG_DAYS` (tests set 0).

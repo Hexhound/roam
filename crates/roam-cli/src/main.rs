@@ -15,10 +15,10 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use roam_files::{FilesError, FolderBridge, GcContext, SyncOutcome};
-use roam_storage::{Identity, PeerStatus, Role, Store, VaultId};
-use roam_sync_core::engine::Engine;
 use roam_pake::PairingCode;
 use roam_share_iroh::{bind_share_endpoint, offer_paths, receive_share, ShareSender};
+use roam_storage::{Identity, PeerStatus, Role, Store, VaultId};
+use roam_sync_core::engine::Engine;
 use roam_transport_iroh::discovery::{browse_lan, LanDiscovery};
 use roam_transport_iroh::pairing_lan::{host_lan_pairing, join_lan_pairing_by_id};
 use roam_transport_iroh::{host_pairing, join_pairing, IrohTransport, PairingToken};
@@ -575,15 +575,10 @@ async fn pair_lan(
     let vault_key = load_vault_key(vault)?;
     let mut store = Store::open(vault, identity.clone()).context("open vault store")?;
 
-    let (code, mut host) = host_lan_pairing(
-        &identity,
-        vault_id,
-        *vault_key,
-        invitee_role,
-        &mut store,
-    )
-    .await
-    .context("arm LAN pairing host")?;
+    let (code, mut host) =
+        host_lan_pairing(&identity, vault_id, *vault_key, invitee_role, &mut store)
+            .await
+            .context("arm LAN pairing host")?;
     host.advertise_on_lan(name)
         .context("announce this device on the local network")?;
 
@@ -1920,10 +1915,7 @@ fn print_pairing_qr(token: &str) {
         Ok(code) => {
             // Dense1x2 packs two QR rows into one text row, so the result fits
             // an ordinary terminal window.
-            let rendered = code
-                .render::<unicode::Dense1x2>()
-                .quiet_zone(true)
-                .build();
+            let rendered = code.render::<unicode::Dense1x2>().quiet_zone(true).build();
             // A typical token renders ~85 columns wide, which WRAPS in an
             // 80-column terminal and destroys the code — it still looks like a
             // QR, it just will not scan. Say so rather than let the user blame

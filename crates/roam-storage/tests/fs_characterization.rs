@@ -57,7 +57,9 @@ fn build_representative_vault(root: &Path, identity: Identity) -> Store {
     store
         .edit_text("notes/hello.md", 0, "hello characterization")
         .expect("edit text");
-    store.set_entry("meta", "title", "Hello").expect("set entry");
+    store
+        .set_entry("meta", "title", "Hello")
+        .expect("set entry");
     store.blobs().put(b"blob payload").expect("put blob");
     store.write_snapshot().expect("write snapshot");
     store
@@ -85,8 +87,12 @@ fn vault_layout_matches_golden() {
         std::fs::write(&path, format!("{actual}\n")).expect("write golden");
     }
 
-    let expected = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("golden {} unreadable ({e}); ROAM_REGEN_GOLDEN=1", path.display()));
+    let expected = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!(
+            "golden {} unreadable ({e}); ROAM_REGEN_GOLDEN=1",
+            path.display()
+        )
+    });
 
     assert_eq!(
         actual.trim(),
@@ -127,7 +133,11 @@ fn identity_secret_key_is_owner_only() {
     let path = dir.path().join("identity.json");
     Identity::generate().save(&path).expect("save identity");
 
-    let mode = std::fs::metadata(&path).expect("metadata").permissions().mode() & 0o777;
+    let mode = std::fs::metadata(&path)
+        .expect("metadata")
+        .permissions()
+        .mode()
+        & 0o777;
     assert_eq!(mode, 0o600, "identity secret must be owner-read/write only");
 }
 
@@ -157,7 +167,8 @@ fn reopening_a_vault_only_appends_to_existing_logs() {
     for (path, old_bytes) in &before {
         // Rebuildable derived state is allowed to be rewritten wholesale; the
         // append-only logs are not.
-        let is_log = path.starts_with("ops/") || path.starts_with("roster/") || path.contains("history");
+        let is_log =
+            path.starts_with("ops/") || path.starts_with("roster/") || path.contains("history");
         if !is_log {
             continue;
         }
