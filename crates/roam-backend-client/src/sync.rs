@@ -2,6 +2,7 @@ use crate::crypto::VaultKey;
 use crate::entries::{local_blobs, local_entries};
 use crate::transport::Backend;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64URL, Engine};
+use futures::stream::{self, StreamExt};
 use roam_rbsr::{initiate, reconcile, ItemSet, SetKind};
 use roam_storage::{Keychain, PeerStatus, Role, Store, VerifyingKey, EPOCH0_ID};
 use std::collections::{BTreeMap, BTreeSet};
@@ -14,6 +15,15 @@ use tokio::sync::Mutex;
 /// Client-side round cap: bounds a pathological/hostile server that never
 /// converges. The 2s reconcile loop is self-healing, so aborting a pass is safe.
 const RBSR_ROUND_CAP: usize = 32;
+
+/// How many entry GETs may be in flight at once during a pull.
+///
+/// Chosen for the case that hurts — a device pairing for the first time, which
+/// needs every entry in the vault and is therefore entirely latency-bound. Eight
+/// is high enough to hide typical mobile round trips and low enough not to look
+/// like a flood to the relay or to a phone's connection pool; `reqwest` keeps at
+/// most this many connections busy per host either way.
+const ENTRY_FETCH_CONCURRENCY: usize = 8;
 
 /// Open a stored ciphertext via the keychain's read rule. Returns:
 /// - `Ok(Some(plaintext))` — opened,
@@ -524,12 +534,36 @@ async fn import_needed_entries<B: Backend>(
             .collect()
     };
 
+    // Fetch with a bounded number of requests in flight, then import in the
+    // order RBSR named them.
+    //
+    // These GETs used to be sequential — one await per entry — which made a
+    // first sync cost one full round trip per op. On a device pairing for the
+    // first time that is the whole history: 240 entries took 140s against a
+    // relay on the same machine, and every one of those seconds was latency,
+    // not work. `buffered` preserves input order, so what changes is only how
+    // many requests are outstanding; the import below still runs one at a time,
+    // in the same sequence, under the same lock.
+    //
+    // Bounded rather than unbounded: `need_entry_ids` is attacker-influenced in
+    // the sense that any peer can author ops, and turning that set directly
+    // into concurrent sockets would be a self-inflicted flood on a phone's
+    // network stack. Entries are small (one op-log line), so the buffered
+    // bodies are bounded by roughly ENTRY_FETCH_CONCURRENCY × line size.
+    let fetched: Vec<(&String, anyhow::Result<Option<Vec<u8>>>)> = stream::iter(
+        need_entry_ids
+            .iter()
+            // A prior pass proved these ids squatted; the real op flows P2P.
+            .filter(|id| !poisoned.contains(*id)),
+    )
+    .map(|id| async move { (id, backend.get_entry(bucket, id).await) })
+    .buffered(ENTRY_FETCH_CONCURRENCY)
+    .collect()
+    .await;
+
     let mut imported = 0usize;
-    for id in need_entry_ids {
-        if poisoned.contains(id) {
-            continue; // a prior pass proved this id squatted; real op flows P2P
-        }
-        let Some(ct) = backend.get_entry(bucket, id).await? else {
+    for (id, result) in fetched {
+        let Some(ct) = result? else {
             continue;
         };
         let Some(line) = open_classified(kc, &ct)? else {
@@ -586,11 +620,159 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
+    /// Wraps a backend and records how many `get_entry` calls overlap.
+    ///
+    /// Every other method delegates untouched — the only thing under
+    /// observation is the shape of the entry pull.
+    struct CountsConcurrentGets<B> {
+        inner: Arc<B>,
+        in_flight: std::sync::atomic::AtomicUsize,
+        peak: std::sync::atomic::AtomicUsize,
+    }
+
+    impl<B> CountsConcurrentGets<B> {
+        fn wrapping(inner: Arc<B>) -> Self {
+            Self {
+                inner,
+                in_flight: std::sync::atomic::AtomicUsize::new(0),
+                peak: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn peak_concurrency(&self) -> usize {
+            self.peak.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl<B: Backend + Send + Sync> Backend for CountsConcurrentGets<B> {
+        async fn get_entry(&self, bucket: &str, id: &str) -> anyhow::Result<Option<Vec<u8>>> {
+            use std::sync::atomic::Ordering::SeqCst;
+            let now = self.in_flight.fetch_add(1, SeqCst) + 1;
+            self.peak.fetch_max(now, SeqCst);
+            // Yield so the executor can poll the other buffered futures. Without
+            // a suspension point every call would run to completion inside one
+            // poll and the peak would read 1 even when the fetch *is* buffered —
+            // a real request suspends on the socket for far longer than this.
+            tokio::task::yield_now().await;
+            let out = self.inner.get_entry(bucket, id).await;
+            self.in_flight.fetch_sub(1, SeqCst);
+            out
+        }
+
+        async fn manifest(&self, bucket: &str) -> anyhow::Result<crate::transport::Manifest> {
+            self.inner.manifest(bucket).await
+        }
+        async fn put_entry(
+            &self,
+            bucket: &str,
+            id: &str,
+            ct: Vec<u8>,
+        ) -> anyhow::Result<crate::transport::PutOutcome> {
+            self.inner.put_entry(bucket, id, ct).await
+        }
+        async fn get_blob(&self, bucket: &str, id: &str) -> anyhow::Result<Option<Vec<u8>>> {
+            self.inner.get_blob(bucket, id).await
+        }
+        async fn put_blob(
+            &self,
+            bucket: &str,
+            id: &str,
+            ct: Vec<u8>,
+        ) -> anyhow::Result<crate::transport::PutOutcome> {
+            self.inner.put_blob(bucket, id, ct).await
+        }
+        async fn get_snapshot(&self, bucket: &str, id: &str) -> anyhow::Result<Option<Vec<u8>>> {
+            self.inner.get_snapshot(bucket, id).await
+        }
+        async fn put_snapshot(
+            &self,
+            bucket: &str,
+            id: &str,
+            ct: Vec<u8>,
+        ) -> anyhow::Result<crate::transport::PutOutcome> {
+            self.inner.put_snapshot(bucket, id, ct).await
+        }
+        async fn list_snapshots(&self, bucket: &str) -> anyhow::Result<Vec<String>> {
+            self.inner.list_snapshots(bucket).await
+        }
+        async fn get_trust(&self, bucket: &str, id: &str) -> anyhow::Result<Option<Vec<u8>>> {
+            self.inner.get_trust(bucket, id).await
+        }
+        async fn put_trust(
+            &self,
+            bucket: &str,
+            id: &str,
+            ct: Vec<u8>,
+        ) -> anyhow::Result<crate::transport::PutOutcome> {
+            self.inner.put_trust(bucket, id, ct).await
+        }
+        async fn reconcile(
+            &self,
+            bucket: &str,
+            kind: SetKind,
+            msg: Vec<u8>,
+        ) -> anyhow::Result<Vec<u8>> {
+            self.inner.reconcile(bucket, kind, msg).await
+        }
+    }
+
     async fn store_at(dir: &std::path::Path) -> Arc<Mutex<Store>> {
         let mut store = Store::open(dir, Identity::generate()).unwrap();
         // Found this vault as admin so local writes + `add_peer` vouches are allowed.
         store.declare_founder(Role::Admin).unwrap();
         Arc::new(Mutex::new(store))
+    }
+
+    /// A first sync is entirely latency-bound: the joining device needs every
+    /// entry in the vault, and fetching them one await at a time cost one round
+    /// trip per op — 140 seconds for 240 entries against a relay on the same
+    /// machine, measured on an emulator. Nothing about the result changes if the
+    /// GETs overlap, so nothing but this test notices if they stop overlapping.
+    #[tokio::test]
+    async fn a_joining_device_fetches_entries_concurrently() {
+        let key = VaultKey([11u8; 32]);
+        let memory = Arc::new(MemoryBackend::default());
+        let a_dir = tempfile::tempdir().unwrap();
+        let b_dir = tempfile::tempdir().unwrap();
+        let a = store_at(a_dir.path()).await;
+        let b = store_at(b_dir.path()).await;
+
+        let (a_peer, a_key) = {
+            let g = a.lock().await;
+            (g.peer_id(), g.identity_verifying_bytes())
+        };
+        let (b_peer, b_key) = {
+            let g = b.lock().await;
+            (g.peer_id(), g.identity_verifying_bytes())
+        };
+        a.lock().await.add_peer(b_peer, b_key, Role::Admin).unwrap();
+        b.lock().await.add_peer(a_peer, a_key, Role::Admin).unwrap();
+
+        // Comfortably more entries than ENTRY_FETCH_CONCURRENCY, so the buffer
+        // is the limit rather than the supply.
+        for i in 0..40 {
+            a.lock()
+                .await
+                .set_entry("files", &format!("k{i}"), "v")
+                .unwrap();
+        }
+        reconcile_once(&a, &memory, &key).await.unwrap();
+
+        let counting = Arc::new(CountsConcurrentGets::wrapping(memory));
+        reconcile_once(&b, &counting, &key).await.unwrap();
+
+        assert_eq!(
+            b.lock().await.get_entry("files", "k39"),
+            Some("v".to_string()),
+            "setup: the pull has to actually deliver the entries",
+        );
+        assert!(
+            counting.peak_concurrency() > 1,
+            "entry GETs ran one at a time (peak in flight: {}), which is one \
+             round trip per op on a first sync",
+            counting.peak_concurrency(),
+        );
     }
 
     #[tokio::test]
