@@ -58,6 +58,9 @@ async fn read_capped(mut resp: reqwest::Response) -> anyhow::Result<Vec<u8>> {
     }
     let mut body: Vec<u8> = Vec::new();
     while let Some(chunk) = resp.chunk().await? {
+        if body.len() as u64 + chunk.len() as u64 > MAX_RESPONSE_BYTES {
+            anyhow::bail!("response body exceeded the {MAX_RESPONSE_BYTES} byte cap");
+        }
         body.extend_from_slice(&chunk);
     }
     Ok(body)
@@ -224,8 +227,13 @@ mod tests {
     #[tokio::test]
     async fn a_chunked_body_that_never_ends_is_cut_off_at_the_cap() {
         // The case the declared length cannot catch: no Content-Length at all,
-        // so only the running total stops it. Without the cap this call reads
-        // until the process dies.
+        // so only the running total stops it.
+        //
+        // Mutation-verified, and it is worth knowing what "fails" looks like
+        // here: with the running total removed, this test does not report a
+        // failed assertion — it allocates until the kernel kills the test
+        // process (2.4 GB before the OOM killer arrived). So a run of this
+        // file that ends in a kill rather than a red test IS this test firing.
         let base = serve_once(
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
             true,
