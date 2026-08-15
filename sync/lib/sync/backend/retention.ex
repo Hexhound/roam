@@ -64,12 +64,37 @@ defmodule Sync.Backend.Retention do
   end
 
   @doc """
+  Trust-bundle ids to delete: keep the newest `keep` by arrival, drop anything
+  older than that AND past `grace`.
+
+  Unlike entries and blobs, this needs no evidence that a bundle is dead, because
+  deleting a live one is not a loss: a trust bundle is a device's whole current
+  view of the roster and key logs, so any device still holding those logs
+  re-publishes it on its next pass when RBSR shows the backend lacking it. The
+  grace period exists only to stop the sweeper and the clients fighting — reaping
+  a bundle minutes after it lands would have every device re-upload it forever.
+
+  Steady state is one bundle: devices that agree converge on identical bytes and
+  therefore one content-addressed id. `keep` is the allowance for devices that
+  transiently disagree — mid-pairing, or one still catching up.
+  """
+  def trust_to_delete(trust_ages, now, grace, keep) do
+    trust_ages
+    |> Enum.sort_by(fn {_id, born} -> born end, :desc)
+    |> Enum.drop(max(keep, 1))
+    |> Enum.filter(fn {_id, born} -> now - born >= grace end)
+    |> Enum.map(&elem(&1, 0))
+    |> Enum.sort()
+  end
+
+  @doc """
   Sweep one bucket: drop snapshots past the newest `:keep` (default #{@default_keep}),
   then delete subsumed entries and orphaned blobs older than `:grace_ms`
   (default 7 days). Always keeps >= 1 snapshot (generational floor).
 
   Opts: `:keep`, `:grace_ms`, `:now_ms` (inject for tests), `:data_root`.
-  Returns `%{snapshots: [ids], entries: [ids], blobs: [ids]}` of what was deleted.
+  Returns `%{snapshots: [ids], entries: [ids], blobs: [ids], trust: [ids]}` of what
+  was deleted.
   """
   def sweep(bucket, opts \\ []) do
     keep = max(Keyword.get(opts, :keep, @default_keep), 1)
@@ -104,7 +129,11 @@ defmodule Sync.Backend.Retention do
     del_blobs = blobs_to_delete(retained_blob_refs, dropped_blob_refs, blob_ages, now, grace)
     Enum.each(del_blobs, &rm(root, bucket, "blobs", &1))
 
-    %{snapshots: dropped_ids, entries: del_entries, blobs: del_blobs}
+    trust_ages = file_ages(root, bucket, "trust")
+    del_trust = trust_to_delete(trust_ages, now, grace, keep)
+    Enum.each(del_trust, &rm(root, bucket, "trust", &1))
+
+    %{snapshots: dropped_ids, entries: del_entries, blobs: del_blobs, trust: del_trust}
   end
 
   # --- internals ---

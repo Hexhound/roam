@@ -9,10 +9,16 @@ config :ash, policies: [show_policy_breakdowns?: true], disable_async?: true
 # The MIX_TEST_PARTITION environment variable can be used
 # to provide built-in test partitioning in CI environment.
 # Run `mix help test` for more information.
+# Credentials read the standard PG* variables before falling back to the
+# conventional postgres/postgres — see the longer note in `dev.exs`. devenv's
+# Postgres has no `postgres` role at all, and the failure surfaces as
+# "The database for Sync.Repo couldn't be created: killed", which names neither
+# the role nor the cause.
 config :sync, Sync.Repo,
-  username: "postgres",
-  password: "postgres",
-  hostname: "localhost",
+  username: System.get_env("PGUSER") || "postgres",
+  password: System.get_env("PGPASSWORD") || "postgres",
+  hostname: System.get_env("PGHOST") || "localhost",
+  port: String.to_integer(System.get_env("PGPORT") || "5432"),
   database: "sync_test#{System.get_env("MIX_TEST_PARTITION")}",
   pool: Ecto.Adapters.SQL.Sandbox,
   pool_size: System.schedulers_online() * 2

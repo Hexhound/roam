@@ -67,6 +67,11 @@ pub trait Backend: MaybeSendSync {
     /// All snapshot ids the backend currently holds for `bucket`.
     async fn list_snapshots(&self, bucket: &str) -> anyhow::Result<Vec<String>>;
 
+    /// A trust bundle: this device's view of the signed roster and key logs.
+    /// Same opaque-ciphertext contract as every other kind — see [`SetKind::Trust`].
+    async fn get_trust(&self, bucket: &str, id: &str) -> anyhow::Result<Option<Vec<u8>>>;
+    async fn put_trust(&self, bucket: &str, id: &str, ct: Vec<u8>) -> anyhow::Result<PutOutcome>;
+
     /// One RBSR round: hand the backend a negentropy message for `kind`'s id set,
     /// get its reply. Bytes are opaque negentropy protocol frames.
     async fn reconcile(&self, bucket: &str, kind: SetKind, msg: Vec<u8>)
@@ -79,6 +84,7 @@ pub struct MemoryBackend {
     entries: Mutex<BTreeMap<String, BTreeMap<String, Vec<u8>>>>,
     blobs: Mutex<BTreeMap<String, BTreeMap<String, Vec<u8>>>>,
     snapshots: Mutex<BTreeMap<String, BTreeMap<String, Vec<u8>>>>,
+    trust: Mutex<BTreeMap<String, BTreeMap<String, Vec<u8>>>>,
     /// Buckets for which the backend is currently requesting a snapshot.
     snapshot_wanted: Mutex<std::collections::BTreeSet<String>>,
     /// Per-entry-id `get_entry` call counts (test instrumentation).
@@ -112,6 +118,7 @@ impl MemoryBackend {
             SetKind::Entries => &self.entries,
             SetKind::Blobs => &self.blobs,
             SetKind::Snapshots => &self.snapshots,
+            SetKind::Trust => &self.trust,
         };
         let guard = map.lock().unwrap();
         let Some(b) = guard.get(bucket) else {
@@ -216,6 +223,12 @@ impl Backend for MemoryBackend {
         ct: Vec<u8>,
     ) -> anyhow::Result<PutOutcome> {
         Ok(put(&self.snapshots, bucket, id, ct))
+    }
+    async fn get_trust(&self, bucket: &str, id: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        Ok(get(&self.trust, bucket, id))
+    }
+    async fn put_trust(&self, bucket: &str, id: &str, ct: Vec<u8>) -> anyhow::Result<PutOutcome> {
+        Ok(put(&self.trust, bucket, id, ct))
     }
     async fn list_snapshots(&self, bucket: &str) -> anyhow::Result<Vec<String>> {
         Ok(self

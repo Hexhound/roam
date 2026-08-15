@@ -72,6 +72,18 @@ impl VaultKey {
         self.keyed(&input)
     }
 
+    /// Trust-bundle id = keyed(id_key, "trust" || content_hash_hex), where the
+    /// hash is BLAKE3 of the plaintext bundle. Content-addressed like a blob
+    /// rather than keyed on the publishing peer, so two devices that hold the
+    /// same roster/key logs converge on one id instead of each holding a
+    /// perpetually-differing copy of the same facts.
+    pub fn trust_id(&self, content_hash: &str) -> String {
+        let mut input = Vec::with_capacity(5 + content_hash.len());
+        input.extend_from_slice(b"trust");
+        input.extend_from_slice(content_hash.as_bytes());
+        self.keyed(&input)
+    }
+
     /// Snapshot backend id = keyed(id_key, "snapshot" || frontier_digest). Two
     /// devices snapshotting at the same frontier derive the same id (dedup).
     pub fn snapshot_id(&self, frontier_digest: &[u8; 32]) -> String {

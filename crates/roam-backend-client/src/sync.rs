@@ -2,6 +2,7 @@ use crate::crypto::VaultKey;
 use crate::entries::{local_blobs, local_entries};
 use crate::transport::Backend;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64URL, Engine};
+use futures::stream::{self, StreamExt};
 use roam_rbsr::{initiate, reconcile, ItemSet, SetKind};
 use roam_storage::{Keychain, PeerStatus, Role, Store, VerifyingKey, EPOCH0_ID};
 use std::collections::{BTreeMap, BTreeSet};
@@ -14,6 +15,15 @@ use tokio::sync::Mutex;
 /// Client-side round cap: bounds a pathological/hostile server that never
 /// converges. The 2s reconcile loop is self-healing, so aborting a pass is safe.
 const RBSR_ROUND_CAP: usize = 32;
+
+/// How many entry GETs may be in flight at once during a pull.
+///
+/// Chosen for the case that hurts — a device pairing for the first time, which
+/// needs every entry in the vault and is therefore entirely latency-bound. Eight
+/// is high enough to hide typical mobile round trips and low enough not to look
+/// like a flood to the relay or to a phone's connection pool; `reqwest` keeps at
+/// most this many connections busy per host either way.
+const ENTRY_FETCH_CONCURRENCY: usize = 8;
 
 /// Open a stored ciphertext via the keychain's read rule. Returns:
 /// - `Ok(Some(plaintext))` — opened,
@@ -40,7 +50,7 @@ pub struct DecryptReport {
 /// Returns `(have, need)` as id strings: `have` = ids the backend lacks
 /// (we upload), `need` = ids we lack (we fetch). Both are returned in the same
 /// base64url (no-pad) encoding used for entry/blob ids elsewhere.
-async fn reconcile_set<B: Backend>(
+pub(crate) async fn reconcile_set<B: Backend>(
     backend: &Arc<B>,
     bucket: &str,
     kind: SetKind,
@@ -90,9 +100,15 @@ pub async fn reconcile_once<B: Backend>(
     let debug = std::env::var_os("ROAM_DEBUG").is_some();
     let bucket = key.bucket_id();
 
-    // Rebuild the keychain each pass — a P2P key-log gossip may have delivered a
-    // new epoch since the last tick. Writes seal under the head epoch; reads
-    // classify against the epochs known right now.
+    // Trust BEFORE content. Roster and key logs decide who may author an entry
+    // and which epoch keys we can open, so exchanging them first means a peer
+    // vouched for during this pass has its ops accepted during this pass — and
+    // that an epoch minted elsewhere is readable before we try to read under it.
+    crate::trust::reconcile_trust(store, backend, key, &bucket, debug).await?;
+
+    // Rebuild the keychain each pass — the trust exchange above, or a P2P
+    // key-log gossip, may have delivered a new epoch since the last tick. Writes
+    // seal under the head epoch; reads classify against the epochs known now.
     let kc = {
         let guard = store.lock().await;
         guard.keychain(&key.id_key(), &key.epoch0_key())?
@@ -518,14 +534,56 @@ async fn import_needed_entries<B: Backend>(
             .collect()
     };
 
+    // Fetch with a bounded number of requests in flight, then import in the
+    // order RBSR named them.
+    //
+    // These GETs used to be sequential — one await per entry — which made a
+    // first sync cost one full round trip per op. On a device pairing for the
+    // first time that is the whole history: 240 entries took 140s against a
+    // relay on the same machine, and every one of those seconds was latency,
+    // not work. `buffered` preserves input order, so what changes is only how
+    // many requests are outstanding; the import below still runs one at a time,
+    // in the same sequence, under the same lock.
+    //
+    // Bounded rather than unbounded: `need_entry_ids` is attacker-influenced in
+    // the sense that any peer can author ops, and turning that set directly
+    // into concurrent sockets would be a self-inflicted flood on a phone's
+    // network stack. Entries are small (one op-log line), so the buffered
+    // bodies are bounded by roughly ENTRY_FETCH_CONCURRENCY × line size.
+    // Each future owns its id, bucket and backend handle rather than borrowing
+    // them. Borrowing compiles for the host build and then fails the Android
+    // one with "implementation of `FnOnce` is not general enough" — the
+    // higher-ranked lifetime on `Backend::get_entry` cannot be proven for a
+    // future the buffer holds across polls. Cloning an `Arc` and two short
+    // strings per entry is nothing next to the round trip it replaces.
+    let wanted: Vec<String> = need_entry_ids
+        .iter()
+        // A prior pass proved these ids squatted; the real op flows P2P.
+        .filter(|id| !poisoned.contains(*id))
+        .cloned()
+        .collect();
+
+    let fetched: Vec<(String, anyhow::Result<Option<Vec<u8>>>)> = stream::iter(wanted)
+        .map(|id| {
+            let backend = Arc::clone(backend);
+            let bucket = bucket.to_string();
+            async move {
+                let out = backend.get_entry(&bucket, &id).await;
+                (id, out)
+            }
+        })
+        .buffered(ENTRY_FETCH_CONCURRENCY)
+        .collect()
+        .await;
+
     let mut imported = 0usize;
-    for id in need_entry_ids {
-        if poisoned.contains(id) {
-            continue; // a prior pass proved this id squatted; real op flows P2P
-        }
-        let Some(ct) = backend.get_entry(bucket, id).await? else {
+    // Verified lines, grouped by the author they attribute to, in fetch order.
+    let mut by_author: BTreeMap<u64, Vec<Vec<u8>>> = BTreeMap::new();
+    for (id, result) in fetched {
+        let Some(ct) = result? else {
             continue;
         };
+        let id = &id;
         let Some(line) = open_classified(kc, &ct)? else {
             // Missing this epoch's key; self-heals when the key-log delivers it.
             report.undecryptable += 1;
@@ -544,16 +602,43 @@ async fn import_needed_entries<B: Backend>(
             eprintln!("[be-sync] rejected poisoned entry id (content mismatch): {id}");
             continue;
         }
-        let Some(vkey) = peers.get(&author) else {
+        if !peers.contains_key(&author) {
             continue; // unknown/untrusted author -> drop
+        }
+        by_author.entry(author).or_default().push(line);
+    }
+
+    // One import per author rather than one per line. Appending line by line
+    // re-read, re-verified and re-imported that peer's ENTIRE log for every
+    // line, so a first sync cost O(n²) signature checks — the dominant cost of
+    // pairing a device, well ahead of the network.
+    for (author, lines) in by_author {
+        let Some(vkey) = peers.get(&author) else {
+            continue;
         };
         let mut guard = store.lock().await;
-        // A bad entry must not abort the whole pass (matching Engine behavior),
-        // but it must be observable rather than silently swallowed.
-        if let Err(err) = guard.dedup_append_peer_line(author, vkey, &line) {
-            eprintln!("backend sync: dedup_append_peer_line peer={author} failed: {err}");
-        } else {
-            imported += 1;
+        match guard.dedup_append_peer_lines(author, vkey, &lines) {
+            Ok(added) => imported += added,
+            Err(err) => {
+                // `import_peer` verifies the whole candidate log and rejects it
+                // entire, so one bad line in the batch would otherwise discard
+                // every good line beside it. Fall back to line-at-a-time, which
+                // is the slow path precisely because it re-verifies each time —
+                // and that is what isolates the offender.
+                eprintln!(
+                    "backend sync: batch import peer={author} failed ({err}); \
+                     retrying line by line"
+                );
+                for line in &lines {
+                    if let Err(err) = guard.dedup_append_peer_line(author, vkey, line) {
+                        eprintln!(
+                            "backend sync: dedup_append_peer_line peer={author} failed: {err}"
+                        );
+                    } else {
+                        imported += 1;
+                    }
+                }
+            }
         }
     }
     if debug {
@@ -580,11 +665,197 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
+    /// Wraps a backend and records how many `get_entry` calls overlap.
+    ///
+    /// Every other method delegates untouched — the only thing under
+    /// observation is the shape of the entry pull.
+    struct CountsConcurrentGets<B> {
+        inner: Arc<B>,
+        in_flight: std::sync::atomic::AtomicUsize,
+        peak: std::sync::atomic::AtomicUsize,
+    }
+
+    impl<B> CountsConcurrentGets<B> {
+        fn wrapping(inner: Arc<B>) -> Self {
+            Self {
+                inner,
+                in_flight: std::sync::atomic::AtomicUsize::new(0),
+                peak: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn peak_concurrency(&self) -> usize {
+            self.peak.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl<B: Backend + Send + Sync> Backend for CountsConcurrentGets<B> {
+        async fn get_entry(&self, bucket: &str, id: &str) -> anyhow::Result<Option<Vec<u8>>> {
+            use std::sync::atomic::Ordering::SeqCst;
+            let now = self.in_flight.fetch_add(1, SeqCst) + 1;
+            self.peak.fetch_max(now, SeqCst);
+            // Yield so the executor can poll the other buffered futures. Without
+            // a suspension point every call would run to completion inside one
+            // poll and the peak would read 1 even when the fetch *is* buffered —
+            // a real request suspends on the socket for far longer than this.
+            tokio::task::yield_now().await;
+            let out = self.inner.get_entry(bucket, id).await;
+            self.in_flight.fetch_sub(1, SeqCst);
+            out
+        }
+
+        async fn manifest(&self, bucket: &str) -> anyhow::Result<crate::transport::Manifest> {
+            self.inner.manifest(bucket).await
+        }
+        async fn put_entry(
+            &self,
+            bucket: &str,
+            id: &str,
+            ct: Vec<u8>,
+        ) -> anyhow::Result<crate::transport::PutOutcome> {
+            self.inner.put_entry(bucket, id, ct).await
+        }
+        async fn get_blob(&self, bucket: &str, id: &str) -> anyhow::Result<Option<Vec<u8>>> {
+            self.inner.get_blob(bucket, id).await
+        }
+        async fn put_blob(
+            &self,
+            bucket: &str,
+            id: &str,
+            ct: Vec<u8>,
+        ) -> anyhow::Result<crate::transport::PutOutcome> {
+            self.inner.put_blob(bucket, id, ct).await
+        }
+        async fn get_snapshot(&self, bucket: &str, id: &str) -> anyhow::Result<Option<Vec<u8>>> {
+            self.inner.get_snapshot(bucket, id).await
+        }
+        async fn put_snapshot(
+            &self,
+            bucket: &str,
+            id: &str,
+            ct: Vec<u8>,
+        ) -> anyhow::Result<crate::transport::PutOutcome> {
+            self.inner.put_snapshot(bucket, id, ct).await
+        }
+        async fn list_snapshots(&self, bucket: &str) -> anyhow::Result<Vec<String>> {
+            self.inner.list_snapshots(bucket).await
+        }
+        async fn get_trust(&self, bucket: &str, id: &str) -> anyhow::Result<Option<Vec<u8>>> {
+            self.inner.get_trust(bucket, id).await
+        }
+        async fn put_trust(
+            &self,
+            bucket: &str,
+            id: &str,
+            ct: Vec<u8>,
+        ) -> anyhow::Result<crate::transport::PutOutcome> {
+            self.inner.put_trust(bucket, id, ct).await
+        }
+        async fn reconcile(
+            &self,
+            bucket: &str,
+            kind: SetKind,
+            msg: Vec<u8>,
+        ) -> anyhow::Result<Vec<u8>> {
+            self.inner.reconcile(bucket, kind, msg).await
+        }
+    }
+
     async fn store_at(dir: &std::path::Path) -> Arc<Mutex<Store>> {
         let mut store = Store::open(dir, Identity::generate()).unwrap();
         // Found this vault as admin so local writes + `add_peer` vouches are allowed.
         store.declare_founder(Role::Admin).unwrap();
         Arc::new(Mutex::new(store))
+    }
+
+    /// A first sync is entirely latency-bound: the joining device needs every
+    /// entry in the vault, and fetching them one await at a time cost one round
+    /// trip per op — 140 seconds for 240 entries against a relay on the same
+    /// machine, measured on an emulator. Nothing about the result changes if the
+    /// GETs overlap, so nothing but this test notices if they stop overlapping.
+    #[tokio::test]
+    async fn a_joining_device_fetches_entries_concurrently() {
+        let key = VaultKey([11u8; 32]);
+        let memory = Arc::new(MemoryBackend::default());
+        let a_dir = tempfile::tempdir().unwrap();
+        let b_dir = tempfile::tempdir().unwrap();
+        let a = store_at(a_dir.path()).await;
+        let b = store_at(b_dir.path()).await;
+
+        let (a_peer, a_key) = {
+            let g = a.lock().await;
+            (g.peer_id(), g.identity_verifying_bytes())
+        };
+        let (b_peer, b_key) = {
+            let g = b.lock().await;
+            (g.peer_id(), g.identity_verifying_bytes())
+        };
+        a.lock().await.add_peer(b_peer, b_key, Role::Admin).unwrap();
+        b.lock().await.add_peer(a_peer, a_key, Role::Admin).unwrap();
+
+        // Comfortably more entries than ENTRY_FETCH_CONCURRENCY, so the buffer
+        // is the limit rather than the supply.
+        for i in 0..40 {
+            a.lock()
+                .await
+                .set_entry("files", &format!("k{i}"), "v")
+                .unwrap();
+        }
+        reconcile_once(&a, &memory, &key).await.unwrap();
+
+        let counting = Arc::new(CountsConcurrentGets::wrapping(memory));
+        reconcile_once(&b, &counting, &key).await.unwrap();
+
+        assert_eq!(
+            b.lock().await.get_entry("files", "k39"),
+            Some("v".to_string()),
+            "setup: the pull has to actually deliver the entries",
+        );
+        assert!(
+            counting.peak_concurrency() > 1,
+            "entry GETs ran one at a time (peak in flight: {}), which is one \
+             round trip per op on a first sync",
+            counting.peak_concurrency(),
+        );
+    }
+
+    /// Scratch probe: how does a first sync scale with entry count when the
+    /// backend has no latency at all? Run with `--ignored --nocapture`.
+    #[tokio::test]
+    #[ignore]
+    async fn probe_pull_cost_by_entry_count() {
+        for count in [50usize, 100, 200, 400] {
+            let key = VaultKey([7u8; 32]);
+            let backend = Arc::new(MemoryBackend::default());
+            let a_dir = tempfile::tempdir().unwrap();
+            let b_dir = tempfile::tempdir().unwrap();
+            let a = store_at(a_dir.path()).await;
+            let b = store_at(b_dir.path()).await;
+            let (a_peer, a_key) = {
+                let g = a.lock().await;
+                (g.peer_id(), g.identity_verifying_bytes())
+            };
+            let (b_peer, b_key) = {
+                let g = b.lock().await;
+                (g.peer_id(), g.identity_verifying_bytes())
+            };
+            a.lock().await.add_peer(b_peer, b_key, Role::Admin).unwrap();
+            b.lock().await.add_peer(a_peer, a_key, Role::Admin).unwrap();
+            for i in 0..count {
+                a.lock()
+                    .await
+                    .set_entry("files", &format!("k{i}"), "some value here")
+                    .unwrap();
+            }
+            reconcile_once(&a, &backend, &key).await.unwrap();
+            let started = std::time::Instant::now();
+            reconcile_once(&b, &backend, &key).await.unwrap();
+            println!(
+                "PROBE entries={count} pull={}ms",
+                started.elapsed().as_millis()
+            );
+        }
     }
 
     #[tokio::test]

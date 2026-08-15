@@ -8,3 +8,4 @@ pub mod http;
 pub use roam_storage::snapshot_msg;
 pub mod sync;
 pub mod transport;
+pub mod trust;

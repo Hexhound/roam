@@ -41,6 +41,17 @@ impl Version {
     }
 }
 
+/// One key-level change to a map container, as reported by
+/// [`Document::map_delta`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MapChange {
+    /// The map container's name (the `map_id` passed to `set_entry`).
+    pub container: String,
+    pub key: String,
+    /// The value after the change, or `None` when the key was deleted.
+    pub value: Option<String>,
+}
+
 /// An opaque handle to a specific point in the op-DAG (a set of leaf op-ids).
 /// Wraps loro's `Frontiers`; `to_bytes`/`from_bytes` give a persistable byte
 /// form used by the storage-layer history index.
@@ -271,6 +282,56 @@ impl Document {
         Ok(TextDiff { spans })
     }
 
+    /// Every key-level change to map containers between two frontiers.
+    ///
+    /// This is what lets an embedder react to a sync rather than poll for it:
+    /// capture [`Document::oplog_frontier`] before importing peer ops, call this
+    /// with the frontier afterwards, and get exactly the keys that moved. Without
+    /// it the only way to find out what a sync changed is to re-read every
+    /// container and diff it by hand, which costs the whole dataset per sync and
+    /// still cannot distinguish "deleted" from "never existed".
+    ///
+    /// Deletes are reported as `value: None`, which is not the same as a key
+    /// that was untouched — the latter simply does not appear. That distinction
+    /// is the point: a consumer projecting into a database has to issue a DELETE
+    /// for one and nothing at all for the other.
+    ///
+    /// Only root map containers are reported (the only kind roam creates), and
+    /// only string values — matching [`Document::get_entry`], which is the sole
+    /// way values get in.
+    pub fn map_delta(&self, from: &Frontier, to: &Frontier) -> Result<Vec<MapChange>, CrdtError> {
+        let batch = self.doc.diff(&from.0, &to.0)?;
+        let mut changes = Vec::new();
+
+        for (cid, diff) in batch.iter() {
+            let loro::ContainerID::Root {
+                name,
+                container_type: loro::ContainerType::Map,
+            } = cid
+            else {
+                continue;
+            };
+            let loro::event::Diff::Map(delta) = diff else {
+                continue;
+            };
+
+            for (key, value) in delta.updated.iter() {
+                changes.push(MapChange {
+                    container: name.to_string(),
+                    key: key.to_string(),
+                    value: value.as_ref().and_then(|entry| match entry {
+                        ValueOrContainer::Value(LoroValue::String(text)) => {
+                            Some(text.to_string())
+                        }
+                        _ => None,
+                    }),
+                });
+            }
+        }
+
+        Ok(changes)
+    }
+
     /// Every change touching text container `id`, oldest-first. Each carries the
     /// frontier AS OF that change, its wall-clock ms, and the authoring peer id.
     pub fn text_changes(&self, id: &str) -> Result<Vec<ChangeInfo>, CrdtError> {
@@ -329,6 +390,107 @@ impl Document {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn map_delta_reports_a_set_key() {
+        let doc = Document::new(1).unwrap();
+        let before = doc.oplog_frontier();
+        doc.set_entry("journeys", "j1", "{\"title\":\"knee\"}").unwrap();
+        doc.commit();
+
+        let changes = doc.map_delta(&before, &doc.oplog_frontier()).unwrap();
+        assert_eq!(
+            changes,
+            vec![MapChange {
+                container: "journeys".into(),
+                key: "j1".into(),
+                value: Some("{\"title\":\"knee\"}".into()),
+            }]
+        );
+    }
+
+    #[test]
+    fn map_delta_distinguishes_a_delete_from_an_absence() {
+        // A consumer projecting into a database has to issue a DELETE for a
+        // removed key and nothing at all for an untouched one. Collapsing the
+        // two would either leave stale rows behind or delete live ones.
+        let doc = Document::new(1).unwrap();
+        doc.set_entry("journeys", "j1", "a").unwrap();
+        doc.set_entry("journeys", "j2", "b").unwrap();
+        doc.commit();
+
+        let before = doc.oplog_frontier();
+        doc.remove_entry("journeys", "j1").unwrap();
+        doc.commit();
+
+        let changes = doc.map_delta(&before, &doc.oplog_frontier()).unwrap();
+        assert_eq!(
+            changes,
+            vec![MapChange {
+                container: "journeys".into(),
+                key: "j1".into(),
+                value: None,
+            }],
+            "only the deleted key, reported as a deletion"
+        );
+    }
+
+    #[test]
+    fn map_delta_spans_containers() {
+        let doc = Document::new(1).unwrap();
+        let before = doc.oplog_frontier();
+        doc.set_entry("journeys", "j1", "a").unwrap();
+        doc.set_entry("events", "e1", "b").unwrap();
+        doc.commit();
+
+        let mut changes = doc.map_delta(&before, &doc.oplog_frontier()).unwrap();
+        changes.sort_by(|a, b| a.container.cmp(&b.container));
+        assert_eq!(changes.len(), 2);
+        assert_eq!(changes[0].container, "events");
+        assert_eq!(changes[1].container, "journeys");
+    }
+
+    #[test]
+    fn map_delta_is_empty_when_nothing_moved() {
+        let doc = Document::new(1).unwrap();
+        doc.set_entry("journeys", "j1", "a").unwrap();
+        doc.commit();
+
+        let frontier = doc.oplog_frontier();
+        assert!(doc.map_delta(&frontier, &frontier).unwrap().is_empty());
+    }
+
+    #[test]
+    fn map_delta_ignores_text_containers() {
+        // Text is a separate concern with its own delta API; leaking a text
+        // container in here would have a map consumer try to write a row for it.
+        let doc = Document::new(1).unwrap();
+        let before = doc.oplog_frontier();
+        doc.insert_text("note", 0, "hello").unwrap();
+        doc.commit();
+
+        assert!(doc.map_delta(&before, &doc.oplog_frontier()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn map_delta_reports_what_a_peer_import_changed() {
+        // The reason this exists: after importing peer ops, an embedder needs
+        // to know which keys moved without re-reading the whole dataset.
+        let local = Document::new(1).unwrap();
+        let remote = Document::new(2).unwrap();
+
+        remote.set_entry("journeys", "j1", "from-peer").unwrap();
+        remote.commit();
+        let ops = remote.export_from(&Version(VersionVector::default())).unwrap();
+
+        let before = local.oplog_frontier();
+        local.import(&ops).unwrap();
+
+        let changes = local.map_delta(&before, &local.oplog_frontier()).unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].key, "j1");
+        assert_eq!(changes[0].value.as_deref(), Some("from-peer"));
+    }
 
     #[test]
     fn edits_text_and_reads_it_back() {

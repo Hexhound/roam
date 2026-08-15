@@ -1,12 +1,31 @@
 import Config
 config :ash, policies: [show_policy_breakdowns?: true]
 
+# LiveDebugger binds its own endpoint on a fixed port (4007). A second Phoenix
+# project running on the same machine therefore stops this one from booting at
+# all: `:eaddrinuse` on a child of the supervision tree takes the whole app
+# down, and the error names LiveDebugger rather than the port, so it reads like
+# a broken dependency rather than a collision.
+#
+# `disabled?` rather than a port override because the port is not configurable —
+# the endpoint's own config key only feeds the URLs it prints. Off by default,
+# so the debugger is there as usual; set LIVE_DEBUGGER_DISABLED=1 to bring the
+# relay up beside something else.
+config :live_debugger, disabled?: System.get_env("LIVE_DEBUGGER_DISABLED") == "1"
+
 # Configure your database
+# Credentials default to the conventional postgres/postgres, but read the
+# standard PG* variables first. devenv's Postgres creates a superuser named
+# after the OS user and no `postgres` role at all, so the hardcoded pair fails
+# with a bare `FATAL: role "postgres" does not exist` — surfaced through Ecto as
+# "The database for Sync.Repo couldn't be created: killed", which names neither
+# the role nor the cause.
 config :sync, Sync.Repo,
-  username: "postgres",
-  password: "postgres",
-  hostname: "localhost",
-  database: "sync_dev",
+  username: System.get_env("PGUSER") || "postgres",
+  password: System.get_env("PGPASSWORD") || "postgres",
+  hostname: System.get_env("PGHOST") || "localhost",
+  port: String.to_integer(System.get_env("PGPORT") || "5432"),
+  database: System.get_env("PGDATABASE_SYNC") || "sync_dev",
   stacktrace: true,
   show_sensitive_data_on_connection_error: true,
   pool_size: 10
