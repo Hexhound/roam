@@ -242,7 +242,13 @@ pub async fn reconcile_once<B: Backend>(
     // Fetch blobs we lack, decrypt, store.
     for id in need_blob_ids.difference(&poisoned) {
         if let Some(ct) = backend.get_blob(&bucket, id).await? {
-            match open_classified(&kc, &ct)? {
+            let opened = open_classified(&kc, &ct)?;
+            // The ciphertext is dead the moment it is opened, and holding both
+            // buffers doubles the peak for the largest thing this pass touches.
+            // Dropping it here is not tidiness — on a phone it is the
+            // difference between one blob's worth of memory and two.
+            drop(ct);
+            match opened {
                 Some(plaintext) => {
                     // BE1: a content-addressed blob id MUST re-derive from its
                     // decrypted bytes. A mismatch means the id was squatted with

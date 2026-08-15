@@ -20,5 +20,13 @@ tokio = { workspace = true, features = ["sync"] }
 zeroize = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
+tokio = { workspace = true, features = [
+  "macros",
+  "rt-multi-thread",
+  "sync",
+  # The response-cap tests stand up a raw TCP server that lies about its body.
+  "net",
+  "io-util",
+  "time",
+] }
 tempfile = { workspace = true }
