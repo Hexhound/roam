@@ -1348,6 +1348,64 @@ impl Store {
     /// the backend content-id fetch path (`roam-backend-client::sync`), which
     /// resolves entries out of causal order (RBSR discovery is set-based, not
     /// sequential).
+    /// Append many lines to one peer's log in a single import.
+    ///
+    /// [`Self::dedup_append_peer_line`] is the same operation for one line, and
+    /// calling it in a loop is quadratic: each call re-reads that peer's whole
+    /// log, re-verifies every signature in it, and re-imports the lot into Loro.
+    /// Pulling N ops therefore costs N full log verifications — which is fine
+    /// for the trickle of a steady-state sync and ruinous for the one case that
+    /// pulls everything at once, a device that has just paired. Measured on an
+    /// emulator, 240 entries took over two minutes with no network in the way.
+    ///
+    /// Batching keeps the security property that matters: the candidate log is
+    /// still built in memory and handed to [`Self::import_peer`], which verifies
+    /// the whole chain BEFORE anything touches disk. What changes is only how
+    /// many times that verification runs.
+    ///
+    /// Returns the number of lines that were new. On a verification failure
+    /// nothing is written — see the caller, which falls back to line-at-a-time
+    /// so that one bad line cannot discard the good ones alongside it.
+    pub fn dedup_append_peer_lines(
+        &mut self,
+        author: u64,
+        key: &VerifyingKey,
+        lines: &[Vec<u8>],
+    ) -> Result<usize, StorageError> {
+        if author == self.identity.peer_id() {
+            return Ok(0);
+        }
+        let existing = self.export_peer_log(author)?;
+        // A set, not a scan per line: the loop this replaces was O(lines ×
+        // existing), which is the same quadratic shape one level down.
+        let existing_lines = split_log_lines_bytes(&existing);
+        let mut seen: std::collections::HashSet<&[u8]> =
+            existing_lines.iter().map(|l| l.as_slice()).collect();
+
+        let mut whole = existing;
+        let mut added = 0usize;
+        for line in lines {
+            if seen.contains(line.as_slice()) {
+                continue;
+            }
+            // Two identical lines inside one batch would otherwise both append.
+            seen.insert(line.as_slice());
+            if !whole.is_empty() && !whole.ends_with(b"\n") {
+                whole.push(b'\n');
+            }
+            whole.extend_from_slice(line);
+            added += 1;
+        }
+        if added == 0 {
+            return Ok(0);
+        }
+        if !whole.ends_with(b"\n") {
+            whole.push(b'\n');
+        }
+        self.import_peer(author, key, whole)?;
+        Ok(added)
+    }
+
     pub fn dedup_append_peer_line(
         &mut self,
         author: u64,

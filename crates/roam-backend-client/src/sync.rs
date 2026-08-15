@@ -577,6 +577,8 @@ async fn import_needed_entries<B: Backend>(
         .await;
 
     let mut imported = 0usize;
+    // Verified lines, grouped by the author they attribute to, in fetch order.
+    let mut by_author: BTreeMap<u64, Vec<Vec<u8>>> = BTreeMap::new();
     for (id, result) in fetched {
         let Some(ct) = result? else {
             continue;
@@ -600,16 +602,43 @@ async fn import_needed_entries<B: Backend>(
             eprintln!("[be-sync] rejected poisoned entry id (content mismatch): {id}");
             continue;
         }
-        let Some(vkey) = peers.get(&author) else {
+        if !peers.contains_key(&author) {
             continue; // unknown/untrusted author -> drop
+        }
+        by_author.entry(author).or_default().push(line);
+    }
+
+    // One import per author rather than one per line. Appending line by line
+    // re-read, re-verified and re-imported that peer's ENTIRE log for every
+    // line, so a first sync cost O(n²) signature checks — the dominant cost of
+    // pairing a device, well ahead of the network.
+    for (author, lines) in by_author {
+        let Some(vkey) = peers.get(&author) else {
+            continue;
         };
         let mut guard = store.lock().await;
-        // A bad entry must not abort the whole pass (matching Engine behavior),
-        // but it must be observable rather than silently swallowed.
-        if let Err(err) = guard.dedup_append_peer_line(author, vkey, &line) {
-            eprintln!("backend sync: dedup_append_peer_line peer={author} failed: {err}");
-        } else {
-            imported += 1;
+        match guard.dedup_append_peer_lines(author, vkey, &lines) {
+            Ok(added) => imported += added,
+            Err(err) => {
+                // `import_peer` verifies the whole candidate log and rejects it
+                // entire, so one bad line in the batch would otherwise discard
+                // every good line beside it. Fall back to line-at-a-time, which
+                // is the slow path precisely because it re-verifies each time —
+                // and that is what isolates the offender.
+                eprintln!(
+                    "backend sync: batch import peer={author} failed ({err}); \
+                     retrying line by line"
+                );
+                for line in &lines {
+                    if let Err(err) = guard.dedup_append_peer_line(author, vkey, line) {
+                        eprintln!(
+                            "backend sync: dedup_append_peer_line peer={author} failed: {err}"
+                        );
+                    } else {
+                        imported += 1;
+                    }
+                }
+            }
         }
     }
     if debug {
@@ -789,6 +818,44 @@ mod tests {
              round trip per op on a first sync",
             counting.peak_concurrency(),
         );
+    }
+
+    /// Scratch probe: how does a first sync scale with entry count when the
+    /// backend has no latency at all? Run with `--ignored --nocapture`.
+    #[tokio::test]
+    #[ignore]
+    async fn probe_pull_cost_by_entry_count() {
+        for count in [50usize, 100, 200, 400] {
+            let key = VaultKey([7u8; 32]);
+            let backend = Arc::new(MemoryBackend::default());
+            let a_dir = tempfile::tempdir().unwrap();
+            let b_dir = tempfile::tempdir().unwrap();
+            let a = store_at(a_dir.path()).await;
+            let b = store_at(b_dir.path()).await;
+            let (a_peer, a_key) = {
+                let g = a.lock().await;
+                (g.peer_id(), g.identity_verifying_bytes())
+            };
+            let (b_peer, b_key) = {
+                let g = b.lock().await;
+                (g.peer_id(), g.identity_verifying_bytes())
+            };
+            a.lock().await.add_peer(b_peer, b_key, Role::Admin).unwrap();
+            b.lock().await.add_peer(a_peer, a_key, Role::Admin).unwrap();
+            for i in 0..count {
+                a.lock()
+                    .await
+                    .set_entry("files", &format!("k{i}"), "some value here")
+                    .unwrap();
+            }
+            reconcile_once(&a, &backend, &key).await.unwrap();
+            let started = std::time::Instant::now();
+            reconcile_once(&b, &backend, &key).await.unwrap();
+            println!(
+                "PROBE entries={count} pull={}ms",
+                started.elapsed().as_millis()
+            );
+        }
     }
 
     #[tokio::test]
