@@ -14,7 +14,7 @@ use crate::snapshot;
 use crate::text_history::{TextVersion, VersionKind};
 use crate::vfs::{NativeFs, VaultFs};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
-use roam_crdt::{Document, Frontier, Version};
+use roam_crdt::{Document, Frontier, MapChange, Version};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -413,6 +413,30 @@ impl Store {
     /// All key/value pairs in map `map_id`.
     pub fn entries(&self, map_id: &str) -> Vec<(String, String)> {
         self.doc.entries(map_id)
+    }
+
+    /// The current op-log frontier — a marker an embedder holds across a sync so
+    /// it can ask [`Store::map_delta`] what moved.
+    pub fn frontier(&self) -> Frontier {
+        self.doc.oplog_frontier()
+    }
+
+    /// Every key-level map change between two frontiers.
+    ///
+    /// The intended use is: take [`Store::frontier`], run a sync (or import peer
+    /// ops), then call this with the frontier from before. The result is exactly
+    /// the keys that moved, with deletes distinguished from untouched keys —
+    /// which is what an embedder projecting into its own database needs in order
+    /// to issue a DELETE for one and nothing for the other.
+    ///
+    /// The alternative, re-reading every container and diffing by hand, costs
+    /// the whole dataset on every sync and still cannot see a deletion.
+    pub fn map_delta(
+        &self,
+        from: &Frontier,
+        to: &Frontier,
+    ) -> Result<Vec<MapChange>, StorageError> {
+        Ok(self.doc.map_delta(from, to)?)
     }
 
     fn persist_new_ops(&mut self) -> Result<(), StorageError> {

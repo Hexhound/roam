@@ -35,6 +35,7 @@ pub use keywrap::{unwrap, wrap};
 pub use oplog::{Entry, OpLog, OPLOG_SIG_DOMAIN};
 pub use paper::PaperKey;
 pub use roster::{merge_roster, PeerRecord, PeerStatus, Role, RosterEntry, RosterLog, RosterOp};
+pub use roam_crdt::MapChange;
 pub use store::{version_dominates, BackendSnapshot, DataSize, HeldSnapshot, Store};
 pub use text_history::{TextVersion, VersionKind};
 pub use vault_key::{vault_subkeys, VAULT_AEAD_LABEL, VAULT_ID_LABEL};
