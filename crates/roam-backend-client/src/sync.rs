@@ -550,22 +550,38 @@ async fn import_needed_entries<B: Backend>(
     // into concurrent sockets would be a self-inflicted flood on a phone's
     // network stack. Entries are small (one op-log line), so the buffered
     // bodies are bounded by roughly ENTRY_FETCH_CONCURRENCY × line size.
-    let fetched: Vec<(&String, anyhow::Result<Option<Vec<u8>>>)> = stream::iter(
-        need_entry_ids
-            .iter()
-            // A prior pass proved these ids squatted; the real op flows P2P.
-            .filter(|id| !poisoned.contains(*id)),
-    )
-    .map(|id| async move { (id, backend.get_entry(bucket, id).await) })
-    .buffered(ENTRY_FETCH_CONCURRENCY)
-    .collect()
-    .await;
+    // Each future owns its id, bucket and backend handle rather than borrowing
+    // them. Borrowing compiles for the host build and then fails the Android
+    // one with "implementation of `FnOnce` is not general enough" — the
+    // higher-ranked lifetime on `Backend::get_entry` cannot be proven for a
+    // future the buffer holds across polls. Cloning an `Arc` and two short
+    // strings per entry is nothing next to the round trip it replaces.
+    let wanted: Vec<String> = need_entry_ids
+        .iter()
+        // A prior pass proved these ids squatted; the real op flows P2P.
+        .filter(|id| !poisoned.contains(*id))
+        .cloned()
+        .collect();
+
+    let fetched: Vec<(String, anyhow::Result<Option<Vec<u8>>>)> = stream::iter(wanted)
+        .map(|id| {
+            let backend = Arc::clone(backend);
+            let bucket = bucket.to_string();
+            async move {
+                let out = backend.get_entry(&bucket, &id).await;
+                (id, out)
+            }
+        })
+        .buffered(ENTRY_FETCH_CONCURRENCY)
+        .collect()
+        .await;
 
     let mut imported = 0usize;
     for (id, result) in fetched {
         let Some(ct) = result? else {
             continue;
         };
+        let id = &id;
         let Some(line) = open_classified(kc, &ct)? else {
             // Missing this epoch's key; self-heals when the key-log delivers it.
             report.undecryptable += 1;
