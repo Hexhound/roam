@@ -12,6 +12,12 @@ pub enum SetKind {
     Entries,
     Blobs,
     Snapshots,
+    /// Signed roster and key logs — who may write, and which epoch keys they
+    /// were handed. Carried as its own set rather than folded into `Entries`
+    /// because it is what decides whether an entry is admissible at all: it has
+    /// to be reconciled and applied BEFORE the entries in the same pass, or a
+    /// newly-vouched-for peer's ops are rejected for one more round trip.
+    Trust,
 }
 
 impl SetKind {
@@ -21,6 +27,7 @@ impl SetKind {
             SetKind::Entries => "entries",
             SetKind::Blobs => "blobs",
             SetKind::Snapshots => "snapshots",
+            SetKind::Trust => "trust",
         }
     }
 }

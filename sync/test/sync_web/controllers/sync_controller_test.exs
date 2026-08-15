@@ -56,6 +56,37 @@ defmodule SyncWeb.SyncControllerTest do
     assert got.resp_body == "snapct"
   end
 
+  test "put then get a trust bundle round-trips the bytes", %{conn: conn} do
+    conn = put_req_header(conn, "content-type", "application/octet-stream")
+    assert put(conn, "/b/#{@bucket}/trust/#{@id}", "sealedtrust").status == 201
+
+    got = get(build_conn(), "/b/#{@bucket}/trust/#{@id}")
+    assert got.status == 200
+    assert got.resp_body == "sealedtrust"
+  end
+
+  test "trust ids are path-guarded like every other kind", %{conn: conn} do
+    conn = put_req_header(conn, "content-type", "application/octet-stream")
+    assert put(conn, "/b/#{@bucket}/trust/..%2F..%2Fetc", "x").status == 400
+  end
+
+  test "trust is a reconcilable kind", %{conn: conn} do
+    # Both of these are 400 — an empty body is not a valid RBSR message — so the
+    # status alone would pass even if "trust" were never whitelisted. The
+    # response body is what actually distinguishes "I know this kind, your
+    # message was junk" from "I have never heard of this kind".
+    conn = put_req_header(conn, "content-type", "application/octet-stream")
+    known = post(conn, "/b/#{@bucket}/reconcile/trust", <<>>)
+    assert known.resp_body == "bad reconcile message"
+
+    unknown =
+      build_conn()
+      |> put_req_header("content-type", "application/octet-stream")
+      |> post("/b/#{@bucket}/reconcile/nosuchkind", <<>>)
+
+    assert unknown.resp_body == "unknown kind"
+  end
+
   test "manifest lists snapshot ids", %{conn: conn} do
     put(
       conn |> put_req_header("content-type", "application/octet-stream"),

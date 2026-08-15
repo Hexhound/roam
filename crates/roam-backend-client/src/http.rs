@@ -24,6 +24,9 @@ impl HttpBackend {
     fn snapshot_url(&self, bucket: &str, id: &str) -> String {
         format!("{}/b/{bucket}/snapshots/{id}", self.base)
     }
+    fn trust_url(&self, bucket: &str, id: &str) -> String {
+        format!("{}/b/{bucket}/trust/{id}", self.base)
+    }
 }
 
 async fn get_bytes(client: &reqwest::Client, url: &str) -> anyhow::Result<Option<Vec<u8>>> {
@@ -74,6 +77,12 @@ impl Backend for HttpBackend {
         ct: Vec<u8>,
     ) -> anyhow::Result<PutOutcome> {
         put_bytes(&self.client, &self.snapshot_url(bucket, id), ct).await
+    }
+    async fn get_trust(&self, bucket: &str, id: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        get_bytes(&self.client, &self.trust_url(bucket, id)).await
+    }
+    async fn put_trust(&self, bucket: &str, id: &str, ct: Vec<u8>) -> anyhow::Result<PutOutcome> {
+        put_bytes(&self.client, &self.trust_url(bucket, id), ct).await
     }
     async fn list_snapshots(&self, bucket: &str) -> anyhow::Result<Vec<String>> {
         // The backend surfaces snapshot ids through the manifest endpoint, so a

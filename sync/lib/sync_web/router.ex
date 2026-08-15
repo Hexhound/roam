@@ -72,6 +72,8 @@ defmodule SyncWeb.Router do
     put "/blobs/:id", SyncController, :put_blob
     get "/snapshots/:id", SyncController, :get_snapshot
     put "/snapshots/:id", SyncController, :put_snapshot
+    get "/trust/:id", SyncController, :get_trust
+    put "/trust/:id", SyncController, :put_trust
     post "/reconcile/:kind", SyncController, :reconcile
   end
 

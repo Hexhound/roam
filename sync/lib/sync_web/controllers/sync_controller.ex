@@ -14,7 +14,18 @@ defmodule SyncWeb.SyncController do
   def get_snapshot(conn, %{"bucket" => b, "id" => id}), do: do_get(conn, b, "snapshots", id)
   def put_snapshot(conn, %{"bucket" => b, "id" => id}), do: do_put(conn, b, "snapshots", id)
 
-  @kinds %{"entries" => "entries", "blobs" => "blobs", "snapshots" => "snapshots"}
+  # Trust bundles: sealed roster + key logs. Opaque here exactly like every other
+  # kind — the server cannot tell a roster from a journal entry, and must not be
+  # able to. See `roam_backend_client::trust`.
+  def get_trust(conn, %{"bucket" => b, "id" => id}), do: do_get(conn, b, "trust", id)
+  def put_trust(conn, %{"bucket" => b, "id" => id}), do: do_put(conn, b, "trust", id)
+
+  @kinds %{
+    "entries" => "entries",
+    "blobs" => "blobs",
+    "snapshots" => "snapshots",
+    "trust" => "trust"
+  }
 
   def reconcile(conn, %{"bucket" => bucket, "kind" => kind}) do
     with :ok <- guard(conn, [bucket]),

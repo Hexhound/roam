@@ -40,7 +40,7 @@ pub struct DecryptReport {
 /// Returns `(have, need)` as id strings: `have` = ids the backend lacks
 /// (we upload), `need` = ids we lack (we fetch). Both are returned in the same
 /// base64url (no-pad) encoding used for entry/blob ids elsewhere.
-async fn reconcile_set<B: Backend>(
+pub(crate) async fn reconcile_set<B: Backend>(
     backend: &Arc<B>,
     bucket: &str,
     kind: SetKind,
@@ -90,9 +90,15 @@ pub async fn reconcile_once<B: Backend>(
     let debug = std::env::var_os("ROAM_DEBUG").is_some();
     let bucket = key.bucket_id();
 
-    // Rebuild the keychain each pass — a P2P key-log gossip may have delivered a
-    // new epoch since the last tick. Writes seal under the head epoch; reads
-    // classify against the epochs known right now.
+    // Trust BEFORE content. Roster and key logs decide who may author an entry
+    // and which epoch keys we can open, so exchanging them first means a peer
+    // vouched for during this pass has its ops accepted during this pass — and
+    // that an epoch minted elsewhere is readable before we try to read under it.
+    crate::trust::reconcile_trust(store, backend, key, &bucket, debug).await?;
+
+    // Rebuild the keychain each pass — the trust exchange above, or a P2P
+    // key-log gossip, may have delivered a new epoch since the last tick. Writes
+    // seal under the head epoch; reads classify against the epochs known now.
     let kc = {
         let guard = store.lock().await;
         guard.keychain(&key.id_key(), &key.epoch0_key())?

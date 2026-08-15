@@ -72,6 +72,6 @@ defmodule Sync.Backend.SweeperTest do
     assert Map.has_key?(results, bad)
     assert is_map(results[bad])
     # The poison object parses to no valid snapshot, so nothing is dropped there.
-    assert results[bad] == %{snapshots: [], entries: [], blobs: []}
+    assert results[bad] == %{snapshots: [], entries: [], blobs: [], trust: []}
   end
 end
