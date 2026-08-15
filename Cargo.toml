@@ -60,3 +60,40 @@ js-sys = "=0.3.103"
 # Pulled in by the generated glue for every `async fn` binding. Pinned with the
 # rest: it depends on wasm-bindgen exactly.
 wasm-bindgen-futures = "=0.4.76"
+
+# Debug info for OUR code, none for our dependencies.
+#
+# Without this, `target/` reached 40 GB. Cargo defaults `debug = true` for dev
+# and test, and roam links iroh + quinn + loro statically into every one of
+# ~135 test binaries — each one 370-430 MB, almost all of it DWARF belonging to
+# dependencies nobody sets a breakpoint in. `package."*"` matches every
+# non-workspace dependency and explicitly NOT workspace members, so roam's own
+# crates keep full debug info: locals, types, expression evaluation, all of it.
+#
+# Measured on roam-backend-client's test binary rather than assumed:
+#
+#     156 MB   cargo default, debug info everywhere
+#      53 MB   this config
+#      33 MB   debug info switched off entirely
+#
+# So it recovers two thirds of the size for 20 MB more than the nuclear option,
+# and the iroh-linked binaries should do better still — their dependency share
+# is larger.
+#
+# The one thing this costs is stepping *inside* a dependency. When that is
+# genuinely what you need, override for the run rather than changing this:
+#
+#     CARGO_PROFILE_TEST_DEBUG=2 cargo test -p roam-storage
+#
+# Release and bench profiles are deliberately untouched.
+[profile.dev]
+debug = true
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.test]
+debug = true
+
+[profile.test.package."*"]
+debug = false
