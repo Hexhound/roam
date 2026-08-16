@@ -47,6 +47,18 @@
   # `cargo clean`), so it is cheap to run often. The remaining ~7.5 GB floor is
   # mostly debug info; `[profile.dev] debug = "line-tables-only"` would cut most
   # of it at the cost of debugger variable inspection.
+  # `chromium` is a TEST DEPENDENCY, not a convenience. The OPFS storage backend
+  # can only be exercised where OPFS exists, and node has no OPFS at all — so the
+  # `tests/js` node harness that proves M1 interop and M3 transport structurally
+  # cannot cover it. Measured in Chromium 150 (see docs/browser_storage_opfs.md):
+  # `createSyncAccessHandle` is *absent* on the main thread and present in a
+  # dedicated worker, so the harness has to be a real browser running a real
+  # worker. It must also be served over `http://127.0.0.1` rather than `file://`
+  # — OPFS needs a secure context with a real storage key, and a `file://` page
+  # is an opaque origin.
+  #
+  # Pinned via nixpkgs like everything else here so the harness does not silently
+  # depend on whatever browser happens to be in the developer's user profile.
   packages = [
     pkgs.cargo-nextest
     pkgs.cargo-sweep
@@ -54,6 +66,7 @@
     pkgs.wasm-pack
     pkgs.nodejs
     pkgs.lld
+    pkgs.chromium
   ];
 
   # Claude Code CLI + agent-acp, sourced from the shared devkit. Pins
