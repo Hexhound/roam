@@ -468,13 +468,11 @@ async fn main() -> Result<()> {
 }
 
 /// Parse a role string into a [`Role`].
+///
+/// The parse itself lives in `roam-storage`, because every embedder needs it and
+/// a CLI-private copy would be a capability the library did not have.
 fn parse_role(s: &str) -> anyhow::Result<Role> {
-    match s.to_ascii_lowercase().as_str() {
-        "reader" => Ok(Role::Reader),
-        "writer" => Ok(Role::Writer),
-        "admin" => Ok(Role::Admin),
-        other => anyhow::bail!("unknown role '{other}' (reader|writer|admin)"),
-    }
+    Ok(s.parse()?)
 }
 
 /// Render a 32-byte epoch id for humans: the all-zero id is epoch 0 (the legacy

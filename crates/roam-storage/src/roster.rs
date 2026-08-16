@@ -16,6 +16,38 @@ pub enum Role {
     Admin,
 }
 
+/// Parsed from the lowercase name, and rendered back as the same name.
+///
+/// Lives here rather than in a front end because every embedder needs it: the
+/// CLI takes a role as an argument, the browser bindings take one across a
+/// `postMessage` boundary, and an FFI bridge takes one as a string too. A
+/// private copy in each was three chances for `"Writer"` to be rejected in one
+/// place and accepted in another.
+impl std::str::FromStr for Role {
+    type Err = StorageError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "reader" => Ok(Role::Reader),
+            "writer" => Ok(Role::Writer),
+            "admin" => Ok(Role::Admin),
+            other => Err(StorageError::Invalid(format!(
+                "unknown role '{other}' (reader|writer|admin)"
+            ))),
+        }
+    }
+}
+
+impl std::fmt::Display for Role {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Role::Reader => "reader",
+            Role::Writer => "writer",
+            Role::Admin => "admin",
+        })
+    }
+}
+
 /// Maximum device-name length in unicode chars (authoring boundary rejects longer).
 pub const MAX_NAME_LEN: usize = 64;
 

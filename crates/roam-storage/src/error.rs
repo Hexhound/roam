@@ -22,4 +22,9 @@ pub enum StorageError {
     Crdt(#[from] roam_crdt::CrdtError),
     #[error("key unwrap failed")]
     Keywrap,
+    /// A value that came from outside — an argument, a message field — that this
+    /// crate's own types will not accept. The message names what was expected,
+    /// because the caller is usually relaying it to a person.
+    #[error("{0}")]
+    Invalid(String),
 }
