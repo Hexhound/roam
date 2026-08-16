@@ -94,6 +94,15 @@ pub enum Command {
         container: String,
         key: String,
     },
+    RemoveEntry {
+        container: String,
+        key: String,
+    },
+    /// Every key in a container, as an object. For the bootstrap projection a
+    /// freshly paired device makes before incremental `changes` mean anything.
+    Entries {
+        container: String,
+    },
     // `textId`, not `id`: the envelope already owns `id`, and a request object
     // cannot carry the key twice. JSON does not reject the duplicate — parsers
     // silently keep one of them — so the collision would surface as a text
@@ -121,7 +130,34 @@ pub enum Command {
     HasBlob {
         hash: String,
     },
+    RemoveBlob {
+        hash: String,
+    },
     BucketId,
+
+    // -- membership and maintenance ------------------------------------------
+
+    /// The roster, as an array. `peerId` crosses as a string and `verifyingKey`
+    /// as base64url, matching every other id on this protocol.
+    Roster,
+    /// This device's role: `"admin"`, `"writer"`, `"reader"`, or `null` when it
+    /// is in no roster at all — which is what a revoked device looks like.
+    SelfRole,
+    RevokePeer {
+        peer_id: String,
+        verifying_key: String,
+    },
+    DataSize,
+    /// `beforeMs` is a wall-clock millisecond timestamp, passed in rather than
+    /// read here: the cutoff is a user's choice, and a browser tab's clock is
+    /// the only one available anyway.
+    CompactDryRun {
+        before_ms: i64,
+    },
+    Compact {
+        before_ms: i64,
+    },
+    RotateEpoch,
 }
 
 /// One reply: the JSON envelope, plus binary that deliberately did not go
@@ -295,6 +331,91 @@ impl<B: Backend> Session<B> {
 
                 Command::GetEntry { container, key } => {
                     json!(self.vault.get_entry(&container, &key).await)
+                }
+
+                Command::RemoveEntry { container, key } => {
+                    self.vault.remove_entry(&container, &key).await?;
+                    Value::Null
+                }
+
+                Command::Entries { container } => {
+                    let entries: serde_json::Map<String, Value> = self
+                        .vault
+                        .entries(&container)
+                        .await
+                        .into_iter()
+                        .map(|(key, value)| (key, Value::String(value)))
+                        .collect();
+                    Value::Object(entries)
+                }
+
+                Command::RemoveBlob { hash } => {
+                    self.vault.remove_blob(&hash).await?;
+                    Value::Null
+                }
+
+                Command::Roster => {
+                    let listed: Vec<Value> = self
+                        .vault
+                        .roster()
+                        .await
+                        .into_iter()
+                        .map(|peer| {
+                            json!({
+                                // A u64 through a JSON double would round, and a
+                                // rounded peer id is a different device.
+                                "peerId": peer.peer_id.to_string(),
+                                "verifyingKey": B64.encode(peer.verifying_key),
+                                "name": peer.name,
+                                "role": peer.role.to_string(),
+                                "active": peer.active,
+                                "isSelf": peer.is_self,
+                            })
+                        })
+                        .collect();
+                    Value::Array(listed)
+                }
+
+                Command::SelfRole => match self.vault.self_role().await {
+                    Some(role) => json!(role.to_string()),
+                    None => Value::Null,
+                },
+
+                Command::RevokePeer {
+                    peer_id,
+                    verifying_key,
+                } => {
+                    let peer_id: u64 = peer_id
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("peerId must be a u64 written as a string"))?;
+                    self.vault
+                        .revoke_peer(peer_id, decode_key(&verifying_key)?)
+                        .await?;
+                    Value::Null
+                }
+
+                Command::DataSize => {
+                    let size = self.vault.data_size().await?;
+                    // Byte counts are u64 and could in principle exceed 2^53,
+                    // but a browser origin's quota is orders of magnitude below
+                    // that, so these cross as numbers rather than strings.
+                    json!({
+                        "blobs": size.blobs,
+                        "oplog": size.oplog,
+                        "meta": size.meta,
+                        "total": size.total,
+                    })
+                }
+
+                Command::CompactDryRun { before_ms } => {
+                    json!(self.vault.compact_dry_run(before_ms).await?)
+                }
+
+                Command::Compact { before_ms } => json!(self.vault.compact(before_ms).await?),
+
+                Command::RotateEpoch => {
+                    self.vault.rotate_epoch().await?;
+                    Value::Null
                 }
 
                 Command::EditText { text_id, at, text } => {

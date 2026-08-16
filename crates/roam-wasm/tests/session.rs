@@ -391,3 +391,210 @@ async fn a_request_with_no_id_replies_with_a_null_one() {
     assert_eq!(reply["id"], Value::Null);
     assert!(reply["ok"].is_string());
 }
+
+/// The commands CareMate's `VaultPort` needs and the earlier protocol did not
+/// have. Grouped, because they share one property worth stating once: every one
+/// of them is a capability the FFI bridge already exposes on mobile, so a gap
+/// here is not a missing feature but a platform that silently cannot do what the
+/// interface promises.
+#[tokio::test]
+async fn the_data_layer_commands_round_trip() {
+    let session = session();
+
+    for (key, value) in [("a", "1"), ("b", "2")] {
+        call(
+            &session,
+            json!({"id": 1, "command": "setEntry", "container": "rows", "key": key, "value": value}),
+        )
+        .await;
+    }
+
+    let listed = call(&session, json!({"id": 2, "command": "entries", "container": "rows"})).await;
+    assert_eq!(listed["ok"], json!({"a": "1", "b": "2"}));
+
+    // A delete has to be observable through `entries`, not merely accepted:
+    // the projection rebuilds from this, so a removal that did not take would
+    // resurrect a row on the next bootstrap.
+    call(
+        &session,
+        json!({"id": 3, "command": "removeEntry", "container": "rows", "key": "a"}),
+    )
+    .await;
+    let after = call(&session, json!({"id": 4, "command": "entries", "container": "rows"})).await;
+    assert_eq!(after["ok"], json!({"b": "2"}));
+
+    // Removing an absent key is not an error — two devices deleting the same
+    // row concurrently are stating the same intent, not racing.
+    let again = call(
+        &session,
+        json!({"id": 5, "command": "removeEntry", "container": "rows", "key": "a"}),
+    )
+    .await;
+    assert!(again["error"].is_null(), "{again}");
+
+    let empty = call(
+        &session,
+        json!({"id": 6, "command": "entries", "container": "nothing-here"}),
+    )
+    .await;
+    assert_eq!(
+        empty["ok"],
+        json!({}),
+        "an unknown container is empty, not an error — a device asks for every \
+         synced table before it has written any of them"
+    );
+}
+
+/// A roster entry names a device by BOTH its id and its key, and revocation has
+/// to name both too: the roster binds the pair, and a revocation carrying only
+/// an id could be replayed against a different key.
+#[tokio::test]
+async fn the_roster_crosses_with_ids_as_strings_and_keys_as_base64() {
+    let session = session();
+    let listed = call(&session, json!({"id": 1, "command": "roster"})).await;
+    let peers = listed["ok"].as_array().expect("an array");
+
+    let me = peers.iter().find(|p| p["isSelf"] == json!(true)).expect(
+        "a founded vault must contain itself — a device missing from its own \
+         roster cannot write",
+    );
+    assert!(
+        me["peerId"].is_string(),
+        "a u64 peer id through a JSON number would round: {me}"
+    );
+    assert_eq!(
+        me["peerId"],
+        call(&session, json!({"id": 2, "command": "peerId"})).await["ok"],
+        "the roster and `peerId` disagree about which device this is"
+    );
+    assert_eq!(me["role"], json!("admin"));
+    assert_eq!(me["active"], json!(true));
+
+    assert_eq!(
+        call(&session, json!({"id": 3, "command": "selfRole"})).await["ok"],
+        json!("admin")
+    );
+}
+
+/// Revoking is terminal, and the tombstone is the point: a revoked peer stays
+/// in the roster as inactive. Forgetting the revocation would let the device
+/// back in on the next fold.
+#[tokio::test]
+async fn a_revoked_peer_stays_in_the_roster_as_a_tombstone() {
+    let session = session();
+    let other = Session::new(
+        Vault::in_memory([3u8; 32]).unwrap(),
+        Arc::new(MemoryBackend::default()),
+    );
+    let peer_id = call(&other, json!({"id": 1, "command": "peerId"})).await["ok"].clone();
+    let key = call(&other, json!({"id": 2, "command": "verifyingKey"})).await["ok"].clone();
+
+    call(
+        &session,
+        json!({"id": 3, "command": "addPeer", "peerId": peer_id, "verifyingKey": key}),
+    )
+    .await;
+    let revoked = call(
+        &session,
+        json!({"id": 4, "command": "revokePeer", "peerId": peer_id, "verifyingKey": key}),
+    )
+    .await;
+    assert!(revoked["error"].is_null(), "{revoked}");
+
+    let listed = call(&session, json!({"id": 5, "command": "roster"})).await;
+    let peer = listed["ok"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["peerId"] == peer_id)
+        .expect("a revoked peer must remain, as a tombstone");
+    assert_eq!(peer["active"], json!(false));
+}
+
+/// Maintenance: sizes, the dry run, and rotation. What is asserted is the
+/// *shape* each answers with, because that is what a UI binds to — the byte
+/// counts themselves belong to `roam-storage`, which tests them.
+#[tokio::test]
+async fn the_maintenance_commands_answer_in_the_shape_a_ui_binds_to() {
+    let session = session();
+    call(
+        &session,
+        json!({"id": 1, "command": "setEntry", "container": "rows", "key": "k", "value": "v"}),
+    )
+    .await;
+
+    let size = call(&session, json!({"id": 2, "command": "dataSize"})).await;
+    for field in ["blobs", "oplog", "meta", "total"] {
+        assert!(
+            size["ok"][field].is_u64(),
+            "dataSize.{field} came back as {}",
+            size["ok"][field]
+        );
+    }
+
+    // A dry run must change nothing. Asserted by comparing the size across it,
+    // which is the only way to tell a dry run from a very fast real one.
+    let before = size["ok"]["total"].clone();
+    let dry = call(
+        &session,
+        json!({"id": 3, "command": "compactDryRun", "beforeMs": 0}),
+    )
+    .await;
+    assert!(dry["ok"].is_u64(), "{dry}");
+    assert_eq!(
+        call(&session, json!({"id": 4, "command": "dataSize"})).await["ok"]["total"],
+        before,
+        "a dry run reclaimed bytes"
+    );
+
+    let rotated = call(&session, json!({"id": 5, "command": "rotateEpoch"})).await;
+    assert!(rotated["error"].is_null(), "{rotated}");
+    // The vault must still be readable under the new epoch — a rotation that
+    // sealed content this device could not reopen would be indistinguishable
+    // from data loss.
+    assert_eq!(
+        call(
+            &session,
+            json!({"id": 6, "command": "getEntry", "container": "rows", "key": "k"})
+        )
+        .await["ok"],
+        json!("v")
+    );
+}
+
+/// A blob this device has dropped is gone locally and stays addressable: the
+/// same bytes can be put back under the same hash. Removal is local-only, so
+/// nothing about it is a statement to other devices.
+#[tokio::test]
+async fn removing_a_blob_is_local_and_reversible_by_re_adding_it() {
+    let session = session();
+    let (put, _) = call_with_bytes(
+        &session,
+        json!({"id": 1, "command": "putBlob"}),
+        Some(b"attachment".to_vec()),
+    )
+    .await;
+    let hash = put["ok"].as_str().expect("a hash").to_string();
+
+    call(&session, json!({"id": 2, "command": "removeBlob", "hash": hash})).await;
+    assert_eq!(
+        call(&session, json!({"id": 3, "command": "hasBlob", "hash": hash})).await["ok"],
+        json!(false)
+    );
+
+    // Removing what is not there is not an error: a caller garbage-collecting
+    // twice is not doing anything wrong.
+    let again = call(&session, json!({"id": 4, "command": "removeBlob", "hash": hash})).await;
+    assert!(again["error"].is_null(), "{again}");
+
+    let (again, _) = call_with_bytes(
+        &session,
+        json!({"id": 5, "command": "putBlob"}),
+        Some(b"attachment".to_vec()),
+    )
+    .await;
+    assert_eq!(
+        again["ok"], put["ok"],
+        "content addressing must be stable across a removal"
+    );
+}
