@@ -456,6 +456,54 @@ async fn maybe_produce_snapshot<B: Backend>(
 /// `before_ts`: `build_backend_snapshot` reads the pre-truncation op-logs to
 /// derive `subsumed_lines`, and the shared `before_ts` makes the produced
 /// snapshot cover exactly the frontier the checkpoint compacts to.
+/// What a [`checkpoint_with_bootstrap`] run actually did.
+#[derive(Debug, Clone)]
+pub struct Checkpointed {
+    /// Bytes reclaimed by compaction.
+    pub freed: u64,
+    /// The bootstrap snapshot published for lagging peers, as `(id, framed)`.
+    ///
+    /// It is already persisted locally and advertisable over P2P. The framed
+    /// bytes come back because a caller with a backend should also `put_snapshot`
+    /// them — a peer that is offline when this device is cannot fetch a snapshot
+    /// that only ever existed here.
+    pub snapshot: Option<(String, Vec<u8>)>,
+    /// True when this vault is wired for sync but this device could not author
+    /// a snapshot, because only an Admin may.
+    ///
+    /// Surfaced rather than logged: the vault has been compacted and any peer
+    /// behind the cutoff now needs an Admin or a backend snapshot to catch up.
+    /// A caller with a UI should say so; the CLI prints a warning.
+    pub compacted_without_bootstrap: bool,
+}
+
+/// Compact history before `before_ts`, publishing a bootstrap snapshot first.
+///
+/// The ordering is the whole point of this function existing. `checkpoint`
+/// truncates op-logs, and [`produce_held_snapshot`] derives its `subsumed_lines`
+/// by *reading* those logs — so producing the snapshot after compacting yields a
+/// snapshot that cannot bootstrap anyone, and the two calls must share one
+/// `before_ts` so the snapshot covers exactly the frontier the compaction lands
+/// on. Getting either wrong strands every peer that is behind the cutoff, and
+/// nothing fails at the time: the damage shows up later, on a peer that cannot
+/// catch up.
+///
+/// That contract used to live only in `roam-cli`, which meant every other
+/// embedder had to rediscover it. Call this instead of the two halves.
+pub fn checkpoint_with_bootstrap(
+    store: &mut Store,
+    key: &VaultKey,
+    before_ts: i64,
+) -> anyhow::Result<Checkpointed> {
+    let snapshot = produce_held_snapshot(store, key, before_ts)?;
+    let freed = store.checkpoint(before_ts)?;
+    Ok(Checkpointed {
+        freed,
+        compacted_without_bootstrap: snapshot.is_none() && store.self_role() != Some(Role::Admin),
+        snapshot,
+    })
+}
+
 pub fn produce_held_snapshot(
     store: &Store,
     key: &VaultKey,
@@ -1363,6 +1411,104 @@ mod tests {
         assert!(
             held.contains(&id),
             "produced snapshot must be locally held/advertisable"
+        );
+    }
+
+    /// Write entries with a history marker after each, so a later checkpoint has
+    /// something to actually truncate. Markers are keyed by wall-clock ms, so the
+    /// sleep is load-bearing: without it several markers collapse onto one
+    /// timestamp and the checkpoint has no earlier marker to compact away.
+    async fn store_with_history(dir: &std::path::Path, rounds: usize) -> Arc<Mutex<Store>> {
+        let s = store_at(dir).await;
+        for round in 0..rounds {
+            let mut g = s.lock().await;
+            g.set_entry("files", &format!("note-{round}"), "hello")
+                .unwrap();
+            g.write_snapshot().unwrap();
+            drop(g);
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        s
+    }
+
+    /// How many entries the produced snapshot tells peers it covers.
+    fn subsumed_count(store: &Store, key: &VaultKey, framed: &[u8]) -> usize {
+        let _ = (store, key);
+        let (manifest_json, _sealed) =
+            roam_storage::snapshot_msg::unframe(framed).expect("framed snapshot parses");
+        let manifest: roam_storage::snapshot_msg::SnapshotManifest =
+            serde_json::from_slice(manifest_json).expect("manifest parses");
+        manifest.subsumed_entry_ids.len()
+    }
+
+    /// The ordering contract, which is the only reason
+    /// [`checkpoint_with_bootstrap`] exists.
+    ///
+    /// A differential test, because the wrong order does not fail — it silently
+    /// produces a *weaker* snapshot. `build_backend_snapshot` derives
+    /// `subsumed_lines` by reading the op-logs, and `checkpoint` truncates them,
+    /// so producing afterwards yields a snapshot that claims to cover fewer
+    /// entries than it should. A lagging peer then adopts it and still asks for
+    /// ops that no longer exist anywhere.
+    ///
+    /// Mutation-checked: swapping the two calls inside
+    /// `checkpoint_with_bootstrap` fails this.
+    #[tokio::test]
+    async fn checkpointing_snapshots_before_it_truncates_and_that_is_observable() {
+        std::env::set_var("ROAM_SNAPSHOT_LAG_DAYS", "0");
+        let key = VaultKey([9u8; 32]);
+
+        // The right order, through the library function.
+        let right_dir = tempfile::tempdir().unwrap();
+        let right = store_with_history(right_dir.path(), 4).await;
+        let (right_id, right_covered) = {
+            let mut g = right.lock().await;
+            let done = checkpoint_with_bootstrap(&mut g, &key, i64::MAX).unwrap();
+            let (id, framed) = done.snapshot.expect("an Admin must publish a bootstrap");
+            let covered = subsumed_count(&g, &key, &framed);
+            (id, covered)
+        };
+
+        // The wrong order, spelled out, on an identical vault.
+        let wrong_dir = tempfile::tempdir().unwrap();
+        let wrong = store_with_history(wrong_dir.path(), 4).await;
+        let wrong_covered = {
+            let mut g = wrong.lock().await;
+            g.checkpoint(i64::MAX).unwrap();
+            match produce_held_snapshot(&g, &key, i64::MAX).unwrap() {
+                Some((_, framed)) => subsumed_count(&g, &key, &framed),
+                None => 0,
+            }
+        };
+
+        assert!(
+            right_covered > wrong_covered,
+            "snapshotting first must cover more entries than snapshotting after \
+             truncation, got {right_covered} vs {wrong_covered}"
+        );
+        assert!(
+            right
+                .lock()
+                .await
+                .held_snapshot_ids()
+                .unwrap()
+                .contains(&right_id),
+            "the published snapshot must be locally held so peers can fetch it"
+        );
+    }
+
+    /// A non-Admin can still compact, and must be *told* that it stranded any
+    /// peer behind the cutoff — the CLI used to decide this on its own.
+    #[tokio::test]
+    async fn a_non_admin_checkpoint_reports_that_it_published_nothing() {
+        let key = VaultKey([9u8; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path(), Identity::generate()).unwrap();
+        let done = checkpoint_with_bootstrap(&mut store, &key, i64::MAX).unwrap();
+        assert!(done.snapshot.is_none());
+        assert!(
+            done.compacted_without_bootstrap,
+            "a non-Admin must be told it could not publish a bootstrap"
         );
     }
 

@@ -466,6 +466,230 @@ impl<T: Transport + 'static> Engine<T> {
         }
     }
 
+    /// Ship our own signed KEY log to every currently-connected peer.
+    ///
+    /// The counterpart of [`broadcast_own_roster`], and needed for the same
+    /// reason: without it a freshly minted epoch reaches nobody until the next
+    /// connect or offer, so every peer's writes fail closed (`seal_under_head`
+    /// refuses to fall back to epoch 0) for an unbounded stretch after a
+    /// rotation.
+    ///
+    /// [`broadcast_own_roster`]: Self::broadcast_own_roster
+    async fn broadcast_own_keylog(&self) {
+        let jsonl = {
+            let store = self.store.lock().await;
+            store.export_own_keylog().unwrap_or_default()
+        };
+        let peers: Vec<u64> = {
+            let connected = self.connected.lock().await;
+            connected.iter().copied().collect()
+        };
+        for peer in peers {
+            self.send(
+                peer,
+                Frame::KeylogOps {
+                    author: self.peer_id(),
+                    jsonl: jsonl.clone(),
+                },
+            )
+            .await;
+        }
+    }
+
+    // -- vault administration ------------------------------------------------
+    //
+    // Everything below is a capability the CLI had and an embedder did not.
+    // `Store` has been public all along; what was missing was a way to reach it
+    // without taking the mutex by hand and re-deriving the contracts that used
+    // to live only in `roam-cli/src/main.rs` — mutations that do not persist
+    // themselves, key material that has to be derived, and gossip that has to
+    // follow a change or the mesh never hears about it.
+
+    /// Every device this vault knows about, with role and status.
+    pub async fn roster(&self) -> Vec<roam_storage::PeerRecord> {
+        self.store.lock().await.roster()
+    }
+
+    /// This device's own role, or `None` if it has not been vouched for yet.
+    pub async fn self_role(&self) -> Option<roam_storage::Role> {
+        self.store.lock().await.self_role()
+    }
+
+    /// On-disk byte usage, broken down by category. Walks the vault, so it is
+    /// cheap enough to call from a settings screen but not free.
+    pub async fn data_size(&self) -> anyhow::Result<roam_storage::DataSize> {
+        Ok(self.store.lock().await.data_size()?)
+    }
+
+    /// Change an existing peer's role. Admin-only, and gossiped — a role change
+    /// nobody hears about is not a role change.
+    pub async fn set_role(
+        &self,
+        peer: u64,
+        key: [u8; 32],
+        role: roam_storage::Role,
+    ) -> anyhow::Result<()> {
+        {
+            let mut store = self.store.lock().await;
+            store.set_role(peer, key, role)?;
+        }
+        self.broadcast_own_roster().await;
+        Ok(())
+    }
+
+    /// Set this device's self-asserted display name, and gossip it.
+    ///
+    /// No `write_snapshot` here, unlike the CLI's `set-name`: the name is folded
+    /// from the roster log, which is durable on append, so the snapshot that
+    /// call makes is redundant. Matches `add_peer`/`revoke_peer`, which are also
+    /// roster-only and also do not snapshot.
+    pub async fn set_device_name(&self, name: &str) -> anyhow::Result<()> {
+        {
+            let mut store = self.store.lock().await;
+            store.set_device_name(name)?;
+        }
+        self.broadcast_own_roster().await;
+        Ok(())
+    }
+
+    // -- epoch keys ----------------------------------------------------------
+
+    /// Mint a new epoch, wrapped to every active member and optionally to a
+    /// paper-recovery key. Admin-only. Returns the new epoch id.
+    ///
+    /// This is the *only* operation that removes read access from a revoked
+    /// device: revocation alone stops a peer's ops being folded, it does not
+    /// stop it decrypting. Revoke, then rotate.
+    ///
+    /// Existing data is NOT re-encrypted — only new writes seal under the new
+    /// epoch. A device compromised before the rotation keeps everything it could
+    /// already read.
+    ///
+    /// The vault key subkeys are derived from the key this engine already holds,
+    /// so no secret has to cross the call. The resulting key log is broadcast
+    /// immediately; without that, peers cannot write at all until they next
+    /// connect, because sealing fails closed rather than falling back to epoch 0.
+    pub async fn rotate_epoch(&self, paper_public: Option<[u8; 32]>) -> anyhow::Result<[u8; 32]> {
+        let (id_key, epoch0_key) = roam_storage::vault_subkeys(&self.vault_key);
+        let epoch = {
+            let mut store = self.store.lock().await;
+            store.rotate_epoch(&id_key, &epoch0_key, paper_public)?
+        };
+        self.broadcast_own_keylog().await;
+        Ok(epoch)
+    }
+
+    /// Recover epoch keys sealed to a paper-recovery phrase, returning how many
+    /// were recovered. Zero means the phrase matched no paper wrap, or this
+    /// device already held every key it can open.
+    ///
+    /// Broadcasts afterwards because recovery re-wraps the recovered epochs to
+    /// this device, and that is a key-log append other devices want.
+    pub async fn recover_with_paper(&self, phrase: &str) -> anyhow::Result<usize> {
+        let (id_key, epoch0_key) = roam_storage::vault_subkeys(&self.vault_key);
+        let recovered = {
+            let mut store = self.store.lock().await;
+            store.recover_with_paper(phrase, &id_key, &epoch0_key)?
+        };
+        if recovered > 0 {
+            self.broadcast_own_keylog().await;
+        }
+        Ok(recovered)
+    }
+
+    /// Publish any epoch wraps this device holds but active members are missing.
+    ///
+    /// Safe and cheap to call on a schedule; it is a no-op when nothing is
+    /// missing. A backend sync loop should call it every pass — a device that
+    /// joined after a rotation has no way to get the epoch key otherwise.
+    pub async fn backfill_wraps(&self) -> anyhow::Result<usize> {
+        let (id_key, epoch0_key) = roam_storage::vault_subkeys(&self.vault_key);
+        let published = {
+            let mut store = self.store.lock().await;
+            store.backfill_wraps(&id_key, &epoch0_key)?
+        };
+        if published > 0 {
+            self.broadcast_own_keylog().await;
+        }
+        Ok(published)
+    }
+
+    /// What is wrong with this vault's key state, if anything. An empty vector
+    /// means healthy.
+    pub async fn vault_state(&self) -> anyhow::Result<Vec<roam_storage::VaultIssue>> {
+        let (id_key, epoch0_key) = roam_storage::vault_subkeys(&self.vault_key);
+        Ok(self.store.lock().await.vault_state(&id_key, &epoch0_key)?)
+    }
+
+    // -- history -------------------------------------------------------------
+
+    /// A text container's version history, newest first.
+    pub async fn text_history(
+        &self,
+        container: &str,
+    ) -> anyhow::Result<Vec<roam_storage::TextVersion>> {
+        Ok(self.store.lock().await.text_history(container)?)
+    }
+
+    /// Roll a text container back to `version`, an index into the list
+    /// [`text_history`] returned. Persisted before returning.
+    ///
+    /// Taking an index rather than a `Frontier` is deliberate, and matches what
+    /// the CLI settled on: a frontier is an opaque handle to a point in the
+    /// op-DAG, and handing one across an API boundary invites a caller to store
+    /// it and replay it against a document it no longer describes. The index is
+    /// resolved against a freshly read history here, so it cannot go stale
+    /// silently — a shrunk history is an error, not a wrong revert.
+    ///
+    /// [`text_history`]: Self::text_history
+    pub async fn revert_text(&self, container: &str, version: usize) -> anyhow::Result<()> {
+        let mut store = self.store.lock().await;
+        let history = store.text_history(container)?;
+        let target = history
+            .get(version)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no version {version} for {container}: history holds {} version(s)",
+                    history.len()
+                )
+            })?
+            .frontier
+            .clone();
+        store.revert_text(container, &target)?;
+        store.write_snapshot()?;
+        Ok(())
+    }
+
+    /// Bytes a checkpoint before `before_ts` would free, without changing
+    /// anything. Pair with `roam_backend_client::sync::checkpoint_with_bootstrap`
+    /// to actually compact: the real checkpoint has to publish a bootstrap
+    /// snapshot first, which needs the backend client, so it deliberately does
+    /// not live here.
+    pub async fn checkpoint_dry_run(&self, before_ts: i64) -> anyhow::Result<u64> {
+        Ok(self.store.lock().await.checkpoint_dry_run(before_ts)?)
+    }
+
+    // -- blobs ---------------------------------------------------------------
+
+    /// Store bytes, returning their content hash. Content-addressed, so storing
+    /// the same bytes twice is free and yields the same hash.
+    pub async fn put_blob(&self, bytes: &[u8]) -> anyhow::Result<String> {
+        Ok(self.store.lock().await.blobs().put(bytes)?)
+    }
+
+    /// The bytes for `hash`, or `None` if this device does not hold them —
+    /// a normal answer, since blobs sync separately from the ops referencing
+    /// them. Use [`request_missing_blobs`] to fetch what is absent.
+    ///
+    /// [`request_missing_blobs`]: Self::request_missing_blobs
+    pub async fn get_blob(&self, hash: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        Ok(self.store.lock().await.blobs().get(hash)?)
+    }
+
+    pub async fn has_blob(&self, hash: &str) -> bool {
+        self.store.lock().await.blobs().has(hash)
+    }
+
     /// Handle one inbound frame from `peer`.
     pub async fn handle(&self, peer: u64, frame: Frame) -> anyhow::Result<()> {
         match frame {

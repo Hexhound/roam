@@ -267,6 +267,22 @@ enum Command {
         #[arg(long)]
         key: String,
     },
+    /// Revoke a peer's membership (admin only).
+    ///
+    /// Stops the peer's later ops being folded by honest devices. It does NOT
+    /// remove read access — the revoked device keeps every key it already held.
+    /// Follow with `rotate` to seal new writes under an epoch it cannot open.
+    Revoke {
+        #[arg(long)]
+        vault: PathBuf,
+        #[arg(long)]
+        identity: PathBuf,
+        /// Target peer id.
+        peer: u64,
+        /// The target's verifying key (base64 standard), for the peer_id<->key binding.
+        #[arg(long)]
+        key: String,
+    },
     /// List a text file's version history (newest first), with an index per row.
     TextHistory {
         #[arg(long)]
@@ -371,6 +387,12 @@ async fn main() -> Result<()> {
             role,
             key,
         } => grant(&vault, &identity, peer, &role, &key).await,
+        Command::Revoke {
+            vault,
+            identity,
+            peer,
+            key,
+        } => revoke(&vault, &identity, peer, &key).await,
         Command::TextHistory {
             vault,
             identity,
@@ -1563,40 +1585,40 @@ async fn checkpoint(vault: &Path, identity_path: &Path, before: &str, dry_run: b
             "checkpoint --before {before}: would free {bytes} bytes (blobs). No changes made."
         );
     } else {
-        // Produce a bootstrap snapshot BEFORE truncating: build_backend_snapshot
-        // reads the pre-truncation op-logs, and the SAME cutoff makes the snapshot
-        // cover exactly the frontier checkpoint compacts to. A lagging peer then
-        // catches up past the compaction frontier by adopting this snapshot.
-        let produced = match load_vault_key(vault) {
+        // The produce-then-truncate ordering lives in the library now, so every
+        // embedder gets it rather than just this one.
+        match load_vault_key(vault) {
             Ok(raw) => {
                 use roam_backend_client::crypto::VaultKey;
-                use roam_backend_client::sync::produce_held_snapshot;
-                let key = VaultKey(*raw);
-                produce_held_snapshot(&store, &key, cutoff).context("produce bootstrap snapshot")?
+                use roam_backend_client::sync::checkpoint_with_bootstrap;
+                let done = checkpoint_with_bootstrap(&mut store, &VaultKey(*raw), cutoff)
+                    .context("checkpoint")?;
+                match done.snapshot.map(|(id, _framed)| id) {
+                    Some(id) => println!(
+                        "checkpoint done: freed {} bytes; op history compacted. \
+                         Bootstrap snapshot {id} published for lagging peers.",
+                        done.freed
+                    ),
+                    None => {
+                        println!(
+                            "checkpoint done: freed {} bytes; op history compacted. Local only.",
+                            done.freed
+                        );
+                        if done.compacted_without_bootstrap {
+                            eprintln!(
+                                "warning: compacted locally, but only an Admin can publish a \
+                                 bootstrap snapshot; peers behind this point need an Admin or \
+                                 backend snapshot to catch up."
+                            );
+                        }
+                    }
+                }
             }
             // No vault key on disk => vault was never wired for sync (purely
             // local). Nothing to bootstrap; checkpoint is safe as-is.
-            Err(_) => None,
-        };
-
-        let freed = store.checkpoint(cutoff).context("checkpoint")?;
-
-        match produced {
-            Some((id, _framed)) => println!(
-                "checkpoint done: freed {freed} bytes; op history compacted. \
-                 Bootstrap snapshot {id} published for lagging peers."
-            ),
-            None => {
+            Err(_) => {
+                let freed = store.checkpoint(cutoff).context("checkpoint")?;
                 println!("checkpoint done: freed {freed} bytes; op history compacted. Local only.");
-                // Distinguish the risky case: a non-Admin on a sync-wired vault
-                // truncated but cannot sign a bootstrap snapshot.
-                if load_vault_key(vault).is_ok() && store.self_role() != Some(Role::Admin) {
-                    eprintln!(
-                        "warning: compacted locally, but only an Admin can publish a bootstrap \
-                         snapshot; peers behind this point need an Admin or backend snapshot to \
-                         catch up."
-                    );
-                }
             }
         }
     }
@@ -1654,6 +1676,35 @@ async fn grant(
         .set_role(peer, key_bytes, parse_role(role)?)
         .context("set role")?;
     println!("granted peer {peer} role {role}");
+    Ok(())
+}
+
+/// Revoke a peer's membership. Honest devices stop folding its later ops
+/// (`import_peer` refuses them), but it keeps every epoch key it already had —
+/// so this alone does not remove read access, and the reminder below is not
+/// decoration.
+async fn revoke(
+    vault: &Path,
+    identity_path: &Path,
+    peer: u64,
+    key_b64: &str,
+) -> anyhow::Result<()> {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine};
+    let identity = Identity::load(identity_path).context("load identity")?;
+    let mut store = Store::open(vault, identity).context("open vault store")?;
+    let key_bytes: [u8; 32] = B64
+        .decode(key_b64)
+        .context("decode key")?
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("key must be 32 bytes"))?;
+    store.revoke_peer(peer, key_bytes).context("revoke peer")?;
+    store.write_snapshot().context("persist after revoke")?;
+    println!("revoked peer {peer}");
+    println!(
+        "note: the revoked device keeps every key it already held. Run `roam rotate` to seal \
+         new writes under an epoch it cannot open; existing data stays readable to it."
+    );
     Ok(())
 }
 
