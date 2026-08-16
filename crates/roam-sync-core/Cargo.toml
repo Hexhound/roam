@@ -9,6 +9,9 @@ repository.workspace = true
 roam-crdt = { path = "../roam-crdt" }
 roam-storage = { path = "../roam-storage" }
 roam-files = { path = "../roam-files" }
+# The transport-agnostic half of pairing. Notably NOT roam-transport-iroh: the
+# engine must stay reachable from a browser, which can never be an iroh peer.
+roam-pairing = { path = "../roam-pairing" }
 tokio.workspace = true
 async-trait.workspace = true
 futures.workspace = true
@@ -19,6 +22,12 @@ anyhow.workspace = true
 zeroize = { workspace = true }
 
 [dev-dependencies]
+# `rt-multi-thread` for `tests/convergence.rs`, which builds a `Runtime` by
+# hand. It is NOT in the workspace default (tokio hard-errors on wasm32 with
+# it), so this crate has to ask for it — without this the test only compiles
+# when some OTHER crate in the same cargo invocation happens to turn the feature
+# on, and `cargo test -p roam-sync-core` alone fails.
+tokio = { workspace = true, features = ["rt-multi-thread"] }
 proptest.workspace = true
 tempfile.workspace = true
 roam-backend-client = { path = "../roam-backend-client" }
