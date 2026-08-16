@@ -264,6 +264,69 @@ impl WasmSession {
         })
     }
 
+    /// Join somebody else's vault through a relay mailbox, then open it.
+    ///
+    /// This is how a browser gets *into* a vault at all. A tab has no UDP
+    /// socket, so it can never be an iroh peer and neither of the other two
+    /// pairing flows can reach it; the handshake runs over the relay instead.
+    /// `invite` is the string the host printed, `code` the six digits it showed.
+    ///
+    /// # Why the handshake finishes before any storage is touched
+    ///
+    /// The OPFS pool is named after the bucket id, and the bucket id is derived
+    /// from the vault key — which arrives *in* the accept. So there is nowhere
+    /// to put a store until pairing has succeeded. That ordering is safe because
+    /// the joiner's store is untouched until the accept is adopted: everything
+    /// before it is network and cryptography. The identity is minted here and
+    /// persisted by [`Vault::join`], so the key the host vouched for is the key
+    /// this device keeps.
+    ///
+    /// A failed join therefore leaves nothing behind — no pool, no identity, no
+    /// half-created vault to clean up.
+    #[wasm_bindgen(js_name = joinOnOpfs)]
+    pub async fn join_on_opfs(invite: String, code: String) -> Result<WasmSession, JsError> {
+        let invite = roam_pairing::Invite::decode(&invite)
+            .map_err(|e| JsError::new(&format!("invite: {e:#}")))?;
+        let code = roam_pairing::PairingCode::parse(code.trim())
+            .map_err(|e| JsError::new(&format!("code: {e}")))?;
+
+        let identity = roam_storage::Identity::generate();
+        let mailbox = roam_pairing::HttpMailbox::for_invite(&invite);
+        let (accept, host_key) =
+            roam_pairing::handshake::fetch_accept_via_mailbox(&identity, &mailbox, &invite, &code)
+                .await
+                .map_err(any_to_js)?;
+
+        // Read the key out before the accept is consumed; it names the pool.
+        let key = accept.vault_key;
+        let bucket = roam_backend_client::crypto::VaultKey(key).bucket_id();
+        let pool = vfs_opfs::mount(&format!(".roam-{bucket}"), MOUNT_CAPACITY)
+            .await
+            .map_err(|e| JsError::new(&format!("mount OPFS pool: {e}")))?;
+
+        let vault = Vault::join(pool.fs(), identity, accept, &host_key).map_err(any_to_js)?;
+        Ok(WasmSession {
+            pool,
+            inner: Session::new(vault, Arc::new(HttpBackend::new(&invite.relay))),
+            reply_bytes: RefCell::new(None),
+        })
+    }
+
+    /// The vault key this session holds, so a joiner can reopen without pairing
+    /// again.
+    ///
+    /// SECURITY: this is the entire vault. A founder passed it *in* to
+    /// [`open_on_opfs`], so JS already held it there; a joiner did not have it
+    /// until now, and handing it back is the only way the next page load can
+    /// call `openOnOpfs`. Everything in this type's security note applies to it
+    /// — in particular it must not be written to `localStorage` in the clear.
+    ///
+    /// [`open_on_opfs`]: WasmSession::open_on_opfs
+    #[wasm_bindgen(js_name = vaultKey)]
+    pub fn vault_key(&self) -> Vec<u8> {
+        self.inner.vault().vault_key().to_vec()
+    }
+
     /// Handle one JSON request, returning the JSON reply.
     ///
     /// The pool is topped up *here*, between commands, because this is the only

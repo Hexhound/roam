@@ -76,21 +76,13 @@ impl Vault {
     /// This is the class of bug `MemFs` structurally cannot catch, which is why
     /// `tests/durable_vault.rs` runs against a remounted slot pool instead.
     ///
-    /// KNOWN GAP: a device that *joins* an existing vault must not found one of
-    /// its own. Nothing here can tell the two cases apart yet, because browser
-    /// pairing does not exist — when it does, joining must supply the roster out
-    /// of band and take the `already founded` path.
+    /// A device that *joins* an existing vault must take [`Vault::join`], which
+    /// does not found: founding here would pin this device as its own vault's
+    /// founder, and the host's roster could then never fold over it. The two
+    /// cases cannot be told apart from the arguments, so they are separate
+    /// constructors rather than a flag.
     pub fn open(fs: Arc<dyn VaultFs>, vault_key: [u8; 32]) -> anyhow::Result<Self> {
-        let identity_path = Path::new(IDENTITY);
-        let identity = match Identity::load_with_fs(&*fs, identity_path) {
-            Ok(existing) => existing,
-            Err(_) => {
-                let fresh = Identity::generate();
-                fresh.save_with_fs(&*fs, identity_path)?;
-                fresh
-            }
-        };
-
+        let identity = load_or_generate_identity(&fs)?;
         let mut store = Store::open_with_fs(Path::new(ROOT), identity, fs)?;
         if store.founder_pin().is_none() {
             // Founding as Admin mirrors the native e2e setup: a device's own
@@ -103,13 +95,73 @@ impl Vault {
         })
     }
 
+    /// Adopt a pairing accept into a fresh store, joining somebody else's vault.
+    ///
+    /// The counterpart to [`Vault::open`], and the reason the two are separate:
+    /// this one must NOT `declare_founder`. A joiner that founded would pin
+    /// itself as the founder of a vault it did not create, and the host's roster
+    /// — anchored on the real founder — could never fold over it. The device
+    /// would hold a vault nobody else recognised.
+    ///
+    /// The accept is applied through [`roam_pairing::adopt_accept`], so the
+    /// browser gets exactly the import order every other platform gets: founder
+    /// pin, then transitive roster, then key log.
+    ///
+    /// Takes the already-fetched accept rather than running the handshake,
+    /// because the handshake has to finish *before* there is anywhere to put a
+    /// store: this vault's OPFS pool is named after the bucket id, which is
+    /// derived from the vault key the accept carries. See
+    /// [`roam_pairing::handshake::fetch_accept_via_mailbox`].
+    pub fn join(
+        fs: Arc<dyn VaultFs>,
+        identity: Identity,
+        accept: roam_pairing::JoinAccept,
+        host_key: &roam_storage::VerifyingKey,
+    ) -> anyhow::Result<Self> {
+        // Persist the identity that ran the handshake — it is the key the host
+        // just vouched for, so a different one on the next open would be a
+        // stranger to the roster this join created.
+        identity.save_with_fs(&*fs, Path::new(IDENTITY))?;
+        let mut store = Store::open_with_fs(Path::new(ROOT), identity, fs)?;
+        let joined = roam_pairing::adopt_accept(&mut store, accept, host_key)?;
+
+        Ok(Self {
+            store: Arc::new(Mutex::new(store)),
+            key: VaultKey(*joined.vault_key),
+        })
+    }
+
     /// A vault backed by `MemFs` — correct, but lost when the tab closes.
     pub fn in_memory(vault_key: [u8; 32]) -> anyhow::Result<Self> {
         Self::open(Arc::new(MemFs::new()), vault_key)
     }
 
+    /// The shared vault key. A joiner needs this to persist after pairing, since
+    /// unlike a founder it did not have the key before it started.
+    pub fn vault_key(&self) -> [u8; 32] {
+        self.key.0
+    }
+
     pub async fn peer_id(&self) -> u64 {
         self.store.lock().await.peer_id()
+    }
+
+    /// This device's role, or `None` if no roster has vouched for it yet.
+    ///
+    /// A UI needs this to know what to offer: a Reader that is shown an editor
+    /// will have its writes dropped at the receiving end, which reads as data
+    /// loss rather than as a permission.
+    pub async fn self_role(&self) -> Option<Role> {
+        self.store.lock().await.self_role()
+    }
+
+    /// The founder this vault's roster fold is anchored on.
+    ///
+    /// A founder's own peer id; a joiner's, the host's. Which of those it is is
+    /// the difference between having joined a vault and having quietly created a
+    /// second one that will never converge with anybody.
+    pub async fn founder_pin(&self) -> Option<u64> {
+        self.store.lock().await.founder_pin()
     }
 
     pub async fn verifying_key(&self) -> [u8; 32] {
@@ -207,5 +259,23 @@ impl Vault {
     pub async fn changes_since(&self, from: &Frontier) -> anyhow::Result<Vec<MapChange>> {
         let store = self.store.lock().await;
         Ok(store.map_delta(from, &store.frontier())?)
+    }
+}
+
+/// This device's signing key, loaded from storage or minted on first use.
+///
+/// Shared by [`Vault::open`] and the join path so both persist it to the same
+/// place. A fresh identity on every open would make the device a stranger to its
+/// own op log — the class of bug `MemFs` structurally cannot catch, since it
+/// starts empty every time.
+fn load_or_generate_identity(fs: &Arc<dyn VaultFs>) -> anyhow::Result<Identity> {
+    let identity_path = Path::new(IDENTITY);
+    match Identity::load_with_fs(&**fs, identity_path) {
+        Ok(existing) => Ok(existing),
+        Err(_) => {
+            let fresh = Identity::generate();
+            fresh.save_with_fs(&**fs, identity_path)?;
+            Ok(fresh)
+        }
     }
 }

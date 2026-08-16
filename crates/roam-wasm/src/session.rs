@@ -147,6 +147,14 @@ impl<B: Backend> Session<B> {
         Self { vault, backend }
     }
 
+    /// The vault this session drives. Exposed so the binding layer can hand a
+    /// freshly-joined device its vault key — a joiner does not have that key
+    /// until pairing succeeds, and without it the next page load could not
+    /// reopen the vault it just joined.
+    pub fn vault(&self) -> &Vault {
+        &self.vault
+    }
+
     /// Handle one request that carries no binary, returning just the JSON.
     ///
     /// Equivalent to [`handle`] with no payload — and the reply bytes it drops

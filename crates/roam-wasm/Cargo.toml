@@ -13,6 +13,7 @@ crate-type = ["cdylib", "rlib"]
 roam-crdt = { path = "../roam-crdt" }
 roam-storage = { path = "../roam-storage" }
 roam-backend-client = { path = "../roam-backend-client" }
+roam-pairing = { path = "../roam-pairing" }
 anyhow = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 # The worker's command protocol (`session`) is plain Rust so it can be tested

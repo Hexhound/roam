@@ -151,10 +151,30 @@ a remounted slot pool, because `MemFs` structurally cannot.
 Mutation-checked both ways: making `declare_founder` unconditional, and
 regenerating the identity, each fail those tests.
 
-**Known gap.** A device that *joins* an existing vault must not found one of its
-own, and nothing can yet tell the two cases apart — browser pairing does not
-exist. When it does, joining has to supply the roster out of band and take the
-"already founded" path.
+**Closed.** A device that *joins* an existing vault must not found one of its
+own. The two cases cannot be told apart from the arguments, so they are separate
+constructors rather than a flag: `Vault::open` founds, `Vault::join` adopts a
+pairing accept and does not. A joiner that founded would pin *itself* as founder
+of a vault it did not create, and the host's roster — anchored on the real
+founder — could never fold over it; the failure is silent, just two vaults that
+never converge. `tests/join.rs` covers it, and all three of its checks fail if
+the founding is put back.
+
+### Joining runs before storage exists
+
+`Session.joinOnOpfs(invite, code)` finishes the whole handshake *before* it
+mounts anything. That is forced rather than chosen: the OPFS pool directory is
+named after the bucket id, the bucket id is derived from the vault key, and the
+vault key arrives inside the accept. It is safe because the joiner's store is
+untouched until the accept is adopted — everything before that is network and
+cryptography — and it has a useful consequence: a failed join leaves nothing
+behind, no pool and no identity.
+
+The reply carries `vaultKey`, which `open` does not, because the direction is
+reversed. A founder passes the key in; a joiner does not have it until the
+handshake succeeds, and without it the next page load could not reopen the vault
+it just joined. It is transferred rather than copied, so the worker is not left
+holding a second reachable copy of the whole vault.
 
 ## Capacity policy
 
@@ -268,9 +288,16 @@ Dart half will need its own.
 ## Still open
 - **The Dart `web_vault_port.dart` itself.** The roam side of the contract is
   complete; the second implementation of the 22-method port is not written.
-- **Pairing a browser session.** Relay leaf only — no iroh, no LAN. Until it
-  exists, `openOnOpfs` always founds a new vault. This is the blocking one: a
-  browser cannot yet *join* a roster, only start its own.
+- **Hosting an invite from a browser.** `joinOnOpfs` lets a browser *join*; there
+  is no binding for the other side, so a browser member cannot yet invite a
+  third device. Nothing structural blocks it — `roam_pairing::host_via_mailbox`
+  is the same wasm-portable code — it is simply not wired.
+- **`joinOnOpfs` inside a real browser.** The join logic is covered natively
+  (`roam-pairing`'s suite, and `roam-wasm/tests/join.rs` for the browser-shaped
+  wiring on `MemFs`), and the CLI pairs end-to-end through a live Phoenix relay.
+  What has NOT been run is `joinOnOpfs` in Chromium against a relay: the headless
+  harness has no host process to pair with. The untested part is the mount
+  ordering, not the protocol.
 - **Key handling.** `vaultKey` arrives from the page, so it is XSS-exposed. It
   must be derived per session and never persisted in the clear — see the security
   notes on `WasmVault`.

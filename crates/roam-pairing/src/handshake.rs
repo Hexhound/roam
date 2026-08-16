@@ -441,6 +441,51 @@ async fn join_via_mailbox_inner<M: Mailbox>(
     poll: Duration,
     claim_instead: Option<([u8; 32], u64)>,
 ) -> Result<Joined> {
+    let (accept, host_key) =
+        fetch_accept_inner(identity, mailbox, invite, code, step, poll, claim_instead).await?;
+    adopt_accept(store, accept, &host_key)
+}
+
+/// Run the handshake and hand back the accept **without applying it**.
+///
+/// For a joiner that cannot open its store until it knows the vault key. The
+/// browser is exactly that case: its OPFS pool directory is named after the
+/// bucket id, which is derived from the vault key, so there is nowhere to put a
+/// store until the handshake has finished. Splitting here is safe precisely
+/// because the store is untouched until [`adopt_accept`] — everything above it
+/// is network and cryptography.
+///
+/// The caller **must** pass the returned key to [`adopt_accept`] and must not
+/// substitute another: it is the responder identity the SPAKE2 run agreed on,
+/// which is what makes a tampered invite fail as a wrong code.
+pub async fn fetch_accept_via_mailbox<M: Mailbox>(
+    identity: &Identity,
+    mailbox: &M,
+    invite: &Invite,
+    code: &PairingCode,
+) -> Result<(JoinAccept, VerifyingKey)> {
+    fetch_accept_inner(
+        identity,
+        mailbox,
+        invite,
+        code,
+        STEP_TIMEOUT,
+        POLL_INTERVAL,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn fetch_accept_inner<M: Mailbox>(
+    identity: &Identity,
+    mailbox: &M,
+    invite: &Invite,
+    code: &PairingCode,
+    step: Duration,
+    poll: Duration,
+    claim_instead: Option<([u8; 32], u64)>,
+) -> Result<(JoinAccept, VerifyingKey)> {
     // The key the host's key log will be authenticated with. It is only as good
     // as the invite — and that is fine, because binding it into the SPAKE2 run
     // below means a wrong key cannot survive the confirmation.
@@ -512,7 +557,7 @@ async fn join_via_mailbox_inner<M: Mailbox>(
     )
     .context("decode the host's accept")?;
 
-    adopt_accept(store, accept, &host_key)
+    Ok((accept, host_key))
 }
 
 /// Poll a slot until it holds something, or `timeout` elapses.

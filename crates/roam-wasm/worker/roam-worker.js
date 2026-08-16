@@ -16,6 +16,7 @@
 // Protocol, page -> worker:
 //
 //   { id, type: 'open', modulePath, vaultKey: [32 bytes], relayUrl }
+//   { id, type: 'join', modulePath, invite, code }       // pair into a vault
 //   { id, command: 'setEntry', container, key, value }   // any session command
 //   { id, command: 'putBlob', bytes: Uint8Array }        // binary rides beside
 //
@@ -70,19 +71,43 @@ const enqueue = (work) => {
 // is a plain getter on the port, and it cannot become a Future just because one
 // platform computes it in another agent. Both are fixed for the life of the
 // session, so the caller caches them here and never asks again.
-const open = async ({ modulePath, vaultKey, relayUrl }) => {
-  // Imported dynamically so the page decides where the wasm bundle lives.
-  // Flutter web serves assets from a path that is not known at build time here.
-  const wasm = await import(modulePath);
-  await wasm.default();
-  session = await wasm.Session.openOnOpfs(new Uint8Array(vaultKey), relayUrl);
-
+const identifiers = async () => {
   const ask = async (command) => {
     const reply = JSON.parse(await session.handle(JSON.stringify({ command })));
     if (reply.error) throw new Error(reply.error);
     return reply.ok;
   };
   return { bucketId: await ask('bucketId'), peerId: await ask('peerId') };
+};
+
+// Imported dynamically so the page decides where the wasm bundle lives: Flutter
+// web serves assets from a path that is not known at build time here.
+const loadWasm = async (modulePath) => {
+  const wasm = await import(modulePath);
+  await wasm.default();
+  return wasm;
+};
+
+const open = async ({ modulePath, vaultKey, relayUrl }) => {
+  const wasm = await loadWasm(modulePath);
+  session = await wasm.Session.openOnOpfs(new Uint8Array(vaultKey), relayUrl);
+  return identifiers();
+};
+
+// Pair into somebody else's vault. This is the only way a browser gets INTO a
+// vault: it has no UDP socket, so it can never be an iroh peer, and both other
+// pairing flows require being dialled.
+//
+// The reply carries `vaultKey`, which `open` does not, because the direction is
+// reversed — a founder passes the key in, a joiner does not have it until the
+// handshake succeeds. The page MUST keep it, or the next load cannot reopen the
+// vault this just joined; and it is the entire vault, so the security note on
+// `Session` applies to it in full. It is sent as a transferable, so the worker's
+// own copy is detached rather than lingering in a second heap.
+const join = async ({ modulePath, invite, code }) => {
+  const wasm = await loadWasm(modulePath);
+  session = await wasm.Session.joinOnOpfs(invite, code);
+  return { ...(await identifiers()), vaultKey: session.vaultKey() };
 };
 
 self.onmessage = (event) => {
@@ -95,8 +120,15 @@ self.onmessage = (event) => {
         self.postMessage({ id, ok: await open(request) });
         return;
       }
+      if (request?.type === 'join') {
+        const ok = await join(request);
+        // The vault key moves rather than being copied, so the worker is not
+        // left holding a second reachable copy of the whole vault.
+        self.postMessage({ id, ok }, [ok.vaultKey.buffer]);
+        return;
+      }
       if (session === null) {
-        throw new Error("send { type: 'open' } before any command");
+        throw new Error("send { type: 'open' } or { type: 'join' } before any command");
       }
 
       // `bytes` is the one field that must not reach the JSON encoder — strip
