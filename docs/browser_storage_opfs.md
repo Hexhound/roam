@@ -21,9 +21,15 @@ already opened.
 
 ## Measured facts, not assumptions
 
-Probed in Chromium 150.0.7871.186, headless, over `http://127.0.0.1` (OPFS needs
-a secure context with a real storage key — `file://` is an opaque origin and
-will not do). Probe lived in `target/opfs-probe/`, deliberately scratch.
+Probed headless over `http://127.0.0.1` (OPFS needs a secure context with a real
+storage key — `file://` is an opaque origin and will not do). The probe lived in
+`target/opfs-probe/`, deliberately scratch.
+
+First measured on Chromium **150.0.7871.186**, then re-measured on
+**151.0.7922.71**, the version the devenv pins. Both agree, which matters for the
+first row of the table below: that one is load-bearing for the whole
+architecture, so it should not rest on a browser build that happened to be in a
+developer's user profile.
 
 | question | answer |
 |---|---|

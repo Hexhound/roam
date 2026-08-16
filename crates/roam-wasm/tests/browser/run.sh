@@ -13,7 +13,11 @@ harness_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 crate_dir="$(cd "$harness_dir/../.." && pwd)"
 repo_root="$(cd "$crate_dir/../.." && pwd)"
 
-export CARGO_BUILD_JOBS=1
+# Single-job by default because this workspace OOMs under parallelism on a
+# smaller machine, but overridable: that limit is a property of the machine, not
+# of the harness, and hard-coding it makes a 16-core box build at the speed of a
+# laptop. TMPDIR stays inside target/ so cargo's scratch lands on the big volume.
+export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}"
 export TMPDIR="$repo_root/target/tmp"
 mkdir -p "$TMPDIR"
 
@@ -24,13 +28,34 @@ wasm-pack build "$crate_dir" --target web --dev \
   --out-dir "tests/browser/pkg" --features browser-test
 
 profile="$(mktemp -d)"
-trap 'rm -rf "$profile"' EXIT
+browser=""
+server=""
+
+# Kill both children and WAIT for them before removing the profile. `kill` only
+# signals: chromium keeps writing into its user-data-dir for a moment after, and
+# an `rm -rf` racing that fails with "Directory not empty" and leaves the profile
+# behind. Profiles are hundreds of MB, and this repo has already filled its disk
+# once, so a cleanup that silently loses the race is not a cosmetic problem.
+#
+# `set +e` first, and it is load-bearing: this runs under `set -e`, and by the
+# time the trap fires the server has usually already exited, so `kill` and `wait`
+# return non-zero and would abort the function BEFORE the `rm`. That is not
+# hypothetical — it is why the first version of this script left a 23 MB profile
+# behind on every single run while looking like it cleaned up.
+cleanup() {
+  set +e
+  [ -n "$browser" ] && kill "$browser" 2>/dev/null
+  [ -n "$server" ] && kill "$server" 2>/dev/null
+  # Reap before removing: chromium keeps writing into its user-data-dir for a
+  # moment after the signal, and an `rm -rf` racing that fails with "Directory
+  # not empty".
+  wait "$browser" "$server" 2>/dev/null
+  rm -rf "$profile"
+}
+trap cleanup EXIT
 
 node "$harness_dir/serve.mjs" &
 server=$!
-# Report the checks' verdict, not the browser's: chromium exits non-zero for its
-# own reasons and would mask a passing run either way.
-trap 'kill $server 2>/dev/null || true; rm -rf "$profile"' EXIT
 
 sleep 1
 # A FRESH profile per run, deliberately. OPFS is durable, so a leftover profile
@@ -41,7 +66,8 @@ chromium --headless=new --no-sandbox --disable-gpu \
   "http://127.0.0.1:${PORT:-8732}/" >/dev/null 2>&1 &
 browser=$!
 
+# Report the CHECKS' verdict, not the browser's: chromium exits non-zero for its
+# own reasons and would mask a passing run either way. The server exits with the
+# verdict it was handed by the page.
 wait $server
-status=$?
-kill $browser 2>/dev/null || true
-exit $status
+exit $?
