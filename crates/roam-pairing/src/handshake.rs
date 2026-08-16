@@ -238,6 +238,25 @@ impl<M: Mailbox> MailboxHost<'_, M> {
     /// nothing else — a stalled or wrong session is abandoned and the loop moves
     /// on, and only a wrong *confirmation* spends an attempt.
     pub async fn accept_for(mut self, window: Duration) -> Result<u64> {
+        // Only an Admin can vouch for a new device. Checked here, up front,
+        // because without it the failure is invisible on both sides: `add_peer`
+        // fails deep inside `serve`, that session is abandoned like any other
+        // rejected one, and the host sits out its whole window before reporting
+        // a timeout — while the joiner is told its code was probably wrong. The
+        // code has already been shown by this point, which is unavoidable, but
+        // an immediate and accurate error beats a silent quarter of an hour.
+        let role = self.store.self_role();
+        if role != Some(roam_storage::Role::Admin) {
+            bail!(
+                "this device is {} in the vault, and only an Admin can add another device — \
+                 ask an Admin device to host the invite",
+                match role {
+                    Some(role) => role.to_string(),
+                    None => "not a member".to_string(),
+                }
+            );
+        }
+
         let deadline = crate::deadline_from_now(window);
         let mut served: Vec<String> = Vec::new();
 

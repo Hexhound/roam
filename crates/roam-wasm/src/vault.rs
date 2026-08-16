@@ -30,7 +30,7 @@ use roam_backend_client::sync::reconcile_once;
 use roam_backend_client::transport::Backend;
 use roam_crdt::{Frontier, MapChange};
 use roam_storage::vfs::{MemFs, VaultFs};
-use roam_storage::{Identity, Role, Store};
+use roam_storage::{Identity, Role, Store, VaultId};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -44,6 +44,15 @@ const ROOT: &str = "/vault";
 /// in particular it is never in `localStorage`, which is XSS-readable.
 const IDENTITY: &str = "/vault/identity.key";
 
+/// The vault's own 32-byte id, beside the identity.
+///
+/// Not derived from the vault key, and it cannot be: a joiner is *told* its
+/// vault id by the host, in the accept, and two devices of one vault must agree
+/// on it. So it is stored, and stored on both paths — a founder mints one, a
+/// joiner writes down the one it was given. Without this a browser could join a
+/// vault but never host anyone into it, having nothing to put in the accept.
+const VAULT_ID: &str = "/vault/vault.id";
+
 /// Cloning shares one vault (the store is behind an `Arc`), it does not copy
 /// one. The `wasm_bindgen` async methods need an owned handle to move into the
 /// returned future, which is the only reason this is `Clone`.
@@ -51,6 +60,11 @@ const IDENTITY: &str = "/vault/identity.key";
 pub struct Vault {
     store: Arc<Mutex<Store>>,
     key: VaultKey,
+    /// The same identity the store holds. Kept alongside because hosting a
+    /// pairing needs `&Identity` and `&mut Store` at once, and the store owns
+    /// the identity it would have to lend.
+    identity: Identity,
+    vault_id: VaultId,
 }
 
 impl Vault {
@@ -83,7 +97,8 @@ impl Vault {
     /// constructors rather than a flag.
     pub fn open(fs: Arc<dyn VaultFs>, vault_key: [u8; 32]) -> anyhow::Result<Self> {
         let identity = load_or_generate_identity(&fs)?;
-        let mut store = Store::open_with_fs(Path::new(ROOT), identity, fs)?;
+        let vault_id = load_or_generate_vault_id(&fs)?;
+        let mut store = Store::open_with_fs(Path::new(ROOT), identity.clone(), fs)?;
         if store.founder_pin().is_none() {
             // Founding as Admin mirrors the native e2e setup: a device's own
             // vouch must fold before its local writes are permitted.
@@ -92,6 +107,8 @@ impl Vault {
         Ok(Self {
             store: Arc::new(Mutex::new(store)),
             key: VaultKey(vault_key),
+            identity,
+            vault_id,
         })
     }
 
@@ -122,13 +139,60 @@ impl Vault {
         // just vouched for, so a different one on the next open would be a
         // stranger to the roster this join created.
         identity.save_with_fs(&*fs, Path::new(IDENTITY))?;
-        let mut store = Store::open_with_fs(Path::new(ROOT), identity, fs)?;
+        let mut store = Store::open_with_fs(Path::new(ROOT), identity.clone(), Arc::clone(&fs))?;
         let joined = roam_pairing::adopt_accept(&mut store, accept, host_key)?;
+        // The host's vault id, not one of our own: this device must name the
+        // vault the same way every other member does, or an invite it later
+        // hosts would enrol somebody into a vault that does not exist.
+        fs.write(Path::new(VAULT_ID), &joined.vault.0)?;
 
         Ok(Self {
             store: Arc::new(Mutex::new(store)),
             key: VaultKey(*joined.vault_key),
+            identity,
+            vault_id: joined.vault,
         })
+    }
+
+    /// Host a pairing over a relay mailbox, letting one device in.
+    ///
+    /// The mirror of [`Vault::join`], and the same flow `Engine::host_invite`
+    /// runs natively. A browser can host as well as join: nothing about the
+    /// mailbox flow needs a socket, which is the whole reason it exists.
+    ///
+    /// `show` is called with the code and the invite *before* this starts
+    /// waiting, and that ordering is not cosmetic — the joiner cannot begin
+    /// until it has both, so a version that returned them at the end would
+    /// deadlock. It is a callback rather than a return value for the same
+    /// reason.
+    ///
+    /// Returns the peer id enrolled. Holds the store lock for the whole window,
+    /// so no other command runs on this vault while an invite is open.
+    pub async fn host_invite<M: roam_pairing::Mailbox>(
+        &self,
+        mailbox: M,
+        invite: roam_pairing::Invite,
+        role: Role,
+        window: std::time::Duration,
+        show: impl FnOnce(&roam_pairing::PairingCode, &roam_pairing::Invite),
+    ) -> anyhow::Result<u64> {
+        let mut store = self.store.lock().await;
+        let (code, host) = roam_pairing::host_via_mailbox(
+            &self.identity,
+            self.vault_id,
+            self.key.0,
+            role,
+            &mut store,
+            mailbox,
+            invite,
+        );
+        show(&code, host.invite());
+        host.accept_for(window).await
+    }
+
+    /// This vault's id — the name every member of it agrees on.
+    pub fn vault_id(&self) -> VaultId {
+        self.vault_id
     }
 
     /// A vault backed by `MemFs` — correct, but lost when the tab closes.
@@ -184,6 +248,19 @@ impl Vault {
 
     pub async fn get_entry(&self, container: &str, key: &str) -> Option<String> {
         self.store.lock().await.get_entry(container, key)
+    }
+
+    /// Remove a key. Removing one that is not there is not an error: two devices
+    /// deleting the same row concurrently are stating the same intent.
+    pub async fn remove_entry(&self, container: &str, key: &str) -> anyhow::Result<()> {
+        self.store.lock().await.remove_entry(container, key)?;
+        Ok(())
+    }
+
+    /// Everything in a container, for the bootstrap pass a freshly paired device
+    /// has to make before incremental changes mean anything.
+    pub async fn entries(&self, container: &str) -> Vec<(String, String)> {
+        self.store.lock().await.entries(container)
     }
 
     pub async fn edit_text(&self, id: &str, at: usize, text: &str) -> anyhow::Result<()> {
@@ -243,6 +320,81 @@ impl Vault {
         self.store.lock().await.blobs().has(hash)
     }
 
+    /// Drop this device's copy of `hash`. Local only — blobs are not a shared
+    /// collection a device can delete out of, so this reclaims storage here and
+    /// says nothing to anyone else. Content-addressed storage has no reference
+    /// counting, so the caller must already know nothing refers to it.
+    pub async fn remove_blob(&self, hash: &str) -> anyhow::Result<()> {
+        self.store.lock().await.blobs().remove(hash)?;
+        Ok(())
+    }
+
+    // -- membership and maintenance ------------------------------------------
+
+    /// Every device this vault trusts, including this one.
+    ///
+    /// Authoritative about privilege and silent about liveness: a roster entry is
+    /// a signed statement about who may write, not about who is awake.
+    pub async fn roster(&self) -> Vec<PeerInfo> {
+        let store = self.store.lock().await;
+        let me = store.peer_id();
+        store
+            .roster()
+            .into_iter()
+            .map(|peer| PeerInfo {
+                peer_id: peer.peer_id,
+                verifying_key: peer.verifying_key,
+                name: peer.name,
+                role: peer.role,
+                // A revoked peer stays in the roster as a tombstone — forgetting
+                // a revocation would let the device back in.
+                active: peer.status == roam_storage::PeerStatus::Active,
+                is_self: peer.peer_id == me,
+            })
+            .collect()
+    }
+
+    /// Withdraw trust from a device. Terminal: the fold treats a revocation as
+    /// final, so it cannot be undone by re-adding the peer.
+    ///
+    /// It does NOT re-key anything the device already holds — it still knows the
+    /// vault key. Pair it with [`Vault::rotate_epoch`] when that matters.
+    pub async fn revoke_peer(&self, peer_id: u64, verifying_key: [u8; 32]) -> anyhow::Result<()> {
+        self.store
+            .lock()
+            .await
+            .revoke_peer(peer_id, verifying_key)?;
+        Ok(())
+    }
+
+    /// Storage this vault occupies, split by what is using it.
+    pub async fn data_size(&self) -> anyhow::Result<roam_storage::DataSize> {
+        Ok(self.store.lock().await.data_size()?)
+    }
+
+    /// Bytes compaction would reclaim with this cutoff, changing nothing.
+    pub async fn compact_dry_run(&self, before_ms: i64) -> anyhow::Result<u64> {
+        Ok(self.store.lock().await.checkpoint_dry_run(before_ms)?)
+    }
+
+    /// Compact history older than `before_ms`, returning the bytes reclaimed.
+    /// Current data is untouched; what is lost is the ability to roll back past
+    /// the cutoff.
+    pub async fn compact(&self, before_ms: i64) -> anyhow::Result<u64> {
+        Ok(self.store.lock().await.checkpoint(before_ms)?)
+    }
+
+    /// Mint a fresh content epoch, wrapped to every current member.
+    ///
+    /// What makes a revocation bite: writes after it are sealed under a key the
+    /// revoked device was never handed. Does not change the vault key, so the
+    /// bucket does not move and nothing has to re-pair.
+    pub async fn rotate_epoch(&self) -> anyhow::Result<()> {
+        let mut store = self.store.lock().await;
+        store.rotate_epoch(&self.key.id_key(), &self.key.epoch0_key(), None)?;
+        Ok(())
+    }
+
     // -- change reporting ----------------------------------------------------
 
     /// A marker for "the document as it is right now", for pairing with
@@ -268,6 +420,45 @@ impl Vault {
 /// place. A fresh identity on every open would make the device a stranger to its
 /// own op log — the class of bug `MemFs` structurally cannot catch, since it
 /// starts empty every time.
+/// One device in the roster, flattened for a caller that is about to serialize
+/// it. Deliberately a plain struct rather than a re-export of the storage type:
+/// the command protocol has to encode it, and encoding an internal type would
+/// pin its layout to the wire.
+#[derive(Debug, Clone)]
+pub struct PeerInfo {
+    pub peer_id: u64,
+    /// Carried beside the id because the roster binds the two, and a revocation
+    /// naming only an id could be replayed against a different key.
+    pub verifying_key: [u8; 32],
+    pub name: Option<String>,
+    pub role: Role,
+    /// False once revoked.
+    pub active: bool,
+    pub is_self: bool,
+}
+
+/// This vault's id, read back or minted on first use.
+///
+/// Only a *founder* may mint one. A joiner takes the host's, written by
+/// [`Vault::join`] — which is why this is not called on that path: a fresh id
+/// there would name a vault of one.
+fn load_or_generate_vault_id(fs: &Arc<dyn VaultFs>) -> anyhow::Result<VaultId> {
+    let path = Path::new(VAULT_ID);
+    if let Ok(bytes) = fs.read(path) {
+        let id: [u8; 32] = bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("{VAULT_ID} is {} bytes, expected 32", bytes.len()))?;
+        return Ok(VaultId(id));
+    }
+    let fresh = VaultId::generate();
+    if let Some(parent) = path.parent() {
+        fs.create_dir_all(parent)?;
+    }
+    fs.write(path, &fresh.0)?;
+    Ok(fresh)
+}
+
 fn load_or_generate_identity(fs: &Arc<dyn VaultFs>) -> anyhow::Result<Identity> {
     let identity_path = Path::new(IDENTITY);
     match Identity::load_with_fs(&**fs, identity_path) {

@@ -230,6 +230,14 @@ pub struct WasmSession {
     /// every sync access handle, and a closed pool's `VaultFs` cannot read.
     pool: OpfsPool,
     inner: Session<HttpBackend>,
+    /// The relay this session was opened against, kept so [`host_invite`] mints
+    /// an invite naming it. Reusing the session's relay rather than taking a
+    /// second one keeps a device from hosting a pairing on a relay it does not
+    /// itself sync through — a mismatch that pairs successfully and then never
+    /// converges.
+    ///
+    /// [`host_invite`]: WasmSession::host_invite
+    relay: String,
     /// See [`WasmSession::take_reply_bytes`]. `RefCell` and not a lock because
     /// a worker is single-threaded and the borrow never spans an `await`.
     reply_bytes: RefCell<Option<Vec<u8>>>,
@@ -261,6 +269,7 @@ impl WasmSession {
             pool,
             inner: Session::new(vault, Arc::new(HttpBackend::new(&relay_url))),
             reply_bytes: RefCell::new(None),
+            relay: relay_url,
         })
     }
 
@@ -309,7 +318,68 @@ impl WasmSession {
             pool,
             inner: Session::new(vault, Arc::new(HttpBackend::new(&invite.relay))),
             reply_bytes: RefCell::new(None),
+            relay: invite.relay,
         })
+    }
+
+    /// Host a pairing invite, letting one other device into this vault.
+    ///
+    /// The other half of [`join_on_opfs`], and the reason a browser is a
+    /// first-class member rather than a guest: a tab that joined a vault can
+    /// itself admit the next device, with no native host anywhere in the story.
+    ///
+    /// `show` is called with `(invite, code)` as soon as they exist and before
+    /// this starts waiting. It has to be a callback: the joiner cannot begin
+    /// until it has both, so returning them when the pairing completes would
+    /// wait for something that can never happen.
+    ///
+    /// Resolves to the enrolled peer id, as a string — a peer id is a `u64` and
+    /// JSON numbers are doubles, the same rule the command protocol follows.
+    ///
+    /// SECURITY: `code` is the only thing authenticating the joiner. It must
+    /// reach them out of band (spoken, or read off the screen) and never travel
+    /// beside the invite — an attacker holding both is the joiner.
+    ///
+    /// [`join_on_opfs`]: WasmSession::join_on_opfs
+    #[wasm_bindgen(js_name = hostInvite)]
+    pub async fn host_invite(
+        &self,
+        role: String,
+        seconds: u32,
+        show: js_sys::Function,
+    ) -> Result<String, JsError> {
+        let role: roam_storage::Role = role
+            .parse()
+            .map_err(|e| JsError::new(&format!("role: {e}")))?;
+        let invite =
+            roam_pairing::Invite::generate(&self.relay, self.inner.vault().verifying_key().await);
+
+        let peer = self
+            .inner
+            .vault()
+            .host_invite(
+                roam_pairing::HttpMailbox::for_invite(&invite),
+                invite,
+                role,
+                std::time::Duration::from_secs(seconds as u64),
+                |code, invite| {
+                    // A JS callback that throws must not take the pairing down
+                    // with it: the host is mid-handshake and the store lock is
+                    // held. The error is reported and the wait proceeds — a
+                    // caller that never saw the code simply gets a timeout.
+                    if let Err(e) = show.call2(
+                        &JsValue::NULL,
+                        &JsValue::from_str(&invite.encode()),
+                        &JsValue::from_str(code.as_str()),
+                    ) {
+                        console_error(&format!("hostInvite's show callback threw: {e:?}"));
+                    }
+                },
+            )
+            .await
+            .map_err(any_to_js)?;
+
+        Ok(peer.to_string())
     }
 
     /// The vault key this session holds, so a joiner can reopen without pairing

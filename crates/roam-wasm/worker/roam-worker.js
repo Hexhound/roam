@@ -17,12 +17,19 @@
 //
 //   { id, type: 'open', modulePath, vaultKey: [32 bytes], relayUrl }
 //   { id, type: 'join', modulePath, invite, code }       // pair into a vault
+//   { id, type: 'hostInvite', role, seconds }            // admit one device
 //   { id, command: 'setEntry', container, key, value }   // any session command
 //   { id, command: 'putBlob', bytes: Uint8Array }        // binary rides beside
 //
 // and worker -> page, always exactly one reply per request:
 //
 //   { id, ok: <value>, changes?: [...], bytes?: Uint8Array } | { id, error: '…' }
+//
+// with one exception, `hostInvite`, which emits `{ id, invite, code }` first and
+// its reply afterwards. That is not a general push channel sneaking back in: the
+// invite and the code are *inputs* the joiner needs before this request can
+// finish, so a design that only spoke at the end would wait forever. It carries
+// the request's own id, so it stays attached to the call that produced it.
 //
 // `bytes` never goes through JSON: attachments are megabytes, and base64 would
 // cost a third more of them plus two parses of data that is opaque anyway. It
@@ -110,6 +117,18 @@ const join = async ({ modulePath, invite, code }) => {
   return { ...(await identifiers()), vaultKey: session.vaultKey() };
 };
 
+// Admit one device into the vault this session already holds — the mirror of
+// `join`, and what makes a browser a full member rather than a guest.
+//
+// Occupies the queue for the whole window, deliberately: the Rust side holds the
+// store lock while an invite is open, so no other command could run on this
+// vault anyway. A UI that wants to stay responsive should use a short window and
+// let the user re-issue, not host in the background.
+const hostInvite = ({ id, role, seconds }) =>
+  session.hostInvite(role ?? 'writer', seconds ?? 300, (invite, code) =>
+    self.postMessage({ id, invite, code })
+  );
+
 self.onmessage = (event) => {
   const request = event.data;
   const id = request?.id ?? null;
@@ -129,6 +148,10 @@ self.onmessage = (event) => {
       }
       if (session === null) {
         throw new Error("send { type: 'open' } or { type: 'join' } before any command");
+      }
+      if (request?.type === 'hostInvite') {
+        self.postMessage({ id, ok: await hostInvite(request) });
+        return;
       }
 
       // `bytes` is the one field that must not reach the JSON encoder — strip
