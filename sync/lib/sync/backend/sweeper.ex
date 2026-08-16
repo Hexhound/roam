@@ -10,7 +10,7 @@ defmodule Sync.Backend.Sweeper do
   use GenServer
   require Logger
 
-  alias Sync.Backend.{Retention, Store}
+  alias Sync.Backend.{Mailbox, Retention, Store}
 
   @default_interval_ms 6 * 60 * 60 * 1000
 
@@ -39,10 +39,25 @@ defmodule Sync.Backend.Sweeper do
   """
   def sweep_all(opts \\ []) do
     root = Keyword.get(opts, :data_root, Store.data_root())
+    sweep_mailboxes(opts)
 
     for bucket <- buckets(root), into: %{} do
       {bucket, sweep_one(bucket, opts)}
     end
+  end
+
+  # Pairing mailboxes are short-lived by nature — a pairing window is five
+  # minutes — but nothing deletes them at the end of a successful handshake:
+  # both sides simply stop polling, and a failed one leaves its slots behind
+  # too. Without this they accumulate forever, one directory per pairing
+  # attempt. Isolated like the bucket sweep, so a mailbox root that cannot be
+  # read never starves snapshot retention.
+  defp sweep_mailboxes(opts) do
+    Mailbox.sweep(Keyword.take(opts, [:ttl_ms, :now_ms]))
+  rescue
+    error ->
+      Logger.error("pairing mailbox sweep failed: #{inspect(error)}")
+      []
   end
 
   # BE4: buckets are client-controlled, so a single poisoned bucket (e.g. a

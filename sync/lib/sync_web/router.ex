@@ -31,7 +31,44 @@ defmodule SyncWeb.Router do
   pipeline :raw do
     plug :accepts, ["*/*"]
     plug :reject_multipart_body
+    plug :allow_any_origin
   end
+
+  # CORS, and why `*` is the honest answer here rather than a lazy one.
+  #
+  # A browser client cannot reach ANY of these routes without it — not the sync
+  # bucket, not the pairing mailbox — because a cross-origin `fetch` to a
+  # different host is blocked before the request is even made. That made a web
+  # client impossible regardless of everything else that had been built for it.
+  #
+  # `*` is correct because there is nothing here for an origin to be trusted
+  # with. These routes carry opaque ciphertext, they authenticate nobody, and
+  # possession of the URL is already the whole of the access control: an
+  # attacker who knows a bucket or rendezvous id can read it with `curl` and does
+  # not need a browser to do it for them. Restricting the header would inconvenience
+  # honest clients and stop no attacker.
+  #
+  # What is NOT set, deliberately:
+  #
+  #   * `Access-Control-Allow-Credentials` — with `*` the two are illegal
+  #     together, and more to the point there are no credentials. Leaving it off
+  #     means a browser attaches no cookies to these requests, so nothing here
+  #     can ever become a CSRF surface.
+  #   * `Access-Control-Allow-Headers: *` for anything beyond content-type. A
+  #     client sends opaque bytes and nothing else.
+  #
+  # This applies only to the `:raw` pipeline. The `:browser` pipeline — which
+  # does have sessions, cookies and CSRF protection — is untouched.
+  defp allow_any_origin(conn, _opts) do
+    conn
+    |> Plug.Conn.put_resp_header("access-control-allow-origin", "*")
+    |> Plug.Conn.put_resp_header("access-control-allow-methods", "GET, PUT, POST, OPTIONS")
+    |> Plug.Conn.put_resp_header("access-control-allow-headers", "content-type")
+    |> Plug.Conn.put_resp_header("access-control-max-age", "86400")
+  end
+
+  # The OPTIONS preflight each scope needs is a route of its own — see
+  # `SyncWeb.PreflightController` for why a plug alone could not do it.
 
   # H-C: the raw sync routes carry opaque octet-stream ciphertext. The MULTIPART
   # Plug.Parser reads the body via `read_part_body`, bypassing the caching
@@ -62,9 +99,23 @@ defmodule SyncWeb.Router do
     end
   end
 
+  # Device pairing through the relay: write-once slots so two devices that cannot
+  # reach each other directly can run a handshake. Opaque here exactly like every
+  # other kind — every body is a SPAKE2 message or a ciphertext sealed under a
+  # key derived from a code the relay never sees. See `Sync.Backend.Mailbox`.
+  scope "/rendezvous/:rendezvous", SyncWeb do
+    pipe_through :raw
+
+    match :options, "/*path", PreflightController, :preflight
+    get "/sessions", RendezvousController, :sessions
+    get "/:session/:slot", RendezvousController, :get_slot
+    put "/:session/:slot", RendezvousController, :put_slot
+  end
+
   scope "/b/:bucket", SyncWeb do
     pipe_through :raw
 
+    match :options, "/*path", PreflightController, :preflight
     get "/manifest", SyncController, :manifest
     get "/entries/:id", SyncController, :get_entry
     put "/entries/:id", SyncController, :put_entry
