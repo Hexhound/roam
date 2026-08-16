@@ -262,11 +262,14 @@ complementary.
   whole-vault compromise. `Vault` therefore exposes no link helper, and the
   binding's doc comment says why. Unchanged from the original plan — this was
   always gated on F1.
-- **Storage is `MemFs`, so a browser vault dies with the tab.** Durability needs
-  an OPFS `VaultFs`. Note one thing M2 did not have to face: `VaultFs: Send +
-  Sync`, and OPFS sync access handles are JS values. Either wrap them (sound on
-  wasm32 — no threads) or cfg the bound as `Backend` now does. `Vault::open`
-  already takes the backend as an argument so the swap is one line.
+- **Storage was `MemFs`, so a browser vault died with the tab.** **This is now
+  built — see `docs/browser_storage_opfs.md` (M4).** An OPFS `VaultFs` exists and
+  is validated in headless Chromium. Two notes from the original plan, resolved:
+  the `Send + Sync` question went the *wrapper* way, not the cfg'd-bound way,
+  because `Store` holds `Arc<dyn VaultFs>` and auto traits do not elaborate onto
+  a trait object through a named supertrait — the trick `Backend` uses would not
+  have worked. And the swap really is one argument, but nothing calls it yet:
+  `Vault::in_memory` is still `MemFs` until the hosting worker exists.
 - **No `roam-files`**, so no folder mirroring in the browser (18 fs sites,
   still a product question — see "What M2 does NOT cover").
 

@@ -20,3 +20,9 @@ mod bindings;
 // Test double for the node acceptance harness; never in a shipped build.
 #[cfg(all(target_arch = "wasm32", feature = "test-relay"))]
 mod relay;
+
+// The OPFS storage checks. Unlike everything else here these cannot be moved
+// into plain Rust — they assert the *browser's* behaviour, so they only exist in
+// a browser build. Feature-gated for the same reason `relay` is.
+#[cfg(all(target_arch = "wasm32", feature = "browser-test"))]
+mod opfs_checks;

@@ -21,6 +21,12 @@ tokio = { workspace = true, features = ["sync"] }
 # Off by default: the shipped browser artifact must not contain a test double.
 test-relay = ["dep:serde_json"]
 
+# Exports the OPFS storage checks for the headless-browser harness. These need
+# `roam-storage/conformance`, which lifts the one suite every `VaultFs` must pass
+# out of `cfg(test)`. Off by default, like `test-relay`, so neither the test
+# suite nor a test double can reach a shipped artifact.
+browser-test = ["roam-storage/conformance"]
+
 # wasm-bindgen is target-gated ON PURPOSE. Nothing in a native build — least of
 # all the CLI — may transitively pull wasm-bindgen in; gating it here makes that
 # structurally impossible rather than a convention we have to remember. It also

@@ -1,0 +1,42 @@
+<!doctype html>
+<!--
+  The page exists only to start the worker and relay its report back to the
+  runner. Nothing storage-related happens here on purpose: OPFS sync access
+  handles do not exist on the main thread.
+-->
+<html>
+<body><pre id="out">running</pre>
+<script type="module">
+const report = async (failed, results) => {
+  document.getElementById('out').textContent = results.join('\n');
+  await fetch('/report', {
+    method: 'POST',
+    body: JSON.stringify({ failed, results }),
+  });
+};
+
+// A Rust panic aborts the worker, so its own error handling never runs. The
+// worker forwards each panic message the instant it is produced; hold them here
+// so a crash can still say what actually failed.
+const panics = [];
+
+const worker = new Worker('worker.js', { type: 'module' });
+worker.onmessage = (e) => {
+  if (e.data.panic !== undefined) {
+    panics.push(e.data.panic);
+    return;
+  }
+  report(e.data.failed, e.data.results);
+};
+worker.onerror = (e) =>
+  report(1, [
+    'worker crashed: ' + e.message,
+    ...panics.map((p) => '      ' + p),
+  ]);
+
+// A worker that never answers must not leave the runner hanging until its own
+// timeout; say so instead.
+setTimeout(() => report(1, ['the worker did not report within 60s']), 60000);
+</script>
+</body>
+</html>

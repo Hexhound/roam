@@ -117,13 +117,62 @@ part of the object type and a cfg'd supertrait will not elaborate onto it. That
 means the wrapper route is the workable one here, and its `unsafe impl` must be
 justified in a comment by the no-threads argument, not waved at.
 
+## What was built
+
+- `roam-storage/src/vfs_pool.rs` — `SlotPool<S>`, the whole design above, over a
+  five-method `Slot` trait. Plain Rust: no JS, no browser, no wasm.
+- `roam-storage/src/vfs_opfs.rs` — wasm32-only. `OpfsSlot` (the five
+  delegations), `mount()` (the one async step), `OpfsPool::ensure_free()`.
+- `roam-wasm/src/opfs_checks.rs` + `roam-wasm/tests/browser/` — the harness.
+
+The split is the point: because `Slot` excludes everything OPFS makes async,
+essentially all the behaviour is natively testable, and the browser-only surface
+is five one-line methods.
+
 ## Validation
 
-`roam_storage::vfs::conformance()` is the acceptance test: one function already
-run against `NativeFs` and `MemFs`, so an OPFS backend earns its keep by passing
-the same function. `tests/vault_on_memfs.rs` — a whole vault lifecycle that
-survives a reopen — becomes the browser's acceptance test with the backend
-swapped, exactly as M2 predicted.
+Three layers, each covering what the one below cannot.
 
-Both must run in a **real browser in a worker**, which node cannot provide. See
-the browser harness in `crates/roam-wasm/tests/browser/`.
+**Native, `roam-storage`.** `vfs::conformance()` — the one suite every backend
+passes, now reachable outside `cfg(test)` behind the `conformance` feature — runs
+against the pool alongside `NativeFs` and `MemFs`. Plus unit tests for slot
+recycling, exhaustion, growth, rename-onto-existing, over-long paths, and a
+duplicate-claim mount.
+
+**Native, `tests/vault_on_slot_pool.rs`.** A real `Store` lifecycle that survives
+a **remount**: a brand-new `SlotPool` rebuilds the path map from slot bytes
+alone. `MemFs` structurally cannot test this — it dies with the process, so
+"reopen the store" only re-reads a map that never went away. A pool holding its
+map in memory passes every test in `vault_on_memfs.rs` and loses the whole vault
+on tab close. Mutation-checked: dropping header recovery fails the two remount
+tests and leaves the third passing.
+
+**Real browser, `crates/roam-wasm/tests/browser/run.sh`.** Four checks in a
+dedicated worker in headless Chromium, covering only what the browser itself has
+to honour: the conformance suite against real OPFS; a vault surviving every
+handle being closed and the pool remounted; `truncate` upward actually
+zero-filling (`create_sized` pre-sizes a blob, and slots are *recycled*, so a
+non-zeroed gap would disclose a previous tenant's bytes); and growing a pool
+after mount. Mutation-checked by making the `Slot` impl ignore the offset.
+
+Two things the harness needs that are easy to get wrong:
+
+- **A fresh browser profile per run.** OPFS is durable, so a leftover profile
+  carries the previous run's pool and "survives a remount" would pass against
+  stale slots even if the build under test wrote nothing.
+- **Panic text has to be forwarded as it happens.** wasm32 panics are aborts: a
+  failed assertion inside `conformance` kills the worker outright, so the
+  `try/catch` around each check never runs and anything merely accumulated in the
+  worker dies with it. The worker posts each `console.error` to the page
+  immediately; without that, a real failure reads only as
+  `RuntimeError: unreachable`.
+
+## Still open
+
+- **Nothing calls `mount` in anger yet.** `Vault::in_memory` is still `MemFs`;
+  wiring OPFS in belongs with the worker that hosts it.
+- **The worker itself.** Message loop, command dispatch, and the
+  `ensure_free` top-up between commands.
+- **Capacity policy.** How many slots to open at mount, and how far ahead to keep
+  the free list, are both unmeasured. `free_slots()` and `capacity()` are exposed
+  for whatever policy the worker settles on.
