@@ -28,6 +28,7 @@
 use roam_backend_client::crypto::VaultKey;
 use roam_backend_client::sync::reconcile_once;
 use roam_backend_client::transport::Backend;
+use roam_crdt::{Frontier, MapChange};
 use roam_storage::vfs::{MemFs, VaultFs};
 use roam_storage::{Identity, Role, Store};
 use std::path::Path;
@@ -157,5 +158,54 @@ impl Vault {
     /// we lack. Everything crossing the wire is ciphertext.
     pub async fn sync<B: Backend>(&self, backend: &Arc<B>) -> anyhow::Result<()> {
         reconcile_once(&self.store, backend, &self.key).await
+    }
+
+    /// The relay bucket this vault addresses. Derived from the vault key, never
+    /// chosen — so it discloses nothing the relay does not already hold.
+    pub fn bucket_id(&self) -> String {
+        self.key.bucket_id()
+    }
+
+    // -- binary payloads -----------------------------------------------------
+    //
+    // Blobs live OUTSIDE the CRDT: only a hash-reference rides the op log, so
+    // these bytes never pass through the document. That is what makes it safe
+    // to move them across the worker boundary as raw buffers rather than as
+    // part of a JSON envelope.
+
+    /// Store `bytes`, returning their content hash. Idempotent — the same bytes
+    /// always produce the same hash and are never rewritten.
+    pub async fn put_blob(&self, bytes: &[u8]) -> anyhow::Result<String> {
+        Ok(self.store.lock().await.blobs().put(bytes)?)
+    }
+
+    /// The bytes for `hash`, or `None` if this device does not hold them.
+    ///
+    /// `None` is a normal answer, not an error: blobs sync separately from ops,
+    /// so a device can legitimately know a reference before it has the bytes.
+    pub async fn get_blob(&self, hash: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        Ok(self.store.lock().await.blobs().get(hash)?)
+    }
+
+    pub async fn has_blob(&self, hash: &str) -> bool {
+        self.store.lock().await.blobs().has(hash)
+    }
+
+    // -- change reporting ----------------------------------------------------
+
+    /// A marker for "the document as it is right now", for pairing with
+    /// [`Vault::changes_since`].
+    pub async fn frontier(&self) -> Frontier {
+        self.store.lock().await.frontier()
+    }
+
+    /// Every key-level map change between `from` and now, deletes included.
+    ///
+    /// This is what lets an embedder project a vault into its own database: the
+    /// alternative — re-reading every container and diffing by hand — costs the
+    /// whole dataset per sync and still cannot see a deletion.
+    pub async fn changes_since(&self, from: &Frontier) -> anyhow::Result<Vec<MapChange>> {
+        let store = self.store.lock().await;
+        Ok(store.map_delta(from, &store.frontier())?)
     }
 }

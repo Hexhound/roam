@@ -39,11 +39,35 @@
 //! and one naming rule: the envelope owns `id`, so a text container is named by
 //! `textId`. JSON silently keeps one value for a duplicated key, so the
 //! collision would not have been an error, it would have been a wrong answer.
+//!
+//! # Binary rides beside the JSON, not inside it
+//!
+//! Attachments are megabytes. Base64 inside the envelope would cost a third
+//! more bytes and — worse — force the whole payload through a JSON parser on
+//! both sides, twice, for data that is opaque anyway. So [`Session::handle`]
+//! takes and returns an optional byte buffer *alongside* the envelope, and the
+//! worker moves it as a transferable. Blobs are the only thing this carries,
+//! which is exactly right: blob bytes live outside the CRDT already, with only
+//! a hash-reference on the op log.
+//!
+//! # Changes ride on the reply, and there is no push channel
+//!
+//! An embedder projecting a vault into its own database needs to be told what
+//! moved. The obvious design is an unsolicited worker-to-page channel — but it
+//! is unnecessary here, because **nothing changes a vault except a command**. A
+//! local edit is a command; pulling a peer's ops is `sync`, also a command. So
+//! every reply carries the map delta its own command produced, under `changes`,
+//! omitted when empty. This keeps ordering trivially correct: a caller can
+//! never observe a change before the reply that caused it.
+//!
+//! Text containers are not in `changes` — `map_delta` is key-level over maps. A
+//! caller projecting text re-reads it after a `sync`.
 
 use crate::vault::Vault;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use base64::Engine as _;
 use roam_backend_client::transport::Backend;
+use roam_crdt::MapChange;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -84,6 +108,27 @@ pub enum Command {
     },
     WriteSnapshot,
     Sync,
+    /// The bytes come from the request's binary payload, not from this object —
+    /// see the module note on why. Replies with the content hash.
+    PutBlob,
+    /// Replies with `{ "len": n }` and the bytes as the reply's payload, or a
+    /// bare `null` when this device does not hold them. The distinction matters:
+    /// a zero-length blob is present and answers `{ "len": 0 }`, so a caller
+    /// must not read "no bytes" as "missing".
+    GetBlob {
+        hash: String,
+    },
+    HasBlob {
+        hash: String,
+    },
+    BucketId,
+}
+
+/// One reply: the JSON envelope, plus binary that deliberately did not go
+/// through it.
+pub struct Reply {
+    pub json: String,
+    pub bytes: Option<Vec<u8>>,
 }
 
 /// One open vault, plus the relay it syncs against.
@@ -102,18 +147,34 @@ impl<B: Backend> Session<B> {
         Self { vault, backend }
     }
 
-    /// Handle one request, returning the reply as a JSON string.
+    /// Handle one request that carries no binary, returning just the JSON.
+    ///
+    /// Equivalent to [`handle`] with no payload — and the reply bytes it drops
+    /// are necessarily absent, since only `getBlob` produces any.
+    ///
+    /// [`handle`]: Session::handle
+    pub async fn handle_json(&self, request: &str) -> String {
+        self.handle(request, None).await.json
+    }
+
+    /// Handle one request, returning the reply envelope and any binary that
+    /// deliberately did not go through it.
     ///
     /// This is infallible by design. A worker that cannot answer leaves the page
     /// waiting forever on a promise that never settles, which is a far worse
     /// failure than an error reply — so every path, including "that isn't JSON",
     /// produces an envelope.
-    pub async fn handle(&self, request: &str) -> String {
+    pub async fn handle(&self, request: &str, payload: Option<Vec<u8>>) -> Reply {
         let parsed: Value = match serde_json::from_str(request) {
             Ok(value) => value,
             // No `id` is recoverable here: there is no request to read one from.
             // The caller sees a rejected promise rather than a hung one.
-            Err(e) => return envelope(Value::Null, Err(format!("malformed request: {e}"))),
+            Err(e) => {
+                return Reply {
+                    json: envelope(Value::Null, Err(format!("malformed request: {e}")), &[]),
+                    bytes: None,
+                }
+            }
         };
 
         // Read the id BEFORE the command parses, so a request naming a command
@@ -122,61 +183,138 @@ impl<B: Backend> Session<B> {
 
         let command: Command = match serde_json::from_value(parsed) {
             Ok(command) => command,
-            Err(e) => return envelope(id, Err(format!("unrecognized command: {e}"))),
+            Err(e) => {
+                return Reply {
+                    json: envelope(id, Err(format!("unrecognized command: {e}")), &[]),
+                    bytes: None,
+                }
+            }
         };
 
-        envelope(id, self.run(command).await.map_err(|e| format!("{e:#}")))
+        // Taken before the command and compared after, so `changes` describes
+        // exactly what this command did. Sound only because `handle` is not
+        // re-entrant — with two commands in flight the window would span both,
+        // and each would claim the other's changes as its own.
+        let before = self.vault.frontier().await;
+
+        let outcome = self.run(command, payload).await;
+
+        // A failed command may still have changed the document before it
+        // failed, so the delta is read on both paths. On the error path it is
+        // dropped rather than reported: an envelope carries `ok` or `error`,
+        // never both, and a caller that is being told a write failed should not
+        // simultaneously be handed its partial effects.
+        let (value, bytes, result) = match outcome {
+            Ok((value, bytes)) => (value, bytes, Ok(())),
+            Err(e) => (Value::Null, None, Err(format!("{e:#}"))),
+        };
+
+        // Falling back to "nothing changed" is wrong, but failing the command
+        // the caller asked for — which by now has already happened — is worse.
+        let changes = self.vault.changes_since(&before).await.unwrap_or_default();
+
+        match result {
+            Ok(()) => Reply {
+                json: envelope(id, Ok(value), &changes),
+                bytes,
+            },
+            Err(message) => Reply {
+                json: envelope(id, Err(message), &changes),
+                bytes: None,
+            },
+        }
     }
 
-    async fn run(&self, command: Command) -> anyhow::Result<Value> {
-        Ok(match command {
-            Command::PeerId => json!(self.vault.peer_id().await.to_string()),
-
-            Command::VerifyingKey => json!(B64.encode(self.vault.verifying_key().await)),
-
-            Command::AddPeer {
-                peer_id,
-                verifying_key,
-            } => {
-                let peer_id: u64 = peer_id
-                    .parse()
-                    .map_err(|_| anyhow::anyhow!("peerId must be a u64 written as a string"))?;
-                self.vault
-                    .add_peer(peer_id, decode_key(&verifying_key)?)
-                    .await?;
-                Value::Null
+    /// The command's value, plus any binary that must bypass the envelope.
+    ///
+    /// The three blob commands are handled ahead of the rest because they are
+    /// the only ones that touch the payload at all; everything after them is a
+    /// plain value.
+    async fn run(
+        &self,
+        command: Command,
+        payload: Option<Vec<u8>>,
+    ) -> anyhow::Result<(Value, Option<Vec<u8>>)> {
+        match command {
+            Command::PutBlob => {
+                let bytes = payload.ok_or_else(|| {
+                    anyhow::anyhow!("putBlob needs its bytes as the request's binary payload")
+                })?;
+                return Ok((json!(self.vault.put_blob(&bytes).await?), None));
             }
 
-            Command::SetEntry {
-                container,
-                key,
-                value,
-            } => {
-                self.vault.set_entry(&container, &key, &value).await?;
-                Value::Null
+            Command::GetBlob { hash } => {
+                return Ok(match self.vault.get_blob(&hash).await? {
+                    Some(bytes) => (json!({ "len": bytes.len() }), Some(bytes)),
+                    None => (Value::Null, None),
+                });
             }
 
-            Command::GetEntry { container, key } => {
-                json!(self.vault.get_entry(&container, &key).await)
+            Command::HasBlob { hash } => {
+                return Ok((json!(self.vault.has_blob(&hash).await), None));
             }
 
-            Command::EditText { text_id, at, text } => {
-                self.vault.edit_text(&text_id, at, &text).await?;
-                Value::Null
-            }
+            _ => {}
+        }
 
-            Command::Text { text_id } => json!(self.vault.text(&text_id).await),
+        Ok((
+            match command {
+                Command::PeerId => json!(self.vault.peer_id().await.to_string()),
 
-            Command::WriteSnapshot => {
-                self.vault.write_snapshot().await?;
-                Value::Null
-            }
+                Command::VerifyingKey => json!(B64.encode(self.vault.verifying_key().await)),
 
-            Command::Sync => {
-                self.vault.sync(&self.backend).await?;
-                Value::Null
-            }
-        })
+                Command::AddPeer {
+                    peer_id,
+                    verifying_key,
+                } => {
+                    let peer_id: u64 = peer_id
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("peerId must be a u64 written as a string"))?;
+                    self.vault
+                        .add_peer(peer_id, decode_key(&verifying_key)?)
+                        .await?;
+                    Value::Null
+                }
+
+                Command::SetEntry {
+                    container,
+                    key,
+                    value,
+                } => {
+                    self.vault.set_entry(&container, &key, &value).await?;
+                    Value::Null
+                }
+
+                Command::GetEntry { container, key } => {
+                    json!(self.vault.get_entry(&container, &key).await)
+                }
+
+                Command::EditText { text_id, at, text } => {
+                    self.vault.edit_text(&text_id, at, &text).await?;
+                    Value::Null
+                }
+
+                Command::Text { text_id } => json!(self.vault.text(&text_id).await),
+
+                Command::WriteSnapshot => {
+                    self.vault.write_snapshot().await?;
+                    Value::Null
+                }
+
+                Command::Sync => {
+                    self.vault.sync(&self.backend).await?;
+                    Value::Null
+                }
+
+                Command::BucketId => json!(self.vault.bucket_id()),
+
+                // Answered above, before the payload was consumed.
+                Command::PutBlob | Command::GetBlob { .. } | Command::HasBlob { .. } => {
+                    unreachable!("blob commands return early")
+                }
+            },
+            None,
+        ))
     }
 }
 
@@ -192,11 +330,30 @@ fn decode_key(encoded: &str) -> anyhow::Result<[u8; 32]> {
 /// `ok` and `error` are mutually exclusive, and `ok` is always present on
 /// success even when it is `null` — so a caller distinguishes the two by which
 /// key exists, never by whether a value is falsy.
-fn envelope(id: Value, result: Result<Value, String>) -> String {
-    let body = match result {
+///
+/// `changes` is omitted entirely when empty, which is the common case: most
+/// commands are reads. A caller therefore treats an absent key and an empty
+/// array identically.
+fn envelope(id: Value, result: Result<Value, String>, changes: &[MapChange]) -> String {
+    let mut body = match result {
         Ok(value) => json!({ "id": id, "ok": value }),
         Err(message) => json!({ "id": id, "error": message }),
     };
+    if !changes.is_empty() {
+        let listed: Vec<Value> = changes
+            .iter()
+            .map(|change| {
+                json!({
+                    "container": change.container,
+                    "key": change.key,
+                    // `null` is a deletion, and is why this cannot simply be a
+                    // map of surviving keys.
+                    "value": change.value,
+                })
+            })
+            .collect();
+        body["changes"] = Value::Array(listed);
+    }
     // Serializing a `Value` built from strings and nulls cannot fail.
     body.to_string()
 }

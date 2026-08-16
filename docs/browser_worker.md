@@ -70,6 +70,57 @@ operation all produce an envelope. A worker that stays silent leaves the page
 holding a promise that never settles, which is strictly worse than an error —
 there is nothing to show a user and nothing to log.
 
+### Binary rides beside the envelope
+
+Attachments are megabytes. Base64 inside the JSON would cost a third more bytes
+and, worse, push the whole payload through a parser twice on each side for data
+that is opaque anyway. So `putBlob` and `getBlob` carry their bytes *alongside*
+the envelope — `Session::handle` takes and returns an `Option<Vec<u8>>`, and the
+worker moves it as a **transferable**, so the buffer changes owner rather than
+being copied.
+
+Blobs are the only thing this carries, which is exactly the right boundary: blob
+bytes already live outside the CRDT, with only a hash-reference on the op log.
+
+Two details that are easy to get wrong, and are pinned by tests:
+
+- **A zero-length blob is present.** `getBlob` answers `{ "len": 0 }` with an
+  empty payload; a *missing* blob answers a bare `null`. Collapse the two and a
+  caller re-fetches an attachment it already holds, forever.
+- **`putBlob` with no payload is an error**, not an empty blob — writing zero
+  bytes under a hash nobody asked for is silent corruption of the reference.
+
+`wasm_bindgen` cannot return two values, so the binding splits into
+`handleWithBytes` and `takeReplyBytes`. Stashing the bytes on the session
+between those two calls is safe for the same reason the queue exists: one
+command at a time. `takeReplyBytes` *takes*, so a large attachment is not held
+alive after the page has read it.
+
+### Changes ride on the reply, and there is no push channel
+
+An embedder projecting a vault into its own database has to be told what moved.
+The obvious design is an unsolicited worker→page channel — and it turns out to
+be unnecessary, because **nothing changes a vault except a command.** A local
+edit is a command; pulling a peer's ops is `sync`, also a command. So each reply
+carries the map delta its own command produced, under `changes`, omitted when
+empty.
+
+That is strictly better than a side channel, not merely simpler: ordering is
+correct by construction, since a caller cannot observe a change before the reply
+that caused it.
+
+`changes` is key-level over *maps* (`Store::map_delta`), so text containers are
+not in it — a caller projecting text re-reads it after a `sync`. A `null` value
+is a deletion, which is why the array carries values rather than just names;
+this protocol has no delete command yet, so the encoding is ahead of its use.
+
+### The two ids `open` hands back
+
+`open` replies with `{ bucketId, peerId }` rather than `null`. Both are fixed for
+the life of a session, and `bucketId` in particular is a **synchronous** getter
+on CareMate's Dart port — it cannot become a `Future` merely because one platform
+computes it in another agent. So it is fetched once and cached.
+
 ## Opening: the pool directory is derived, not chosen
 
 `Session.openOnOpfs(vaultKey, relayUrl)` mounts `.roam-<bucketId>`, where the
@@ -121,8 +172,12 @@ exhaustion mid-command is a provisioning bug, not a recoverable condition.
 
 **Native** (`cargo test -p roam-wasm`) — `tests/session.rs` covers the protocol,
 including two sessions vouching for each other over commands alone and
-converging through a relay, and that no input produces silence.
-`tests/durable_vault.rs` covers reopening, over a remounted slot pool.
+converging through a relay, that a pulled change is reported on the `sync` reply
+that caused it, that a read reports no changes at all, and that no input produces
+silence. `tests/durable_vault.rs` covers reopening, over a remounted slot pool.
+
+Mutation-checked: suppressing `changes` fails two tests, and making a missing
+blob answer like an empty one fails a third.
 
 **Real browser** (`crates/roam-wasm/tests/browser/run.sh`) — five checks that
 drive the *shipped* worker file from a page, alongside the four OPFS checks. The
@@ -137,7 +192,14 @@ needs a browser:
   vault locked by `NoModificationAllowedError`;
 - a vault opened by a later worker is the same vault, seen by the same device;
 - 24 commands fired without awaiting all land, which is the queue doing its job;
-- a failing command rejects without killing the session.
+- a failing command rejects without killing the session;
+- **1 MiB of blob bytes really is transferred, not copied.** The page checks its
+  own `Uint8Array` is detached after the send, which is the only observable
+  difference between a transfer and a structured clone — and then a *second*
+  worker reads the bytes back, so this also proves they reached OPFS rather than
+  living in the first session's memory;
+- `open` reports a `bucketId` matching the command, and a write reports its own
+  `changes`.
 
 Each check uses its own vault key, and that is not tidiness. Sharing one key made
 the checks share a vault — every check inserted text at position 0, and their
@@ -186,14 +248,17 @@ the seam for it — `lib/data/sync/vault_port.dart` is a 22-method abstraction w
 one implementation today (`roam_vault_port.dart`, frb-backed); web adds a second,
 and nothing above the port changes. frb stays for Android and iOS.
 
-Three things that implementation has to solve, none of them yet built:
+Three things that implementation needed, all three now built on the roam side —
+though one of them turned out not to need what this doc first said it did:
 
-- **Binary.** `putBlob`/`getBlob` are `List<int>`; the protocol carries JSON
-  only. Needs transferables.
-- **`Stream<VaultChange> get changes`.** Needs an unsolicited push channel; the
-  worker only pushes `{panic}` today.
-- **`String get bucketId`** is the port's one synchronous getter. Derivable from
-  the vault key, so cache it at open.
+- **Binary.** `putBlob`/`getBlob` are `List<int>` on the port. Now carried
+  beside the envelope as transferables; see above.
+- **`Stream<VaultChange> get changes`.** Predicted here as needing an
+  unsolicited push channel. It does not: nothing changes a vault except a
+  command, so the delta rides on the causing command's own reply and the Dart
+  side pumps it into a `StreamController`. No second channel exists.
+- **`String get bucketId`.** Returned by `open` and cached, since it is the
+  port's one synchronous getter.
 
 The standing cost of this route is that the protocol is a hand-written contract
 in three places (Rust enum ↔ JSON ↔ Dart), where frb's codegen would have kept
@@ -201,10 +266,14 @@ two of them in step automatically. `tests/session.rs` guards the Rust half; the
 Dart half will need its own.
 
 ## Still open
+- **The Dart `web_vault_port.dart` itself.** The roam side of the contract is
+  complete; the second implementation of the 22-method port is not written.
 - **Pairing a browser session.** Relay leaf only — no iroh, no LAN. Until it
-  exists, `openOnOpfs` always founds a new vault.
-- **Blobs over the protocol.** No command carries binary yet; attachments will
-  need transferables rather than JSON.
+  exists, `openOnOpfs` always founds a new vault. This is the blocking one: a
+  browser cannot yet *join* a roster, only start its own.
 - **Key handling.** `vaultKey` arrives from the page, so it is XSS-exposed. It
   must be derived per session and never persisted in the clear — see the security
   notes on `WasmVault`.
+- **Blob transfer between devices.** `putBlob`/`getBlob` are local; a browser
+  that syncs an op-log referencing a blob it does not hold still has no way to
+  fetch the bytes.

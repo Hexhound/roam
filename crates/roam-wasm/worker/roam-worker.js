@@ -17,10 +17,19 @@
 //
 //   { id, type: 'open', modulePath, vaultKey: [32 bytes], relayUrl }
 //   { id, command: 'setEntry', container, key, value }   // any session command
+//   { id, command: 'putBlob', bytes: Uint8Array }        // binary rides beside
 //
 // and worker -> page, always exactly one reply per request:
 //
-//   { id, ok: <value> } | { id, error: '…' }
+//   { id, ok: <value>, changes?: [...], bytes?: Uint8Array } | { id, error: '…' }
+//
+// `bytes` never goes through JSON: attachments are megabytes, and base64 would
+// cost a third more of them plus two parses of data that is opaque anyway. It
+// travels as a transferable instead, so the buffer is moved rather than copied.
+//
+// `changes` is the map delta this command produced, absent when empty. There is
+// no separate push channel because nothing changes a vault except a command —
+// a local edit is one, and pulling a peer's ops is `sync`.
 //
 // A worker -> page message with no `id` is unsolicited: `{ panic }`.
 
@@ -56,12 +65,24 @@ const enqueue = (work) => {
   return result;
 };
 
+// Answers with the two identifiers a caller needs to have on hand
+// *synchronously* afterwards. The bucket id in particular: on the Dart side it
+// is a plain getter on the port, and it cannot become a Future just because one
+// platform computes it in another agent. Both are fixed for the life of the
+// session, so the caller caches them here and never asks again.
 const open = async ({ modulePath, vaultKey, relayUrl }) => {
   // Imported dynamically so the page decides where the wasm bundle lives.
   // Flutter web serves assets from a path that is not known at build time here.
   const wasm = await import(modulePath);
   await wasm.default();
   session = await wasm.Session.openOnOpfs(new Uint8Array(vaultKey), relayUrl);
+
+  const ask = async (command) => {
+    const reply = JSON.parse(await session.handle(JSON.stringify({ command })));
+    if (reply.error) throw new Error(reply.error);
+    return reply.ok;
+  };
+  return { bucketId: await ask('bucketId'), peerId: await ask('peerId') };
 };
 
 self.onmessage = (event) => {
@@ -71,16 +92,33 @@ self.onmessage = (event) => {
   enqueue(async () => {
     try {
       if (request?.type === 'open') {
-        await open(request);
-        self.postMessage({ id, ok: null });
+        self.postMessage({ id, ok: await open(request) });
         return;
       }
       if (session === null) {
         throw new Error("send { type: 'open' } before any command");
       }
-      // The reply is already a JSON envelope carrying this id; parse it back
-      // into an object so the page gets structured data rather than a string.
-      self.postMessage(JSON.parse(await session.handle(JSON.stringify(request))));
+
+      // `bytes` is the one field that must not reach the JSON encoder — strip
+      // it out and hand it over as a payload instead.
+      const { bytes, ...envelope } = request;
+      const json = await session.handleWithBytes(
+        JSON.stringify(envelope),
+        bytes ? new Uint8Array(bytes) : undefined,
+      );
+
+      // Already a JSON envelope carrying this id; parse it back so the page
+      // gets structured data rather than a string.
+      const reply = JSON.parse(json);
+      const replyBytes = session.takeReplyBytes();
+      if (replyBytes === undefined) {
+        self.postMessage(reply);
+      } else {
+        // Transferred, not copied. Safe because Rust already handed ownership
+        // of a fresh buffer over — nothing on this side reads it again.
+        reply.bytes = replyBytes;
+        self.postMessage(reply, [replyBytes.buffer]);
+      }
     } catch (e) {
       // Never leave a request unanswered. A page awaiting a promise that never
       // settles has no timeout and no error to show — strictly worse than a

@@ -198,6 +198,7 @@ impl WasmVault {
 use crate::session::Session;
 use roam_backend_client::http::HttpBackend;
 use roam_storage::vfs_opfs::{self, OpfsPool};
+use std::cell::RefCell;
 
 /// How many slots to open at mount, and how many free ones to keep ahead of the
 /// next command.
@@ -229,6 +230,9 @@ pub struct WasmSession {
     /// every sync access handle, and a closed pool's `VaultFs` cannot read.
     pool: OpfsPool,
     inner: Session<HttpBackend>,
+    /// See [`WasmSession::take_reply_bytes`]. `RefCell` and not a lock because
+    /// a worker is single-threaded and the borrow never spans an `await`.
+    reply_bytes: RefCell<Option<Vec<u8>>>,
 }
 
 #[wasm_bindgen(js_class = Session)]
@@ -256,6 +260,7 @@ impl WasmSession {
         Ok(WasmSession {
             pool,
             inner: Session::new(vault, Arc::new(HttpBackend::new(&relay_url))),
+            reply_bytes: RefCell::new(None),
         })
     }
 
@@ -279,7 +284,39 @@ impl WasmSession {
                 r#"{{"id":null,"error":"could not reserve storage before the command: {e}"}}"#
             );
         }
-        self.inner.handle(&request).await
+        self.inner.handle_json(&request).await
+    }
+
+    /// The same, for the commands that carry binary.
+    ///
+    /// Split from [`handle`] rather than folded into it because `wasm_bindgen`
+    /// gives no way to return two values: the reply's bytes have to be fetched
+    /// separately. They are stashed on `self` between the two calls, which is
+    /// safe for exactly the reason the queue exists — one command at a time.
+    ///
+    /// [`handle`]: WasmSession::handle
+    #[wasm_bindgen(js_name = handleWithBytes)]
+    pub async fn handle_with_bytes(&self, request: String, payload: Option<Vec<u8>>) -> String {
+        if let Err(e) = self.pool.ensure_free(KEEP_FREE).await {
+            return format!(
+                r#"{{"id":null,"error":"could not reserve storage before the command: {e}"}}"#
+            );
+        }
+        let reply = self.inner.handle(&request, payload).await;
+        *self.reply_bytes.borrow_mut() = reply.bytes;
+        reply.json
+    }
+
+    /// The binary half of the last [`handle_with_bytes`] reply, if it had one.
+    ///
+    /// Taken, not copied: calling this twice gives `undefined` the second time,
+    /// so a large attachment is not held alive by the session after the page has
+    /// read it.
+    ///
+    /// [`handle_with_bytes`]: WasmSession::handle_with_bytes
+    #[wasm_bindgen(js_name = takeReplyBytes)]
+    pub fn take_reply_bytes(&self) -> Option<Vec<u8>> {
+        self.reply_bytes.borrow_mut().take()
     }
 }
 

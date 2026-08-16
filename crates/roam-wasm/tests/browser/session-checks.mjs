@@ -46,7 +46,7 @@ class Client {
       if (!settle) return;
       this.pending.delete(data.id);
       if (data.error !== undefined) settle.reject(new Error(data.error));
-      else settle.resolve(data.ok);
+      else settle.resolve(data);
     };
     // A worker that dies takes every in-flight reply with it. Fail the pending
     // requests loudly rather than letting the run hang to its timeout.
@@ -60,16 +60,22 @@ class Client {
     };
   }
 
-  send(request) {
+  /// The whole reply message, for the checks that care about `bytes` or
+  /// `changes` and not just `ok`.
+  sendRaw(request, transfer = []) {
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
       this.pending.set(id, { resolve, reject });
-      this.worker.postMessage({ ...request, id });
+      this.worker.postMessage({ ...request, id }, transfer);
     });
   }
 
+  send(request) {
+    return this.sendRaw(request).then((reply) => reply.ok);
+  }
+
   open() {
-    return this.send({
+    return this.sendRaw({
       type: 'open',
       modulePath: MODULE_PATH,
       vaultKey: this.key,
@@ -89,8 +95,11 @@ class Client {
 const withWorker = async (key, body) => {
   const client = new Client(key);
   try {
-    await client.open();
-    return await body(client);
+    // The open reply is passed through rather than dropped: it carries the ids
+    // a caller caches, and opening a second time would remount a pool whose
+    // handles are still held — `NoModificationAllowedError`, not a fresh start.
+    const opened = await client.open();
+    return await body(client, opened);
   } finally {
     client.terminate();
   }
@@ -209,6 +218,84 @@ const checks = [
           expect(value === `v${i}`, `k${i} read back as ${JSON.stringify(value)}`);
         }
         return '24 concurrent writes, all landed';
+      }),
+  ],
+
+  [
+    'blob bytes cross the boundary as transferables, intact and durable',
+    async (key) => {
+      // Non-UTF-8 on purpose, and big enough that a transfer is worth making:
+      // anything that quietly routed these through JSON or through a string
+      // would corrupt them here rather than in someone's attachment.
+      const payload = new Uint8Array(1 << 20);
+      for (let i = 0; i < payload.length; i++) payload[i] = (i * 31 + 7) & 0xff;
+
+      const hash = await withWorker(key, async (client) => {
+        // `payload.buffer` is handed over, not copied — after this the page's
+        // view is detached, which is the observable proof the transfer happened
+        // rather than a structured clone.
+        const put = await client.sendRaw(
+          { command: 'putBlob', bytes: payload },
+          [payload.buffer]
+        );
+        expect(
+          payload.byteLength === 0,
+          'the payload was copied, not transferred — its buffer is still attached'
+        );
+        return put.ok;
+      });
+
+      // A second worker, so this also proves the bytes reached OPFS rather than
+      // living in the first session's memory.
+      return withWorker(key, async (client) => {
+        const got = await client.sendRaw({ command: 'getBlob', hash });
+        expect(got.ok?.len === 1 << 20, `got back ${JSON.stringify(got.ok)}`);
+        expect(
+          got.bytes instanceof Uint8Array,
+          `reply bytes arrived as ${got.bytes?.constructor?.name}`
+        );
+        for (let i = 0; i < got.bytes.length; i++) {
+          expect(
+            got.bytes[i] === ((i * 31 + 7) & 0xff),
+            `byte ${i} came back as ${got.bytes[i]}`
+          );
+        }
+        return `1 MiB round-tripped through OPFS as ${hash.slice(0, 12)}…`;
+      });
+    },
+  ],
+
+  [
+    'open reports the ids a caller has to hold synchronously',
+    async (key) =>
+      withWorker(key, async (client, opened) => {
+        // `bucketId` is a plain getter on the Dart port, so it cannot become a
+        // Future just because this platform computes it in another agent. It is
+        // fixed for the session, so `open` hands it over once.
+        expect(
+          typeof opened.ok?.bucketId === 'string' && opened.ok.bucketId.length > 0,
+          `open gave no bucketId: ${JSON.stringify(opened.ok)}`
+        );
+        const asked = await client.send({ command: 'bucketId' });
+        expect(
+          asked === opened.ok.bucketId,
+          `open said ${opened.ok.bucketId}, the command says ${asked}`
+        );
+
+        // And a write reports what it changed on its own reply — the reason
+        // there is no separate push channel.
+        const wrote = await client.sendRaw({
+          command: 'setEntry',
+          container: 'meta',
+          key: 'title',
+          value: 'Hi',
+        });
+        expect(
+          JSON.stringify(wrote.changes) ===
+            JSON.stringify([{ container: 'meta', key: 'title', value: 'Hi' }]),
+          `changes came back as ${JSON.stringify(wrote.changes)}`
+        );
+        return `bucket ${opened.ok.bucketId.slice(0, 12)}…`;
       }),
   ],
 
