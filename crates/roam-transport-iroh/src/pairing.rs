@@ -70,7 +70,7 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use ed25519_dalek::Signature;
 use iroh::endpoint::{RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr};
-use roam_storage::{vault_subkeys, Identity, Role, Store, VaultId, VerifyingKey};
+use roam_storage::{Identity, Role, Store, VaultId, VerifyingKey};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -203,37 +203,11 @@ pub struct JoinRequest {
 /// A → B: accepted; here is the vault, the shared vault key, and A's signed
 /// roster snapshot.
 ///
-/// The `vault_key` (the backend decryption secret) is wiped on drop; every other
-/// field is public roster/key-log material and skipped.
-#[derive(Serialize, Deserialize, zeroize::ZeroizeOnDrop)]
-pub struct JoinAccept {
-    /// The vault B is joining (B re-validates it against its token).
-    #[zeroize(skip)]
-    pub vault: [u8; 32],
-    /// The shared vault key (backend decryption secret). Only ever sent here,
-    /// after the joiner's proof verifies, over the encrypted pairing stream.
-    pub vault_key: [u8; 32],
-    /// A's TRANSITIVE roster: every roster log the host holds, keyed by author
-    /// peer id. This includes the founder chain the host received when it joined
-    /// (e.g. `roster-<founder>.jsonl`) plus the host's own log, so a joiner behind
-    /// a non-founder admin folds the full founder->host->joiner chain. Verified
-    /// per-author during the joiner's roster fold, not here.
-    #[zeroize(skip)]
-    pub rosters: Vec<(u64, Vec<u8>)>,
-    /// The host's signed key-log (author = `keylog_author`), so the joiner learns
-    /// the epoch DAG and any wraps addressed to it. Empty for an un-rotated vault.
-    #[zeroize(skip)]
-    pub keylog_author: u64,
-    #[zeroize(skip)]
-    pub keylog_jsonl: Vec<u8>,
-    /// The pinned vault founder's `peer_id`. The joiner writes this to its own
-    /// `<vault>/founder` pin so its roster fold seeds `ever_admin` and it can
-    /// materialize the role the host just granted (without it a Reader/Writer
-    /// joiner folds NO role and is inert). Delivered ONLY here, over the proven
-    /// stream — never in the out-of-band token.
-    #[zeroize(skip)]
-    pub founder: u64,
-}
+/// Defined in [`roam_pairing`] rather than here, because all three pairing flows
+/// send exactly this and the order a joiner must apply it in is a security
+/// property — three copies of it would be three chances to get that order wrong.
+/// Re-exported so this module's callers see no change.
+pub use roam_pairing::JoinAccept;
 
 /// The armed host side of a pairing exchange.
 ///
@@ -441,41 +415,19 @@ impl PairingHost<'_> {
             bail!("pairing proof did not verify — rejecting join (peer not added)");
         }
 
-        // The founder pin the joiner needs to seed its roster fold. The host is
-        // founded (it authored the vault), so this is `Some`; a `None` here is a
-        // host misconfiguration — fail closed rather than shipping a bogus 0.
-        let founder = self
-            .store
-            .founder_pin()
-            .context("host is not founded — cannot deliver a founder pin to the joiner")?;
-
-        // Proof holds: add the joiner to our roster with the invitee role, then
-        // vouch back with our vault + signed roster so it can reach our siblings
-        // transitively.
-        self.store
-            .add_peer(req.peer_id, req.verifying_key, self.role)
-            .context("add paired peer to roster")?;
-        // Wrap every epoch the host can open to the freshly-added joiner, so the
-        // newcomer starts Synced instead of WaitingKey. (No-op for an un-rotated
-        // vault: only epoch 0 exists and it is never wrapped.)
-        let (id_key, epoch0) = vault_subkeys(&self.vault_key);
-        self.store
-            .backfill_wraps(&id_key, &epoch0)
-            .context("wrap epochs to the new joiner")?;
-        let accept = JoinAccept {
-            vault: self.vault.0,
-            vault_key: self.vault_key,
-            rosters: self
-                .store
-                .export_all_rosters()
-                .context("export transitive roster")?,
-            keylog_author: self.identity.peer_id(),
-            keylog_jsonl: self
-                .store
-                .export_own_keylog()
-                .context("export own keylog")?,
-            founder,
-        };
+        // Proof holds: enrol the joiner with the invitee role and vouch back with
+        // our vault + signed roster, so it can reach our siblings transitively.
+        // The founder-pin check, the `add_peer`-before-`backfill_wraps` ordering
+        // and the export all live in `roam_pairing::enrol_joiner`.
+        let accept = roam_pairing::enrol_joiner(
+            self.store,
+            self.identity,
+            self.vault,
+            &self.vault_key,
+            self.role,
+            req.verifying_key,
+            req.peer_id,
+        )?;
         write_msg(&mut send, &accept)
             .await
             .context("send pairing accept")?;
@@ -557,56 +509,29 @@ async fn run_join(
         .context("send pairing request")?;
     send.finish().context("finish pairing send")?;
 
-    let mut accept: JoinAccept = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_msg(&mut recv))
+    let accept: JoinAccept = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_msg(&mut recv))
         .await
         .context("timed out reading the host's accept")??;
 
-    // VAULT MATCH: refuse to join a different vault than the token named.
+    // VAULT MATCH: refuse to join a different vault than the token named. This
+    // check is specific to the token flow — it is the only one whose out-of-band
+    // material names a vault — so it stays here, and it must happen BEFORE
+    // anything is imported.
     if accept.vault != token.vault {
         bail!("pairing vault mismatch — refusing to join a different vault");
     }
 
-    // Pin the founder the host delivered over the proven stream FIRST, so the
-    // roster fold seeds `ever_admin` with it. Without this pin a Reader/Writer
-    // joiner (which cannot author roster ops, and is not admin) would materialize
-    // NO role at all and be inert. We do NOT author our own `add_peer` for the
-    // host — that is admin-gated and we may be a mere Reader; trust in the host
-    // (and our own granted role) both fall out of the founder-seeded fold over
-    // the host's imported roster.
-    store
-        .pin_founder(accept.founder)
-        .context("pin founder delivered by host")?;
-    // Import the host's TRANSITIVE roster so we learn the founder's self-`Add`
-    // (proves its admin role and anchors the fold), the host's own log, and the
-    // `Add{role}` the host authored for us — the full founder->host->joiner chain.
-    // Each author's log is verified against the roster-vouched key during our fold
-    // (`rebuild_peers`); the founder pin above anchors trust in the founder.
+    // The key that authenticates the host's key-log. `check_host_identity_is_
+    // consistent` (run before we dialed) already bound this to the endpoint id
+    // QUIC authenticated, so it describes the device we actually talked to.
     let host_key = VerifyingKey::from_bytes(&token.verifying_key)
         .context("token carried a malformed host key")?;
-    // `JoinAccept` wipes its `vault_key` on drop (`ZeroizeOnDrop`), so its fields
-    // can't be moved out by value — take the owned Vecs with `mem::take`, leaving
-    // empties the Drop can harmlessly run over.
-    store
-        .import_roster_bundle(std::mem::take(&mut accept.rosters))
-        .context("import host transitive roster")?;
-    // Import the host's key-log so we learn the epoch DAG and any wraps addressed
-    // to us (the host published them via backfill during accept). Authenticated by
-    // the same host key as the roster.
-    if !accept.keylog_jsonl.is_empty() {
-        store
-            .import_keylog(
-                accept.keylog_author,
-                &host_key,
-                std::mem::take(&mut accept.keylog_jsonl),
-            )
-            .context("import host keylog")?;
-    }
+    // Founder pin, then transitive roster, then key-log — see
+    // `roam_pairing::adopt_accept` for why that order is the security property.
+    let joined = roam_pairing::adopt_accept(store, accept, &host_key)?;
 
     conn.close(0u32.into(), b"paired");
-    // Copy the vault key out of the `ZeroizeOnDrop` `JoinAccept` into a
-    // `Zeroizing` wrapper so the caller's copy is wiped on drop too (the accept
-    // itself wipes its field when it drops at the end of this fn).
-    Ok((zeroize::Zeroizing::new(accept.vault_key), accept.founder))
+    Ok((joined.vault_key, joined.founder))
 }
 
 /// Snapshot a dialable [`EndpointAddr`], waiting (bounded) for a direct address
@@ -664,7 +589,7 @@ async fn read_msg<T: DeserializeOwned>(recv: &mut RecvStream) -> Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use roam_storage::PeerStatus;
+    use roam_storage::{vault_subkeys, PeerStatus};
     use tempfile::tempdir;
 
     #[test]

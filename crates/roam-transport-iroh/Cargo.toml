@@ -9,6 +9,7 @@ repository.workspace = true
 roam-sync-core = { path = "../roam-sync-core" }
 roam-storage = { path = "../roam-storage" }
 roam-pake = { path = "../roam-pake" }
+roam-pairing = { path = "../roam-pairing" }
 ed25519-dalek.workspace = true
 iroh.workspace = true
 iroh-mdns-address-lookup = { workspace = true }

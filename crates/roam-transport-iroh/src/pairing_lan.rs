@@ -67,7 +67,7 @@ use anyhow::{bail, Context, Result};
 use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr, SecretKey};
 use roam_pake::{Initiator, PairingCode, Responder, Side};
-use roam_storage::{vault_subkeys, Identity, Role, Store, VaultId, VerifyingKey};
+use roam_storage::{Identity, Role, Store, VaultId, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
 use crate::pairing::JoinAccept;
@@ -334,34 +334,17 @@ impl LanPairingHost<'_> {
             bail!("joiner claims a key that is not the device we authenticated — refusing to pair");
         }
 
-        let founder = self
-            .store
-            .founder_pin()
-            .context("host is not founded — cannot deliver a founder pin to the joiner")?;
-        self.store
-            .add_peer(request.peer_id, request.verifying_key, self.role)
-            .context("add paired peer to roster")?;
-        // Wrap every epoch we can open to the newcomer, so it starts Synced
-        // rather than WaitingKey. No-op for an un-rotated vault.
-        let (id_key, epoch0) = vault_subkeys(&self.vault_key);
-        self.store
-            .backfill_wraps(&id_key, &epoch0)
-            .context("wrap epochs to the new joiner")?;
-
-        let accept = JoinAccept {
-            vault: self.vault.0,
-            vault_key: self.vault_key,
-            rosters: self
-                .store
-                .export_all_rosters()
-                .context("export transitive roster")?,
-            keylog_author: self.identity.peer_id(),
-            keylog_jsonl: self
-                .store
-                .export_own_keylog()
-                .context("export own keylog")?,
-            founder,
-        };
+        // Founder-pin check, `add_peer` before `backfill_wraps`, and the export —
+        // shared with every other flow, see `roam_pairing::enrol_joiner`.
+        let accept = roam_pairing::enrol_joiner(
+            self.store,
+            self.identity,
+            self.vault,
+            &self.vault_key,
+            self.role,
+            request.verifying_key,
+            request.peer_id,
+        )?;
         let bytes = serde_json::to_vec(&accept).context("serialize LAN pairing accept")?;
         write_frame(&mut send, &sealer.seal(&bytes)).await?;
         send.finish().context("finish LAN pairing send")?;
@@ -517,34 +500,17 @@ async fn run_lan_join(
     .context("serialize LAN join request")?;
     write_frame(&mut send, &sealer.seal(&request)).await?;
 
-    let mut accept: JoinAccept =
+    let accept: JoinAccept =
         serde_json::from_slice(&opener.open(&timeout_read(&mut recv, HANDSHAKE_TIMEOUT).await?)?)
             .context("decode the host's accept")?;
 
-    // Same import order as the token flow: pin the founder first so the roster
-    // fold has an anchor, then the transitive roster, then the key-log.
-    store
-        .pin_founder(accept.founder)
-        .context("pin founder delivered by host")?;
-    store
-        .import_roster_bundle(std::mem::take(&mut accept.rosters))
-        .context("import host transitive roster")?;
-    if !accept.keylog_jsonl.is_empty() {
-        store
-            .import_keylog(
-                accept.keylog_author,
-                &host_key,
-                std::mem::take(&mut accept.keylog_jsonl),
-            )
-            .context("import host keylog")?;
-    }
+    // Same import order as every other flow, and for the same reason — see
+    // `roam_pairing::adopt_accept`. There is no vault cross-check here because a
+    // six-digit code names no vault; see this module's header.
+    let joined = roam_pairing::adopt_accept(store, accept, &host_key)?;
 
     conn.close(0u32.into(), b"paired");
-    Ok((
-        VaultId(accept.vault),
-        zeroize::Zeroizing::new(accept.vault_key),
-        accept.founder,
-    ))
+    Ok((joined.vault, joined.vault_key, joined.founder))
 }
 
 /// A one-shot endpoint for LAN pairing.

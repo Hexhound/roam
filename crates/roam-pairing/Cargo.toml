@@ -1,0 +1,42 @@
+[package]
+name = "roam-pairing"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Deliberately NO iroh. This crate holds the parts of pairing that are the same
+# whatever moves the bytes — the join payload, the canonical import order, and a
+# PAKE-authenticated handshake over an abstract mailbox — so a browser, which
+# can never be an iroh peer, can run exactly the protocol a phone runs.
+[dependencies]
+roam-storage = { path = "../roam-storage" }
+roam-pake = { path = "../roam-pake" }
+anyhow.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+rand.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+zeroize = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true, features = ["time"] }
+
+# The poll loop has to wait between mailbox reads, and `tokio::time` is not
+# available on the bare wasm target. `setTimeout` is, in a page and in a worker
+# alike — the same reasoning as `roam_storage::wallclock`.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = { workspace = true }
+wasm-bindgen = { workspace = true }
+wasm-bindgen-futures = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+tempfile.workspace = true
+# The tests implement a deliberately-dishonest `Mailbox` to play a tampering
+# relay, which needs the same attribute the trait is declared with.
+async-trait.workspace = true
+# A squatting attacker has to produce a *well-formed* SPAKE2 message under a
+# code of its own, which means reaching the handshake types directly.
+roam-pake = { path = "../roam-pake" }

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/roam-crdt", "crates/roam-storage", "crates/roam-sync-core", "crates/roam-transport-iroh", "crates/roam-cli", "crates/roam-files", "crates/roam-backend-client", "crates/roam-rbsr", "crates/roam-wasm", "crates/roam-share", "crates/roam-pake", "crates/roam-share-iroh"]
+members = ["crates/roam-crdt", "crates/roam-storage", "crates/roam-sync-core", "crates/roam-transport-iroh", "crates/roam-cli", "crates/roam-files", "crates/roam-backend-client", "crates/roam-rbsr", "crates/roam-wasm", "crates/roam-share", "crates/roam-pake", "crates/roam-pairing", "crates/roam-share-iroh"]
 
 [workspace.package]
 edition = "2021"
