@@ -1,0 +1,58 @@
+<!doctype html>
+<!--
+  The joining device, deliberately on a SECOND ORIGIN.
+
+  OPFS is partitioned per origin, and roam names a vault's pool after its bucket
+  id — which is derived from the vault key, so two devices of one vault agree on
+  it. That is exactly right in production (a browser profile is one device) and
+  fatal for a test that wants two: both workers would open the same slot files,
+  and OPFS exclusivity would fail the second mount with
+  NoModificationAllowedError before the check could look at anything.
+
+  So the host page is served from 127.0.0.1 and this one from localhost. Same
+  server, same files, different origins — hence different OPFS storage, and a
+  genuinely cross-origin relay for the joiner, which is what a deployed app has
+  anyway.
+
+  There is no logic here. Messages are forwarded to the worker and its replies
+  forwarded back, so everything the check asserts is asserted against the
+  SHIPPED `worker/roam-worker.js` and not against a stand-in.
+-->
+<html>
+<body><pre>joiner</pre>
+<script type="module">
+let worker = null;
+
+const reply = (message) => parent.postMessage(message, '*');
+
+addEventListener('message', (event) => {
+  const request = event.data;
+
+  // Explicit worker lifecycle, because the durability check needs a SECOND
+  // worker over the same OPFS store: the first has to be gone before the next
+  // one mounts, or its sync access handles are still held.
+  if (request.control === 'newWorker') {
+    if (worker) worker.terminate();
+    worker = new Worker('/worker/roam-worker.js', { type: 'module' });
+    worker.onmessage = ({ data }) => reply(data);
+    worker.onerror = (e) =>
+      reply({ id: request.id, error: `joiner worker crashed: ${e.message}` });
+    reply({ id: request.id, ok: 'ready' });
+    return;
+  }
+
+  if (request.control === 'terminate') {
+    worker?.terminate();
+    worker = null;
+    reply({ id: request.id, ok: 'terminated' });
+    return;
+  }
+
+  worker.postMessage(request);
+});
+
+// The parent cannot post into a frame that has not run its script yet.
+reply({ ready: true });
+</script>
+</body>
+</html>
