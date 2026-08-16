@@ -196,6 +196,39 @@ impl<S: Slot> SlotPool<S> {
         self.inner.lock().unwrap().slots.len()
     }
 
+    /// Add one more slot to the pool.
+    ///
+    /// Separate from [`SlotPool::adopt`] because opening a slot is the
+    /// asynchronous part and this is not: the caller awaits, then hands the
+    /// opened slot over. That is the whole reason growth lives outside the
+    /// `VaultFs` surface — no trait method has an `await` to spend.
+    ///
+    /// A slot arriving with a non-empty header is adopted under that name, so
+    /// growing a pool cannot silently orphan a file that was already there.
+    pub fn add_slot(&self, slot: S) -> io::Result<()> {
+        let header = read_header(&slot)?;
+        let mut state = self.inner.lock().unwrap();
+        let index = state.slots.len();
+        state.slots.push(slot);
+
+        if header.name.is_empty() {
+            state.free.push(index);
+        } else if state
+            .names
+            .insert(PathBuf::from(&header.name), index)
+            .is_some()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "added slot claims {:?}, which is already mapped",
+                    header.name
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     /// Whether `set_owner_only` was applied to `path`. Mirrors
     /// `MemFs::is_owner_only` so the identity-secret rename test can run against
     /// this backend too.
@@ -562,6 +595,21 @@ mod tests {
             b"hi",
             "a shorter new tenant must not see the old file's tail"
         );
+    }
+
+    #[test]
+    fn growing_the_pool_relieves_exhaustion() {
+        let fs = pool(1);
+        fs.write(Path::new("/v/a"), b"one").unwrap();
+        assert_eq!(fs.free_slots(), 0);
+
+        // What the worker does between commands, once awaiting is possible again.
+        fs.add_slot(VecSlot::default()).unwrap();
+
+        assert_eq!(fs.capacity(), 2);
+        fs.write(Path::new("/v/b"), b"two").unwrap();
+        assert_eq!(fs.read(Path::new("/v/a")).unwrap(), b"one");
+        assert_eq!(fs.read(Path::new("/v/b")).unwrap(), b"two");
     }
 
     #[test]

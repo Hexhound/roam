@@ -22,6 +22,11 @@ mod store;
 mod text_history;
 mod vault_key;
 pub mod vfs;
+// The OPFS `Slot` impl is browser-only by construction — it holds JS values —
+// so it is target-gated rather than feature-gated. A native build cannot pull
+// web-sys in even by mistake.
+#[cfg(target_arch = "wasm32")]
+pub mod vfs_opfs;
 pub mod vfs_pool;
 pub mod wallclock;
 

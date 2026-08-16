@@ -60,6 +60,12 @@ js-sys = "=0.3.103"
 # Pulled in by the generated glue for every `async fn` binding. Pinned with the
 # rest: it depends on wasm-bindgen exactly.
 wasm-bindgen-futures = "=0.4.76"
+# OPFS bindings for the browser storage backend. Same exact-pin rule as the rest
+# of this block: web-sys pins wasm-bindgen exactly, so 0.2.126 forces 0.3.103.
+# Features are declared per-crate rather than here — web-sys gates every
+# interface behind one, and a workspace-wide list would compile bindings nothing
+# uses into every wasm artifact.
+web-sys = "=0.3.103"
 
 # Debug info for OUR code, none for our dependencies.
 #
