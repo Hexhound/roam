@@ -18,6 +18,13 @@ serde_json.workspace = true
 base64.workspace = true
 thiserror.workspace = true
 
+[features]
+# Exports `vfs::conformance` — the one suite every `VaultFs` backend must pass —
+# outside `cfg(test)`. The OPFS backend can only be run in a real browser, so
+# roam-wasm has to call it from a `#[wasm_bindgen]` export rather than from a
+# unit test. Off by default: a shipped artifact must not carry a test suite.
+conformance = []
+
 # `wallclock::now_ms` — `SystemTime::now()` traps on wasm32, so the browser
 # build reads the clock through `Date.now()` instead. Target-gated so a native
 # build cannot pull js-sys in.

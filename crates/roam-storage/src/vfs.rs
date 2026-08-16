@@ -411,107 +411,113 @@ impl VaultFs for MemFs {
     }
 }
 
+/// One conformance suite, run against every backend. A browser `VaultFs` must
+/// pass this same function — that is the point of it.
+///
+/// Reachable outside `cfg(test)` behind the `conformance` feature, because the
+/// OPFS backend can only be exercised in a real browser: the harness in
+/// `roam-wasm` calls this from a `#[wasm_bindgen]` export. The feature is off by
+/// default so a shipped artifact cannot contain it.
+#[cfg(any(test, feature = "conformance"))]
+pub fn conformance(fs: &dyn VaultFs, root: &Path) {
+    fs.create_dir_all(root).expect("create root");
+
+    let file = root.join("a.bin");
+    assert!(!fs.exists(&file), "must not exist before writing");
+    assert_eq!(
+        fs.read(&file).unwrap_err().kind(),
+        io::ErrorKind::NotFound,
+        "absent file must report NotFound, not a generic error"
+    );
+
+    fs.write(&file, b"hello").expect("write");
+    assert!(fs.exists(&file));
+    assert_eq!(fs.read(&file).unwrap(), b"hello");
+    assert_eq!(fs.file_len(&file).unwrap(), 5);
+    assert_eq!(fs.read_to_string(&file).unwrap(), "hello");
+
+    // Append extends, never rewrites — the op-log invariant.
+    fs.append(&file, b" world").expect("append");
+    assert_eq!(fs.read(&file).unwrap(), b"hello world");
+
+    // Append also creates.
+    let fresh = root.join("fresh.bin");
+    fs.append(&fresh, b"new").expect("append creates");
+    assert_eq!(fs.read(&fresh).unwrap(), b"new");
+
+    // append_sync must be semantically identical to append; only its
+    // durability promise differs. Both create-then-extend paths matter,
+    // since the native backend takes a different branch on create.
+    let durable = root.join("durable.bin");
+    fs.append_sync(&durable, b"first")
+        .expect("append_sync creates");
+    fs.append_sync(&durable, b"-second")
+        .expect("append_sync extends");
+    assert_eq!(fs.read(&durable).unwrap(), b"first-second");
+
+    // Ranged reads, including a clamped tail.
+    assert_eq!(fs.read_range(&file, 6, 5).unwrap(), b"world");
+    assert_eq!(fs.read_range(&file, 6, 99).unwrap(), b"world");
+    assert_eq!(fs.read_range(&file, 99, 4).unwrap(), b"");
+
+    // write() replaces rather than appends.
+    fs.write(&file, b"xyz").expect("overwrite");
+    assert_eq!(fs.read(&file).unwrap(), b"xyz");
+
+    // Pre-size + random-access write: the out-of-order blob chunk path.
+    // Chunks are written back-to-front here precisely because arrival order
+    // must not matter.
+    let part = root.join("blob.part");
+    fs.create_sized(&part, 8).expect("create_sized");
+    assert_eq!(fs.file_len(&part).unwrap(), 8, "must be pre-sized");
+    assert_eq!(fs.read(&part).unwrap(), vec![0u8; 8], "must be zero-filled");
+
+    fs.write_range(&part, 4, b"cdef").expect("write tail first");
+    fs.write_range(&part, 0, b"ab").expect("write head after");
+    assert_eq!(fs.read(&part).unwrap(), b"ab\0\0cdef");
+    assert_eq!(
+        fs.file_len(&part).unwrap(),
+        8,
+        "an in-range write must not change the file length"
+    );
+
+    // create_sized replaces any existing file rather than merging into it.
+    fs.create_sized(&part, 2).expect("resize");
+    assert_eq!(fs.read(&part).unwrap(), vec![0u8; 2]);
+    fs.remove_file(&part).expect("cleanup part");
+
+    // rename is the atomic-publish primitive.
+    let renamed = root.join("b.bin");
+    fs.rename(&file, &renamed).expect("rename");
+    assert!(!fs.exists(&file), "source must be gone after rename");
+    assert_eq!(fs.read(&renamed).unwrap(), b"xyz");
+
+    fs.set_owner_only(&renamed).expect("set_owner_only");
+
+    let listed = fs.read_dir(root).expect("read_dir");
+    assert!(listed.contains(&renamed), "read_dir must list {renamed:?}");
+    assert!(
+        !listed.contains(&file),
+        "read_dir must not list a renamed-away path"
+    );
+
+    fs.remove_file(&renamed).expect("remove");
+    assert!(!fs.exists(&renamed));
+    assert_eq!(
+        fs.remove_file(&renamed).unwrap_err().kind(),
+        io::ErrorKind::NotFound,
+        "removing twice must report NotFound"
+    );
+
+    assert_eq!(
+        fs.read_dir(&root.join("nope")).unwrap_err().kind(),
+        io::ErrorKind::NotFound
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// One conformance suite, run against every backend. A browser `VaultFs`
-    /// added later must pass this same function — that is the point of it.
-    fn conformance(fs: &dyn VaultFs, root: &Path) {
-        fs.create_dir_all(root).expect("create root");
-
-        let file = root.join("a.bin");
-        assert!(!fs.exists(&file), "must not exist before writing");
-        assert_eq!(
-            fs.read(&file).unwrap_err().kind(),
-            io::ErrorKind::NotFound,
-            "absent file must report NotFound, not a generic error"
-        );
-
-        fs.write(&file, b"hello").expect("write");
-        assert!(fs.exists(&file));
-        assert_eq!(fs.read(&file).unwrap(), b"hello");
-        assert_eq!(fs.file_len(&file).unwrap(), 5);
-        assert_eq!(fs.read_to_string(&file).unwrap(), "hello");
-
-        // Append extends, never rewrites — the op-log invariant.
-        fs.append(&file, b" world").expect("append");
-        assert_eq!(fs.read(&file).unwrap(), b"hello world");
-
-        // Append also creates.
-        let fresh = root.join("fresh.bin");
-        fs.append(&fresh, b"new").expect("append creates");
-        assert_eq!(fs.read(&fresh).unwrap(), b"new");
-
-        // append_sync must be semantically identical to append; only its
-        // durability promise differs. Both create-then-extend paths matter,
-        // since the native backend takes a different branch on create.
-        let durable = root.join("durable.bin");
-        fs.append_sync(&durable, b"first")
-            .expect("append_sync creates");
-        fs.append_sync(&durable, b"-second")
-            .expect("append_sync extends");
-        assert_eq!(fs.read(&durable).unwrap(), b"first-second");
-
-        // Ranged reads, including a clamped tail.
-        assert_eq!(fs.read_range(&file, 6, 5).unwrap(), b"world");
-        assert_eq!(fs.read_range(&file, 6, 99).unwrap(), b"world");
-        assert_eq!(fs.read_range(&file, 99, 4).unwrap(), b"");
-
-        // write() replaces rather than appends.
-        fs.write(&file, b"xyz").expect("overwrite");
-        assert_eq!(fs.read(&file).unwrap(), b"xyz");
-
-        // Pre-size + random-access write: the out-of-order blob chunk path.
-        // Chunks are written back-to-front here precisely because arrival order
-        // must not matter.
-        let part = root.join("blob.part");
-        fs.create_sized(&part, 8).expect("create_sized");
-        assert_eq!(fs.file_len(&part).unwrap(), 8, "must be pre-sized");
-        assert_eq!(fs.read(&part).unwrap(), vec![0u8; 8], "must be zero-filled");
-
-        fs.write_range(&part, 4, b"cdef").expect("write tail first");
-        fs.write_range(&part, 0, b"ab").expect("write head after");
-        assert_eq!(fs.read(&part).unwrap(), b"ab\0\0cdef");
-        assert_eq!(
-            fs.file_len(&part).unwrap(),
-            8,
-            "an in-range write must not change the file length"
-        );
-
-        // create_sized replaces any existing file rather than merging into it.
-        fs.create_sized(&part, 2).expect("resize");
-        assert_eq!(fs.read(&part).unwrap(), vec![0u8; 2]);
-        fs.remove_file(&part).expect("cleanup part");
-
-        // rename is the atomic-publish primitive.
-        let renamed = root.join("b.bin");
-        fs.rename(&file, &renamed).expect("rename");
-        assert!(!fs.exists(&file), "source must be gone after rename");
-        assert_eq!(fs.read(&renamed).unwrap(), b"xyz");
-
-        fs.set_owner_only(&renamed).expect("set_owner_only");
-
-        let listed = fs.read_dir(root).expect("read_dir");
-        assert!(listed.contains(&renamed), "read_dir must list {renamed:?}");
-        assert!(
-            !listed.contains(&file),
-            "read_dir must not list a renamed-away path"
-        );
-
-        fs.remove_file(&renamed).expect("remove");
-        assert!(!fs.exists(&renamed));
-        assert_eq!(
-            fs.remove_file(&renamed).unwrap_err().kind(),
-            io::ErrorKind::NotFound,
-            "removing twice must report NotFound"
-        );
-
-        assert_eq!(
-            fs.read_dir(&root.join("nope")).unwrap_err().kind(),
-            io::ErrorKind::NotFound
-        );
-    }
 
     #[test]
     fn native_fs_satisfies_the_contract() {
