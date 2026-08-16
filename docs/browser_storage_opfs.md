@@ -97,8 +97,15 @@ which is a bug to surface loudly rather than a condition to recover from.
 
 Do **not** try to grow the pool from inside a `VaultFs` method. There is no way
 to await there, and the alternatives (`Atomics.wait` on a `SharedArrayBuffer`
-with a proxy worker) require cross-origin isolation — COOP/COEP headers that
-would also break embedding third-party resources, which CareMate does.
+with a proxy worker) require cross-origin isolation — COOP/COEP headers, plus a
+Safari-specific build, for a problem the worker's message loop solves for free.
+
+(An earlier version of this paragraph also claimed COOP/COEP "would break
+embedding third-party resources, which CareMate does". That was wrong: CareMate's
+Dart contains no `NetworkImage`, `WebView` or `HtmlElementView`, and its only
+cross-origin runtime fetches are CORS-capable model downloads belonging to
+features that are not web-enabled. The header cost is real but smaller than
+stated.)
 
 ### Durability
 

@@ -144,12 +144,63 @@ the checks share a vault — every check inserted text at position 0, and their
 writes interleaved into one string. Durability couples tests to each other; that
 is exactly the failure mode `MemFs` never exhibits.
 
-## Still open
+## Flutter web ↔ roam-wasm: why frb's thread pool cannot host this
 
-- **Flutter web ↔ roam-wasm.** The named spike, and the real unknown.
-  `flutter_rust_bridge` 2.11.1 runs Rust on the main thread by default on web,
-  which the probe rules out. Either frb has a worker mode that fits, or the web
-  client talks to `roam-worker.js` over `dart:js_interop` and skips frb entirely.
+The named spike, now run. The question was whether roam's storage could live
+inside `flutter_rust_bridge`'s SharedArrayBuffer thread pool instead of a worker
+of its own — which would have kept one bridge for all platforms.
+
+It cannot, and the reason is a property of the browser, not of frb. wasm threads
+are separate **agents**: they share linear memory but not the JS heap, and a
+`JsValue` is an index into a per-agent table. So the question reduces to whether
+a sync access handle can cross an agent boundary. Measured, Chromium 151:
+
+| attempt | result |
+|---|---|
+| `structuredClone(handle)` in the same agent | `DataCloneError` — cannot be cloned |
+| `postMessage(handle)` to the page | `DataCloneError` |
+| `postMessage(handle)` to another worker | `DataCloneError` |
+| `postMessage(handle, [handle])` as a transferable | `DataCloneError` — "does not have a transferable type" |
+| another agent opening the same file while the first holds it | `NoModificationAllowedError` |
+
+The last row is what closes the door. A handle can neither be *moved* to another
+thread nor *re-opened* there, so whichever thread opens the pool must be the only
+thread that ever touches it — for the life of the pool. frb's default pool is
+[four threads](https://github.com/fzyzcjy/flutter_rust_bridge/discussions/1007)
+with no affinity guarantee, so this is unsound rather than slow: the failure is a
+`NoModificationAllowedError` on whichever call happens to land elsewhere.
+
+This is also the measurement behind the `unsafe impl Send + Sync for OpfsSlot` in
+`vfs_opfs.rs`. Its justification — "exactly one thread per agent on wasm32" — is
+true only while roam owns its worker. Enabling wasm threading would falsify it,
+and nothing in the type system would notice.
+
+frb is not *strictly* ruled out: a custom `BaseThreadPool` with a single thread
+would restore affinity. But that gives up frb's concurrency entirely, still
+requires COOP/COEP and a separate Safari build (Safari cannot spawn nested
+workers), and leans on an undocumented invariant — while buying nothing over a
+worker roam already owns.
+
+**So: the web client talks to `roam-worker.js` directly.** CareMate already has
+the seam for it — `lib/data/sync/vault_port.dart` is a 22-method abstraction with
+one implementation today (`roam_vault_port.dart`, frb-backed); web adds a second,
+and nothing above the port changes. frb stays for Android and iOS.
+
+Three things that implementation has to solve, none of them yet built:
+
+- **Binary.** `putBlob`/`getBlob` are `List<int>`; the protocol carries JSON
+  only. Needs transferables.
+- **`Stream<VaultChange> get changes`.** Needs an unsolicited push channel; the
+  worker only pushes `{panic}` today.
+- **`String get bucketId`** is the port's one synchronous getter. Derivable from
+  the vault key, so cache it at open.
+
+The standing cost of this route is that the protocol is a hand-written contract
+in three places (Rust enum ↔ JSON ↔ Dart), where frb's codegen would have kept
+two of them in step automatically. `tests/session.rs` guards the Rust half; the
+Dart half will need its own.
+
+## Still open
 - **Pairing a browser session.** Relay leaf only — no iroh, no LAN. Until it
   exists, `openOnOpfs` always founds a new vault.
 - **Blobs over the protocol.** No command carries binary yet; attachments will
