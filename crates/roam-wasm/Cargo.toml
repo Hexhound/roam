@@ -15,11 +15,17 @@ roam-storage = { path = "../roam-storage" }
 roam-backend-client = { path = "../roam-backend-client" }
 anyhow = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
+# The worker's command protocol (`session`) is plain Rust so it can be tested
+# natively, which means its JSON handling has to be a plain dependency too — not
+# the wasm-only one the test-relay used to carry.
+serde = { workspace = true }
+serde_json = { workspace = true }
+base64 = { workspace = true }
 
 [features]
 # Exports a MemoryBackend-backed relay so the node harness can serve real HTTP.
 # Off by default: the shipped browser artifact must not contain a test double.
-test-relay = ["dep:serde_json"]
+test-relay = []
 
 # Exports the OPFS storage checks for the headless-browser harness. These need
 # `roam-storage/conformance`, which lifts the one suite every `VaultFs` must pass
@@ -34,7 +40,6 @@ browser-test = ["roam-storage/conformance"]
 # stays plain Rust with plain `CrdtError`.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = { workspace = true }
-serde_json = { workspace = true, optional = true }
 wasm-bindgen-futures = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]

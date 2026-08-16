@@ -1,0 +1,91 @@
+// The Web Worker that hosts roam in a browser.
+//
+// This file is a shipped artifact, not test scaffolding. It exists because roam
+// *cannot* run on a page's main thread: OPFS sync access handles are absent
+// there — the property is `undefined`, so it is not a permission that can be
+// granted (measured in Chromium 150 and 151; see
+// `docs/browser_storage_opfs.md`). Storage is what forces the worker, and the
+// worker is what forces a message protocol.
+//
+// It deliberately holds no logic. Every decision about what a command means
+// lives in `roam_wasm::session`, which is plain Rust and covered by
+// `tests/session.rs` — because anything implemented here could only ever be
+// tested in a browser. What is left below is transport: parse, forward,
+// serialize, reply.
+//
+// Protocol, page -> worker:
+//
+//   { id, type: 'open', modulePath, vaultKey: [32 bytes], relayUrl }
+//   { id, command: 'setEntry', container, key, value }   // any session command
+//
+// and worker -> page, always exactly one reply per request:
+//
+//   { id, ok: <value> } | { id, error: '…' }
+//
+// A worker -> page message with no `id` is unsolicited: `{ panic }`.
+
+let session = null;
+
+// Panic text has to reach the page the instant it is produced. A wasm32 panic
+// is an ABORT: it kills this worker outright, so nothing accumulated here
+// survives to be reported, and every in-flight reply is lost with it. The Rust
+// panic hook writes the message to console.error just before the trap, which is
+// the only moment the text exists anywhere.
+const realConsoleError = console.error.bind(console);
+console.error = (...args) => {
+  self.postMessage({ panic: args.join(' ') });
+  realConsoleError(...args);
+};
+
+// Commands run strictly one at a time.
+//
+// This is not throughput caution, it is correctness: `Session.handle` tops the
+// slot pool up before dispatching, and topping up reads the pool's capacity and
+// then awaits `createSyncAccessHandle`. Two overlapping calls would both read
+// the same capacity and both try to open the same slot index — and OPFS
+// enforces exclusivity, so the second fails with `NoModificationAllowedError`.
+// The queue is here rather than in Rust because this is where requests arrive;
+// `Session.handle` documents that it must not be called re-entrantly.
+let queue = Promise.resolve();
+
+const enqueue = (work) => {
+  const result = queue.then(work);
+  // Keep the chain alive: an unhandled rejection would poison every later
+  // command, turning one failure into a permanently dead worker.
+  queue = result.catch(() => {});
+  return result;
+};
+
+const open = async ({ modulePath, vaultKey, relayUrl }) => {
+  // Imported dynamically so the page decides where the wasm bundle lives.
+  // Flutter web serves assets from a path that is not known at build time here.
+  const wasm = await import(modulePath);
+  await wasm.default();
+  session = await wasm.Session.openOnOpfs(new Uint8Array(vaultKey), relayUrl);
+};
+
+self.onmessage = (event) => {
+  const request = event.data;
+  const id = request?.id ?? null;
+
+  enqueue(async () => {
+    try {
+      if (request?.type === 'open') {
+        await open(request);
+        self.postMessage({ id, ok: null });
+        return;
+      }
+      if (session === null) {
+        throw new Error("send { type: 'open' } before any command");
+      }
+      // The reply is already a JSON envelope carrying this id; parse it back
+      // into an object so the page gets structured data rather than a string.
+      self.postMessage(JSON.parse(await session.handle(JSON.stringify(request))));
+    } catch (e) {
+      // Never leave a request unanswered. A page awaiting a promise that never
+      // settles has no timeout and no error to show — strictly worse than a
+      // failure it can report.
+      self.postMessage({ id, error: String(e?.message ?? e) });
+    }
+  });
+};

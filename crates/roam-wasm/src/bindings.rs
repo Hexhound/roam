@@ -8,6 +8,25 @@ use crate::doc::Doc;
 use roam_crdt::CrdtError;
 use wasm_bindgen::prelude::*;
 
+/// Route panic messages to `console.error` before the process aborts.
+///
+/// wasm32 panics are **aborts**, not unwinds. Without this hook a panic reaches
+/// JS as a bare `RuntimeError: unreachable`, the message having never left the
+/// module — and in a worker that abort also kills every pending reply, so the
+/// page is left with unsettled promises and no diagnosis. This is not test
+/// scaffolding: it is the only way a shipped browser build can say what went
+/// wrong.
+#[wasm_bindgen(start)]
+pub fn report_panics() {
+    std::panic::set_hook(Box::new(|info| console_error(&info.to_string())));
+}
+
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_namespace = console, js_name = error)]
+    fn console_error(message: &str);
+}
+
 /// `CrdtError` carries no JS-meaningful structure, so it crosses the boundary
 /// as its `Display` string. Callers get a normal JS `Error`.
 fn to_js(error: CrdtError) -> JsError {
@@ -86,7 +105,9 @@ fn any_to_js(error: anyhow::Error) -> JsError {
 ///   link to read my notes" flow needs a *reader-scoped* key, which does not
 ///   exist yet — that is F1 read-scoping. Until then a leaked link would be a
 ///   whole-vault compromise, so this API deliberately offers no link helper.
-/// * Storage is currently `MemFs`: correct, but gone when the tab closes.
+/// * Storage here is `MemFs`: correct, but gone when the tab closes. For a
+///   durable vault use `Session.openOnOpfs`, which is what the worker runs; this
+///   type remains for callers that genuinely want a scratch vault.
 #[wasm_bindgen(js_name = Vault)]
 pub struct WasmVault {
     inner: Vault,
@@ -167,6 +188,98 @@ impl WasmVault {
     pub async fn sync(&self, base_url: String) -> Result<(), JsError> {
         let backend = Arc::new(roam_backend_client::http::HttpBackend::new(&base_url));
         self.inner.sync(&backend).await.map_err(any_to_js)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// M4 — a durable session, hosted in a dedicated Web Worker.
+// ---------------------------------------------------------------------------
+
+use crate::session::Session;
+use roam_backend_client::http::HttpBackend;
+use roam_storage::vfs_opfs::{self, OpfsPool};
+
+/// How many slots to open at mount, and how many free ones to keep ahead of the
+/// next command.
+///
+/// Both are starting values, not measured ones. What sets the floor is that a
+/// vault's fixed files (identity, founder pin, roster and key logs, this
+/// device's op log, the snapshot) are on the order of ten, and everything above
+/// that is one slot per blob chunk. What sets `KEEP_FREE` is that a single
+/// command must never be able to exhaust the pool: there is nowhere to `await` a
+/// refill inside a synchronous `VaultFs` call, so exhaustion mid-command is a
+/// provisioning bug, not a recoverable condition.
+///
+/// Opening a slot is one `createSyncAccessHandle`, so the mount cost is linear
+/// in `MOUNT_CAPACITY` — the reason not to simply open a thousand.
+const MOUNT_CAPACITY: usize = 64;
+const KEEP_FREE: usize = 16;
+
+/// A vault open on OPFS, driven by JSON commands.
+///
+/// This is what `worker/roam-worker.js` wraps, and it only works inside a
+/// dedicated Web Worker: OPFS sync access handles do not exist on a document's
+/// main thread. Constructing one from a page fails at [`open_on_opfs`] with a
+/// message saying so.
+///
+/// [`open_on_opfs`]: WasmSession::open_on_opfs
+#[wasm_bindgen(js_name = Session)]
+pub struct WasmSession {
+    /// Held for its lifetime, not just to grow: dropping an `OpfsPool` closes
+    /// every sync access handle, and a closed pool's `VaultFs` cannot read.
+    pool: OpfsPool,
+    inner: Session<HttpBackend>,
+}
+
+#[wasm_bindgen(js_class = Session)]
+impl WasmSession {
+    /// Open (or reopen) the vault `vaultKey` addresses, in this origin's OPFS.
+    ///
+    /// The pool directory is *derived from the vault key* rather than passed in.
+    /// That is what makes reopening automatic — the same key finds the same
+    /// files — and it keeps two vaults in one origin from colliding, which would
+    /// not be a merge but a `NoModificationAllowedError` at mount. The derived
+    /// name is the bucket id, which is already the opaque public name for this
+    /// vault, so it discloses nothing that the relay does not already hold.
+    #[wasm_bindgen(js_name = openOnOpfs)]
+    pub async fn open_on_opfs(vault_key: &[u8], relay_url: String) -> Result<WasmSession, JsError> {
+        let key: [u8; 32] = vault_key
+            .try_into()
+            .map_err(|_| JsError::new("vaultKey must be exactly 32 bytes"))?;
+
+        let bucket = roam_backend_client::crypto::VaultKey(key).bucket_id();
+        let pool = vfs_opfs::mount(&format!(".roam-{bucket}"), MOUNT_CAPACITY)
+            .await
+            .map_err(|e| JsError::new(&format!("mount OPFS pool: {e}")))?;
+
+        let vault = Vault::open(pool.fs(), key).map_err(any_to_js)?;
+        Ok(WasmSession {
+            pool,
+            inner: Session::new(vault, Arc::new(HttpBackend::new(&relay_url))),
+        })
+    }
+
+    /// Handle one JSON request, returning the JSON reply.
+    ///
+    /// The pool is topped up *here*, between commands, because this is the only
+    /// place in the whole design where awaiting is possible: `VaultFs` is
+    /// synchronous, and opening an OPFS handle is not. Growth failing is
+    /// reported as an error rather than ignored — a command run against a pool
+    /// that could not grow would fail later with `StorageFull`, and blaming the
+    /// write is much less useful than blaming the quota.
+    ///
+    /// NOT RE-ENTRANT. Two overlapping calls would both observe the same pool
+    /// capacity across the `await` and then try to open the same slot index;
+    /// OPFS enforces exclusivity, so the second fails with
+    /// `NoModificationAllowedError`. `worker/roam-worker.js` serializes requests
+    /// for this reason.
+    pub async fn handle(&self, request: String) -> String {
+        if let Err(e) = self.pool.ensure_free(KEEP_FREE).await {
+            return format!(
+                r#"{{"id":null,"error":"could not reserve storage before the command: {e}"}}"#
+            );
+        }
+        self.inner.handle(&request).await
     }
 }
 

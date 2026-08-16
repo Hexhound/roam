@@ -18,10 +18,12 @@
 //! # Storage
 //!
 //! [`Vault::in_memory`] runs on `MemFs`, which is real and correct but *not*
-//! durable — closing the tab loses the vault. The durable browser backend is an
-//! OPFS `VaultFs` implementation, which is deliberately still to come; see the
-//! handoff doc. Storage is a constructor argument precisely so that swap is a
-//! one-line change here.
+//! durable — closing the tab loses the vault. [`Vault::open`] takes the backend
+//! as an argument, so the durable browser path is the same code over
+//! `roam_storage::vfs_opfs`; see `docs/browser_storage_opfs.md`.
+//!
+//! Durability is not just a swap of the `VaultFs`, though — it changes what
+//! "open" has to mean. See [`Vault::open`].
 
 use roam_backend_client::crypto::VaultKey;
 use roam_backend_client::sync::reconcile_once;
@@ -36,6 +38,11 @@ use tokio::sync::Mutex;
 /// works — `MemFs` and OPFS both treat it as an opaque key prefix.
 const ROOT: &str = "/vault";
 
+/// This device's signing key, inside the same storage backend as everything
+/// else. On OPFS that means it never leaves the origin's private filesystem —
+/// in particular it is never in `localStorage`, which is XSS-readable.
+const IDENTITY: &str = "/vault/identity.key";
+
 /// Cloning shares one vault (the store is behind an `Arc`), it does not copy
 /// one. The `wasm_bindgen` async methods need an owned handle to move into the
 /// returned future, which is the only reason this is `Clone`.
@@ -46,7 +53,7 @@ pub struct Vault {
 }
 
 impl Vault {
-    /// Open a vault on the given storage backend, founding it as Admin.
+    /// Open a vault on the given storage backend, creating it on first use.
     ///
     /// `vault_key` is the shared secret every device of a vault holds; it
     /// derives the bucket id and the content keys, so two `Vault`s built with
@@ -55,11 +62,40 @@ impl Vault {
     /// SECURITY: this key is the whole vault. It must never be persisted in
     /// `localStorage` or handed over in a URL fragment — see the module notes in
     /// `bindings` and the handoff doc's F1 dependency.
+    ///
+    /// # Both steps here are conditional, and that is the point
+    ///
+    /// Until storage was durable this function could generate a fresh identity
+    /// and declare a founder unconditionally, because every open *was* a first
+    /// open — `MemFs` starts empty every time. Against OPFS both are wrong on
+    /// the second open, and not subtly: a new identity every reload makes the
+    /// device a stranger to its own op log, and `declare_founder` returns
+    /// `"vault founder already pinned"`, so reopening would simply fail.
+    ///
+    /// This is the class of bug `MemFs` structurally cannot catch, which is why
+    /// `tests/durable_vault.rs` runs against a remounted slot pool instead.
+    ///
+    /// KNOWN GAP: a device that *joins* an existing vault must not found one of
+    /// its own. Nothing here can tell the two cases apart yet, because browser
+    /// pairing does not exist — when it does, joining must supply the roster out
+    /// of band and take the `already founded` path.
     pub fn open(fs: Arc<dyn VaultFs>, vault_key: [u8; 32]) -> anyhow::Result<Self> {
-        let mut store = Store::open_with_fs(Path::new(ROOT), Identity::generate(), fs)?;
-        // Founding as Admin mirrors the native e2e setup: a device's own vouch
-        // must fold before its local writes are permitted.
-        store.declare_founder(Role::Admin)?;
+        let identity_path = Path::new(IDENTITY);
+        let identity = match Identity::load_with_fs(&*fs, identity_path) {
+            Ok(existing) => existing,
+            Err(_) => {
+                let fresh = Identity::generate();
+                fresh.save_with_fs(&*fs, identity_path)?;
+                fresh
+            }
+        };
+
+        let mut store = Store::open_with_fs(Path::new(ROOT), identity, fs)?;
+        if store.founder_pin().is_none() {
+            // Founding as Admin mirrors the native e2e setup: a device's own
+            // vouch must fold before its local writes are permitted.
+            store.declare_founder(Role::Admin)?;
+        }
         Ok(Self {
             store: Arc::new(Mutex::new(store)),
             key: VaultKey(vault_key),

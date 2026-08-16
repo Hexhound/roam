@@ -9,6 +9,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 const rootDir = path.dirname(new URL(import.meta.url).pathname);
+// The shipped worker lives outside the harness, and is served FROM ITS SOURCE
+// rather than copied in. A copy is a second thing to keep in step, and a stale
+// one would let the checks pass against a worker nobody ships.
+const workerDir = path.resolve(rootDir, '../../worker');
 const port = Number(process.env.PORT ?? 8732);
 const timeoutMs = Number(process.env.TIMEOUT_MS ?? 120000);
 
@@ -47,10 +51,13 @@ const server = http.createServer((req, res) => {
   }
 
   const requested = req.url === '/' ? '/index.html' : req.url.split('?')[0];
-  // Serve only from under the harness directory; a traversal here would expose
-  // the whole repo to a page.
-  const target = path.join(rootDir, path.normalize(requested));
-  if (!target.startsWith(rootDir)) {
+  // Serve only from under the harness directory, plus the crate's `worker/`;
+  // a traversal here would expose the whole repo to a page.
+  const [baseDir, relative] = requested.startsWith('/worker/')
+    ? [workerDir, requested.slice('/worker'.length)]
+    : [rootDir, requested];
+  const target = path.join(baseDir, path.normalize(relative));
+  if (!target.startsWith(baseDir)) {
     res.writeHead(403);
     res.end('forbidden');
     return;

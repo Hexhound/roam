@@ -1,12 +1,21 @@
 <!doctype html>
 <!--
-  The page exists only to start the worker and relay its report back to the
-  runner. Nothing storage-related happens here on purpose: OPFS sync access
-  handles do not exist on the main thread.
+  The page runs two suites in sequence and reports both:
+
+    1. the OPFS storage checks, in a worker of their own — they assert the
+       browser's own behaviour, so they have to be where the sync access handles
+       are;
+    2. the session checks, which drive the SHIPPED worker
+       (`worker/roam-worker.js`) from the page, the way a real app does.
+
+  Nothing storage-related happens on the page itself, on purpose: OPFS sync
+  access handles do not exist on the main thread.
 -->
 <html>
 <body><pre id="out">running</pre>
 <script type="module">
+import { runSessionChecks } from './session-checks.mjs';
+
 const report = async (failed, results) => {
   document.getElementById('out').textContent = results.join('\n');
   await fetch('/report', {
@@ -20,23 +29,47 @@ const report = async (failed, results) => {
 // so a crash can still say what actually failed.
 const panics = [];
 
-const worker = new Worker('worker.js', { type: 'module' });
-worker.onmessage = (e) => {
-  if (e.data.panic !== undefined) {
-    panics.push(e.data.panic);
-    return;
-  }
-  report(e.data.failed, e.data.results);
-};
-worker.onerror = (e) =>
-  report(1, [
-    'worker crashed: ' + e.message,
-    ...panics.map((p) => '      ' + p),
-  ]);
+const storageChecks = new Promise((resolve) => {
+  const worker = new Worker('worker.js', { type: 'module' });
+  worker.onmessage = (e) => {
+    if (e.data.panic !== undefined) {
+      panics.push(e.data.panic);
+      return;
+    }
+    resolve(e.data);
+  };
+  worker.onerror = (e) =>
+    resolve({
+      failed: 1,
+      results: [
+        'storage worker crashed: ' + e.message,
+        ...panics.map((p) => '      ' + p),
+      ],
+    });
+});
 
-// A worker that never answers must not leave the runner hanging until its own
-// timeout; say so instead.
-setTimeout(() => report(1, ['the worker did not report within 60s']), 60000);
+// A suite that never answers must not leave the runner hanging until the
+// server's own timeout; say so instead, while there is still a page to say it.
+const deadline = setTimeout(
+  () => report(1, ['the checks did not report within 120s']),
+  120000
+);
+
+(async () => {
+  const storage = await storageChecks;
+  let session;
+  try {
+    session = await runSessionChecks();
+  } catch (e) {
+    session = { failed: 1, results: ['session checks threw: ' + e] };
+  }
+  clearTimeout(deadline);
+  await report(storage.failed + session.failed, [
+    ...storage.results,
+    '',
+    ...session.results,
+  ]);
+})();
 </script>
 </body>
 </html>

@@ -268,8 +268,14 @@ complementary.
   the `Send + Sync` question went the *wrapper* way, not the cfg'd-bound way,
   because `Store` holds `Arc<dyn VaultFs>` and auto traits do not elaborate onto
   a trait object through a named supertrait — the trick `Backend` uses would not
-  have worked. And the swap really is one argument, but nothing calls it yet:
-  `Vault::in_memory` is still `MemFs` until the hosting worker exists.
+  have worked. The swap really is one argument, and it is now made: the worker
+  that hosts roam calls it (`docs/browser_worker.md`), and `Vault::in_memory`
+  survives only as the `MemFs` path the native tests use.
+
+  One thing the original plan did not anticipate: durability changed what *open*
+  has to mean. `Vault::open` generated an identity and declared a founder every
+  time — harmless under `MemFs`, where every open is a first open, and fatal on
+  the second open against OPFS.
 - **No `roam-files`**, so no folder mirroring in the browser (18 fs sites,
   still a product question — see "What M2 does NOT cover").
 

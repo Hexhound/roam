@@ -24,24 +24,9 @@ use wasm_bindgen::prelude::*;
 
 const CAPACITY: usize = 48;
 
-/// Route panic messages to `console.error` before the abort.
-///
-/// wasm32 panics are aborts, so a failed `assert!` inside [`conformance`]
-/// surfaces in JS as a bare `RuntimeError: unreachable` with the message lost.
-/// The harness captures `console.error` in the worker to recover it — without
-/// this, a failing conformance check tells you nothing about which assertion
-/// broke.
-#[wasm_bindgen(start)]
-pub fn report_panics() {
-    std::panic::set_hook(Box::new(|info| {
-        error(&info.to_string());
-    }));
-}
-
-#[wasm_bindgen(js_namespace = console)]
-extern "C" {
-    fn error(message: &str);
-}
+// The panic hook these checks depend on lives in `bindings`, unconditionally: a
+// shipped worker needs it for exactly the same reason a test one does. Without
+// it a failing assertion here reads as `RuntimeError: unreachable`.
 
 fn js(e: std::io::Error) -> JsError {
     JsError::new(&e.to_string())

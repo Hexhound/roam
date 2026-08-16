@@ -173,12 +173,18 @@ Two things the harness needs that are easy to get wrong:
   immediately; without that, a real failure reads only as
   `RuntimeError: unreachable`.
 
-## Still open
+## What came next
 
-- **Nothing calls `mount` in anger yet.** `Vault::in_memory` is still `MemFs`;
-  wiring OPFS in belongs with the worker that hosts it.
-- **The worker itself.** Message loop, command dispatch, and the
-  `ensure_free` top-up between commands.
-- **Capacity policy.** How many slots to open at mount, and how far ahead to keep
-  the free list, are both unmeasured. `free_slots()` and `capacity()` are exposed
-  for whatever policy the worker settles on.
+The worker that calls `mount` in anger, the command protocol it speaks, and the
+capacity policy that keeps the pool from running dry are all M4 —
+`browser_worker.md`. Two things this doc left open resolved there, and both are
+worth knowing before reading the code:
+
+- **Durability changed what "open a vault" means.** Persisting the path map was
+  only half of it; `Vault::open` was also generating a fresh identity and
+  declaring a founder on every open, which is invisible under `MemFs` and fatal
+  on the second open against OPFS.
+- **A terminated worker does release its handles.** Nothing calls `close()` when
+  a tab dies — `terminate()` does not run Rust's `Drop` — so the browser has to,
+  and now a check proves it does. Otherwise closing a tab would leave the vault
+  locked by `NoModificationAllowedError`.

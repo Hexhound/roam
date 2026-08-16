@@ -9,9 +9,11 @@
 //!   interesting can only be tested through a browser.
 
 mod doc;
+mod session;
 mod vault;
 
 pub use doc::Doc;
+pub use session::{Command, Session};
 pub use vault::Vault;
 
 #[cfg(target_arch = "wasm32")]
