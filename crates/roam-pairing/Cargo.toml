@@ -15,6 +15,9 @@ roam-pake = { path = "../roam-pake" }
 anyhow.workspace = true
 async-trait.workspace = true
 base64.workspace = true
+# The same client the backend sync uses, and for the same reason: it is the one
+# HTTP stack in this workspace that compiles for both native and wasm32.
+reqwest = { workspace = true }
 rand.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
@@ -32,7 +35,16 @@ wasm-bindgen = { workspace = true }
 wasm-bindgen-futures = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+# `net` + `io-util`: the HTTP test stands up a real relay on a real socket, so
+# the status-code and URL contract with the Elixir routes is exercised rather
+# than assumed.
+tokio = { workspace = true, features = [
+  "macros",
+  "rt-multi-thread",
+  "time",
+  "net",
+  "io-util",
+] }
 tempfile.workspace = true
 # The tests implement a deliberately-dishonest `Mailbox` to play a tampering
 # relay, which needs the same attribute the trait is declared with.

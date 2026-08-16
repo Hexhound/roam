@@ -28,11 +28,13 @@
 
 pub mod accept;
 pub mod handshake;
+pub mod http;
 pub mod invite;
 pub mod mailbox;
 
 pub use accept::{adopt_accept, enrol_joiner, JoinAccept, Joined};
 pub use handshake::{host_via_mailbox, join_via_mailbox, MailboxHost, PakeError};
+pub use http::HttpMailbox;
 pub use invite::Invite;
 pub use mailbox::{Mailbox, MemoryMailbox, Slot, SlotOutcome};
 pub use roam_pake::{PairingCode, MAX_ATTEMPTS};

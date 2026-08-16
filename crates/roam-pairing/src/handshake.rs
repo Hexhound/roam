@@ -466,8 +466,23 @@ async fn join_via_mailbox_inner<M: Mailbox>(
         bail!("pairing confirmation slot was already written — abandoning");
     }
 
+    // A joiner CANNOT be told its code was wrong, and that is not an oversight:
+    // the host's confirmation is the only value a guesser could test candidates
+    // against, so the host withholds it from anyone who has not already proved
+    // the code. The observable result of a wrong code is therefore silence, and
+    // silence is indistinguishable from a host that closed the window or went
+    // offline.
+    //
+    // Nothing can be done about the ambiguity without handing over the oracle.
+    // What can be done is to stop reporting the most likely cause as an
+    // inscrutable protocol timeout — "waiting for the other device to write
+    // `confirm-host`" is true and useless to the person who mistyped a digit.
     let their_confirm: [u8; 32] = await_slot(mailbox, &session, Slot::ConfirmHost, step, poll)
-        .await?
+        .await
+        .context(
+            "the other device did not answer — most likely the code was wrong, \
+             or its pairing window has closed. Ask for a fresh code and try again",
+        )?
         .try_into()
         .map_err(|_| anyhow::anyhow!("malformed confirmation"))?;
     // Mutual authentication completes here. Nothing above this line may be

@@ -552,6 +552,73 @@ impl<T: Transport + 'static> Engine<T> {
         Ok(())
     }
 
+    // -- pairing -------------------------------------------------------------
+
+    /// Host a pairing invite through a relay mailbox, and accept one joiner.
+    ///
+    /// This is how a device that cannot be dialled — a browser tab, which has no
+    /// UDP socket and can never be an iroh peer — is let into the vault. The
+    /// two other flows both require dialling, so without this an embedder on the
+    /// web could hold a vault and sync it but never be admitted to one.
+    ///
+    /// `show` is called once, with the six-digit code and the public invite,
+    /// *before* the wait begins — an embedder wires it to whatever displays
+    /// them. They travel by different routes on purpose: the invite carries no
+    /// secret and can go in a QR or a link, while the code is the only thing
+    /// that authenticates and should be read aloud or typed. Put both in one QR
+    /// and you are no worse off than the bearer-token flow; separate them and
+    /// you are meaningfully better off. See [`roam_pairing::invite`].
+    ///
+    /// # This holds the store lock for the whole window
+    ///
+    /// Enrolment mutates the roster, so the host needs the store, and it cannot
+    /// know when a joiner will appear. Sync therefore stalls for as long as the
+    /// code is showing. That is deliberate and matches the other two pairing
+    /// flows, which take `&mut Store` for the same reason — pairing is a
+    /// user-present action measured in seconds. Pass a `window` you are willing
+    /// to stall for; [`roam_pairing::handshake::DEFAULT_WINDOW`] is five minutes.
+    ///
+    /// Returns the joined peer's loro id. The joiner is gossiped to the rest of
+    /// the mesh on the way out — a new member nobody else hears about would be
+    /// invisible until the next reconnect.
+    pub async fn host_invite<M: roam_pairing::Mailbox>(
+        &self,
+        mailbox: M,
+        invite: roam_pairing::Invite,
+        role: roam_storage::Role,
+        window: std::time::Duration,
+        show: impl FnOnce(&roam_pairing::PairingCode, &roam_pairing::Invite),
+    ) -> anyhow::Result<u64> {
+        let peer = {
+            let mut store = self.store.lock().await;
+            let (code, host) = roam_pairing::host_via_mailbox(
+                &self.identity,
+                self.vault,
+                *self.vault_key,
+                role,
+                &mut store,
+                mailbox,
+                invite,
+            );
+            show(&code, host.invite());
+            host.accept_for(window).await?
+        };
+        // The roster gained a member. Same contract as `set_role`: a change the
+        // mesh never hears about is not a change.
+        self.broadcast_own_roster().await;
+        Ok(peer)
+    }
+
+    /// Mint an invite naming this device, for [`host_invite`](Self::host_invite).
+    ///
+    /// Separate so a caller can show or store the rendezvous before arming the
+    /// host — and because binding this device's key into it is not optional:
+    /// the key is what the joiner's SPAKE2 run uses as the responder identity,
+    /// so an invite built with somebody else's key fails as a wrong code.
+    pub fn mint_invite(&self, relay_base_url: &str) -> roam_pairing::Invite {
+        roam_pairing::Invite::generate(relay_base_url, self.identity.verifying_key().to_bytes())
+    }
+
     // -- epoch keys ----------------------------------------------------------
 
     /// Mint a new epoch, wrapped to every active member and optionally to a

@@ -17,6 +17,7 @@ roam-transport-iroh = { path = "../roam-transport-iroh" }
 roam-files = { path = "../roam-files" }
 roam-backend-client = { path = "../roam-backend-client" }
 roam-pake = { path = "../roam-pake" }
+roam-pairing = { path = "../roam-pairing" }
 roam-share = { path = "../roam-share" }
 roam-share-iroh = { path = "../roam-share-iroh" }
 iroh.workspace = true

@@ -94,6 +94,46 @@ enum Command {
         #[arg(long)]
         name: Option<String>,
     },
+    /// Host a pairing invite through a relay, for a device that cannot be dialled.
+    ///
+    /// The other two flows both require reaching the joiner directly — over QUIC
+    /// with a token, or over the LAN with mDNS. A browser tab can do neither, so
+    /// this carries the handshake through the relay's mailbox instead. It also
+    /// works across the internet for two devices that are not on one network.
+    ///
+    /// Two things come out, and they should travel by DIFFERENT routes: the
+    /// invite carries no secret and can go in a QR, a link or a chat message,
+    /// while the six digits are the only thing that authenticates and should be
+    /// read aloud. Send both together and this is no better than `pair-token`;
+    /// send them apart and a leaked QR gives away nothing.
+    PairRelay {
+        #[arg(long)]
+        vault: PathBuf,
+        #[arg(long)]
+        identity: PathBuf,
+        /// Base URL of the relay carrying the mailbox.
+        #[arg(long)]
+        relay: String,
+        /// Role to grant the invitee: reader|writer|admin.
+        #[arg(long, default_value = "admin")]
+        role: String,
+        /// How long to keep the code showing, in seconds.
+        #[arg(long, default_value = "300")]
+        seconds: u64,
+    },
+    /// Join a vault through a relay, using an invite and the code that came with it.
+    JoinRelay {
+        #[arg(long)]
+        vault: PathBuf,
+        #[arg(long)]
+        identity: PathBuf,
+        /// The invite string printed by `roam pair-relay`.
+        #[arg(long)]
+        invite: String,
+        /// The six digits shown on the host.
+        #[arg(long)]
+        code: String,
+    },
     /// Join a vault over the LAN by typing the code shown on the other device.
     JoinLan {
         #[arg(long)]
@@ -335,6 +375,19 @@ async fn main() -> Result<()> {
             role,
             name,
         } => pair_lan(&vault, &identity, &role, name.as_deref()).await,
+        Command::PairRelay {
+            vault,
+            identity,
+            relay,
+            role,
+            seconds,
+        } => pair_relay(&vault, &identity, &relay, &role, seconds).await,
+        Command::JoinRelay {
+            vault,
+            identity,
+            invite,
+            code,
+        } => join_relay(&vault, &identity, &invite, &code).await,
         Command::JoinLan {
             vault,
             identity,
@@ -624,6 +677,82 @@ async fn pair_lan(
     // they did not read.
     let peer = host.accept_auto().await.context("accept LAN join")?;
     println!("paired peer: {peer}");
+    Ok(())
+}
+
+async fn pair_relay(
+    vault: &Path,
+    identity_path: &Path,
+    relay: &str,
+    role: &str,
+    seconds: u64,
+) -> Result<()> {
+    let invitee_role = parse_role(role)?;
+    let identity = Identity::load(identity_path).context("load identity")?;
+    let vault_id = load_vault_id(vault)?;
+    let vault_key = load_vault_key(vault)?;
+    let mut store = Store::open(vault, identity.clone()).context("open vault store")?;
+
+    // The invite binds THIS device's key as the SPAKE2 responder identity, which
+    // is what makes a substituted invite fail as a wrong code rather than send a
+    // joiner to an impostor.
+    let invite = roam_pairing::Invite::generate(relay, identity.verifying_key().to_bytes());
+    let mailbox = roam_pairing::HttpMailbox::for_invite(&invite);
+    let (code, host) = roam_pairing::host_via_mailbox(
+        &identity,
+        vault_id,
+        *vault_key,
+        invitee_role,
+        &mut store,
+        mailbox,
+        invite.clone(),
+    );
+
+    println!("invite: {}", invite.encode());
+    println!("code:   {}", code.as_str());
+    println!();
+    println!("on the other device, run:");
+    println!(
+        "  roam join-relay --vault <dir> --identity <file> \\\n    --invite {} --code {}",
+        invite.encode(),
+        code.as_str()
+    );
+    println!();
+    // Worth saying out loud at the point of use, not just in --help: the whole
+    // security gain over `pair-token` is that these two travel separately.
+    println!("The invite carries no secret — a QR or a chat message is fine for it.");
+    println!("The code is the secret. Read it aloud; do not send it the same way.");
+    println!();
+    println!(
+        "waiting for a device to type the code ({} attempts, then the code is dead)…",
+        host.attempts_left()
+    );
+
+    // No y/N prompt, for the same reason as `pair-lan`: typing the code IS the
+    // approval, and a second dialog only trains the user to confirm blindly.
+    let peer = host
+        .accept_for(Duration::from_secs(seconds))
+        .await
+        .context("accept relay join")?;
+    println!("paired peer: {peer}");
+    Ok(())
+}
+
+async fn join_relay(vault: &Path, identity_path: &Path, invite: &str, code: &str) -> Result<()> {
+    let identity = Identity::load(identity_path).context("load identity")?;
+    let invite = roam_pairing::Invite::decode(invite).context("decode invite")?;
+    let code = parse_code(code)?;
+    let mut store = Store::open(vault, identity.clone()).context("open joiner store")?;
+    let mailbox = roam_pairing::HttpMailbox::for_invite(&invite);
+
+    let joined = roam_pairing::join_via_mailbox(&identity, &mut store, &mailbox, &invite, &code)
+        .await
+        .context("join through the relay")?;
+    // The code named no vault — same as the LAN flow — so there was nothing to
+    // cross-check against. Persist what the host actually delivered.
+    save_vault_id(vault, &joined.vault)?;
+    save_vault_key(vault, &joined.vault_key)?;
+    println!("joined vault; founder peer: {}", joined.founder);
     Ok(())
 }
 
