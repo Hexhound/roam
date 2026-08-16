@@ -29,6 +29,7 @@ fn kind(name: &str) -> Result<SetKind, JsError> {
         "entries" => Ok(SetKind::Entries),
         "blobs" => Ok(SetKind::Blobs),
         "snapshots" => Ok(SetKind::Snapshots),
+        "trust" => Ok(SetKind::Trust),
         other => Err(JsError::new(&format!("unknown reconcile set {other}"))),
     }
 }
@@ -68,6 +69,7 @@ impl WasmTestRelay {
             SetKind::Entries => self.inner.get_entry(&bucket, &id).await,
             SetKind::Blobs => self.inner.get_blob(&bucket, &id).await,
             SetKind::Snapshots => self.inner.get_snapshot(&bucket, &id).await,
+            SetKind::Trust => self.inner.get_trust(&bucket, &id).await,
         }
         .map_err(err)
     }
@@ -86,6 +88,7 @@ impl WasmTestRelay {
             SetKind::Entries => self.inner.put_entry(&bucket, &id, body).await,
             SetKind::Blobs => self.inner.put_blob(&bucket, &id, body).await,
             SetKind::Snapshots => self.inner.put_snapshot(&bucket, &id, body).await,
+            SetKind::Trust => self.inner.put_trust(&bucket, &id, body).await,
         }
         .map_err(err)?;
         Ok(outcome == PutOutcome::Created)
