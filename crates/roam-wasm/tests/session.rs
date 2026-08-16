@@ -409,7 +409,11 @@ async fn the_data_layer_commands_round_trip() {
         .await;
     }
 
-    let listed = call(&session, json!({"id": 2, "command": "entries", "container": "rows"})).await;
+    let listed = call(
+        &session,
+        json!({"id": 2, "command": "entries", "container": "rows"}),
+    )
+    .await;
     assert_eq!(listed["ok"], json!({"a": "1", "b": "2"}));
 
     // A delete has to be observable through `entries`, not merely accepted:
@@ -420,7 +424,11 @@ async fn the_data_layer_commands_round_trip() {
         json!({"id": 3, "command": "removeEntry", "container": "rows", "key": "a"}),
     )
     .await;
-    let after = call(&session, json!({"id": 4, "command": "entries", "container": "rows"})).await;
+    let after = call(
+        &session,
+        json!({"id": 4, "command": "entries", "container": "rows"}),
+    )
+    .await;
     assert_eq!(after["ok"], json!({"b": "2"}));
 
     // Removing an absent key is not an error — two devices deleting the same
@@ -576,15 +584,27 @@ async fn removing_a_blob_is_local_and_reversible_by_re_adding_it() {
     .await;
     let hash = put["ok"].as_str().expect("a hash").to_string();
 
-    call(&session, json!({"id": 2, "command": "removeBlob", "hash": hash})).await;
+    call(
+        &session,
+        json!({"id": 2, "command": "removeBlob", "hash": hash}),
+    )
+    .await;
     assert_eq!(
-        call(&session, json!({"id": 3, "command": "hasBlob", "hash": hash})).await["ok"],
+        call(
+            &session,
+            json!({"id": 3, "command": "hasBlob", "hash": hash})
+        )
+        .await["ok"],
         json!(false)
     );
 
     // Removing what is not there is not an error: a caller garbage-collecting
     // twice is not doing anything wrong.
-    let again = call(&session, json!({"id": 4, "command": "removeBlob", "hash": hash})).await;
+    let again = call(
+        &session,
+        json!({"id": 4, "command": "removeBlob", "hash": hash}),
+    )
+    .await;
     assert!(again["error"].is_null(), "{again}");
 
     let (again, _) = call_with_bytes(

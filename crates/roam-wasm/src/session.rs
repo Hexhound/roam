@@ -136,7 +136,6 @@ pub enum Command {
     BucketId,
 
     // -- membership and maintenance ------------------------------------------
-
     /// The roster, as an array. `peerId` crosses as a string and `verifyingKey`
     /// as base64url, matching every other id on this protocol.
     Roster,
