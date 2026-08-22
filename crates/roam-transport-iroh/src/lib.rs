@@ -17,7 +17,10 @@ pub mod pairing;
 pub mod pairing_lan;
 pub mod transport;
 
-pub use endpoint::{build_endpoint, PAIRING_ALPN, SYNC_ALPN};
+pub use endpoint::{
+    build_endpoint, build_endpoint_with, BoundEndpoint, EndpointConfig, LanMode, RelayChoice,
+    PAIRING_ALPN, SYNC_ALPN,
+};
 pub use pairing::{host_pairing, join_pairing, PairingToken};
 pub use pairing_lan::{host_lan_pairing, join_lan_pairing, PAIRING_LAN_ALPN};
 pub use transport::IrohTransport;

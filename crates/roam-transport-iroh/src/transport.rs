@@ -4,7 +4,8 @@
 //! framed [`Frame`] to a shared inbound channel; outbound sends dial the peer
 //! (idempotently, reusing an open stream) and write length-prefixed frames.
 
-use crate::endpoint::{build_endpoint, SYNC_ALPN};
+use crate::discovery::LanDiscovery;
+use crate::endpoint::{build_endpoint_with, EndpointConfig, SYNC_ALPN};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use futures::stream::BoxStream;
@@ -76,12 +77,31 @@ pub struct IrohTransport {
     /// Handle to the accept loop, aborted on drop so a dropped transport does
     /// not leak the task (and its `Endpoint` clone).
     accept_task: tokio::task::JoinHandle<()>,
+    /// Kept alive, never read: dropping the handle stops the mDNS service, and
+    /// with it both advertising and LAN address resolution. `None` when LAN was
+    /// not asked for, or when it was and multicast was unavailable.
+    _lan: Option<LanDiscovery>,
 }
 
 impl IrohTransport {
     /// Build the endpoint, store `routes`, and start the accept loop.
+    ///
+    /// Uses n0 relays with no local discovery; [`IrohTransport::spawn_with`]
+    /// chooses otherwise.
     pub async fn spawn(identity: &Identity, routes: HashMap<u64, [u8; 32]>) -> Result<Self> {
-        let endpoint = build_endpoint(identity).await?;
+        Self::spawn_with(identity, routes, &EndpointConfig::n0()).await
+    }
+
+    /// [`IrohTransport::spawn`], against a specific endpoint configuration —
+    /// local-network discovery, self-hosted relays, or no relays at all.
+    pub async fn spawn_with(
+        identity: &Identity,
+        routes: HashMap<u64, [u8; 32]>,
+        config: &EndpointConfig,
+    ) -> Result<Self> {
+        let bound = build_endpoint_with(identity, config).await?;
+        let lan = bound.lan;
+        let endpoint = bound.endpoint;
         // Wait (bounded) for the endpoint to discover a direct address so that a
         // later `endpoint_addr()` is dialable on loopback before discovery lags.
         wait_for_direct_addr(&endpoint).await;
@@ -123,6 +143,7 @@ impl IrohTransport {
             inbound_conns,
             dialing: Arc::new(Mutex::new(HashMap::new())),
             accept_task,
+            _lan: lan,
         })
     }
 
