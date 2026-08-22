@@ -40,7 +40,7 @@ pub use keylog::{KeyBody, KeyLog, KeyLogEntry, Recipient};
 pub use keywrap::{unwrap, wrap};
 pub use oplog::{Entry, OpLog, OPLOG_SIG_DOMAIN};
 pub use paper::PaperKey;
-pub use roam_crdt::MapChange;
+pub use roam_crdt::{Frontier, MapChange};
 pub use roster::{merge_roster, PeerRecord, PeerStatus, Role, RosterEntry, RosterLog, RosterOp};
 pub use store::{version_dominates, BackendSnapshot, DataSize, HeldSnapshot, Store};
 pub use text_history::{TextVersion, VersionKind};
