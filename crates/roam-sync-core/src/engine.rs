@@ -131,10 +131,37 @@ impl<T: Transport + 'static> Engine<T> {
         transport: Arc<T>,
         vault_key: [u8; 32],
     ) -> Self {
+        Self::with_store(
+            identity,
+            vault,
+            Arc::new(Mutex::new(store)),
+            transport,
+            vault_key,
+        )
+    }
+
+    /// [`Engine::new`], over a store the caller already holds.
+    ///
+    /// An embedding application usually owns its store before it decides to
+    /// sync — it opened one to read from, and syncing is a later, optional
+    /// thing that may be turned on and off. Handing ownership to the engine
+    /// would force that application to route every local read and write through
+    /// the engine, and to rebuild the world whenever sync stopped.
+    ///
+    /// Sharing the handle instead keeps one `Store` behind one lock, which is
+    /// what correctness requires: two `Store`s over the same directory are two
+    /// independent op logs that would diverge.
+    pub fn with_store(
+        identity: Identity,
+        vault: VaultId,
+        store: Arc<Mutex<Store>>,
+        transport: Arc<T>,
+        vault_key: [u8; 32],
+    ) -> Self {
         Self {
             identity,
             vault,
-            store: Arc::new(Mutex::new(store)),
+            store,
             transport,
             sent_offsets: Arc::new(Mutex::new(HashMap::new())),
             acked_versions: Arc::new(Mutex::new(HashMap::new())),
