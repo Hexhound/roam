@@ -93,6 +93,33 @@ pub enum RelayChoice {
     Disabled,
 }
 
+impl RelayChoice {
+    /// Build a choice from whatever relay urls an app was configured with.
+    ///
+    /// Empty means [`RelayChoice::N0`] rather than [`RelayChoice::Disabled`]:
+    /// an app that ships no relay setting must still reach a device on another
+    /// network, and "unconfigured" is the state every install starts in.
+    /// Turning relays off is a deliberate act and has to be spelled as one.
+    ///
+    /// Parsing lives here so consumers do not need `iroh` in their dependency
+    /// tree — and, more to the point, cannot end up parsing against a different
+    /// version of it than the endpoint is built with.
+    pub fn parse<S: AsRef<str>>(urls: &[S]) -> Result<Self> {
+        if urls.is_empty() {
+            return Ok(Self::N0);
+        }
+        let parsed = urls
+            .iter()
+            .map(|url| {
+                url.as_ref()
+                    .parse::<RelayUrl>()
+                    .with_context(|| format!("relay url {:?}", url.as_ref()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self::Custom(parsed))
+    }
+}
+
 /// Everything about an endpoint a caller might reasonably want to choose.
 #[derive(Debug, Clone, Default)]
 pub struct EndpointConfig {
@@ -274,6 +301,31 @@ mod tests {
         let config = EndpointConfig::lan_only();
         assert_eq!(config.lan, LanMode::Advertise);
         assert_eq!(config.relay, RelayChoice::Disabled);
+    }
+
+    #[test]
+    fn no_configured_relay_means_the_defaults() {
+        let empty: [String; 0] = [];
+        assert_eq!(RelayChoice::parse(&empty).unwrap(), RelayChoice::N0);
+    }
+
+    #[test]
+    fn configured_relays_are_kept_in_order() {
+        let choice = RelayChoice::parse(&["https://a.example/", "https://b.example/"]).unwrap();
+        let RelayChoice::Custom(urls) = choice else {
+            panic!("configured urls did not become a custom choice");
+        };
+        let seen: Vec<String> = urls.iter().map(|url| url.to_string()).collect();
+        assert_eq!(seen, ["https://a.example/", "https://b.example/"]);
+    }
+
+    #[test]
+    fn a_bad_relay_url_names_itself() {
+        let error = RelayChoice::parse(&["not a url"]).unwrap_err();
+        assert!(
+            error.to_string().contains("not a url"),
+            "unhelpful message: {error}"
+        );
     }
 
     #[tokio::test]
